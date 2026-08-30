@@ -7,7 +7,7 @@ from myvllm.spec_decode.types import Proposal, SampleResult
 
 @dataclass
 class SpecDecodeMetrics:
-    steps: int = 0
+    sequence_records: int = 0
     proposed_tokens: int = 0
     accepted_tokens: int = 0
     acceptance_lengths: list[int] = field(default_factory=list)
@@ -26,7 +26,7 @@ class SpecDecodeMetrics:
         self.stage_seconds[stage] += seconds
 
     def record(self, proposal: Proposal, sample: SampleResult) -> None:
-        self.steps += 1
+        self.sequence_records += 1
         self.proposed_tokens += len(proposal.token_ids)
         self.accepted_tokens += sample.accepted_proposal_tokens
         self.acceptance_lengths.append(sample.accepted_proposal_tokens)

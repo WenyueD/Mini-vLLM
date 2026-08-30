@@ -115,6 +115,30 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)        
 
+    def abort(self, seq: Sequence) -> bool:
+        """Remove a request and release all provisional and committed KV state."""
+        if seq.is_finished:
+            return False
+        found = False
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+            found = True
+        if seq in self.running:
+            self.running.remove(seq)
+            found = True
+        if seq.active_transaction is not None:
+            transaction = seq.active_transaction
+            seq.rollback(transaction)
+            found = True
+        if self.block_manager.rollback_active(seq):
+            found = True
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+            found = True
+        seq.status = SequenceStatus.ABORTED
+        seq.finish_reason = "cancelled"
+        return found
+
 
     # postprocess after generation to check whether sequences are finished
     # if finished, deallocate blocks
@@ -136,6 +160,7 @@ class Scheduler:
             )
             if no_completion_budget or at_model_limit:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_reason = "length"
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
                 continue
@@ -150,6 +175,7 @@ class Scheduler:
 
             if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_reason = "eos" if stop_due_to_eos else "length"
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
 

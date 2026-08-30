@@ -158,7 +158,7 @@ class SpecDecodeCoordinator:
         for seq, proposal, sample, transaction, reservation in zip(
             sequences, proposals, samples, transactions, reservations
         ):
-            emitted, terminal = self._truncate(
+            emitted, finish_reason = self._truncate(
                 seq, sample.emitted_token_ids, eos_token_id
             )
             accepted_kept = min(sample.accepted_proposal_tokens, len(emitted))
@@ -191,7 +191,7 @@ class SpecDecodeCoordinator:
                     transaction,
                     reservation,
                     emitted,
-                    terminal,
+                    finish_reason,
                     committed_sample,
                 )
             )
@@ -206,14 +206,15 @@ class SpecDecodeCoordinator:
             transaction,
             reservation,
             emitted,
-            terminal,
+            finish_reason,
             committed_sample,
         ) in plans:
             accepted_kept = committed_sample.accepted_proposal_tokens
             seq.commit(transaction, emitted, accepted_kept)
             block_manager.commit(seq, reservation, seq.num_computed_tokens)
-            if terminal:
+            if finish_reason is not None:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_reason = finish_reason
             self.metrics.record(proposal, committed_sample)
             results.append(
                 SpecDecodeStepResult(
@@ -221,6 +222,9 @@ class SpecDecodeCoordinator:
                     emitted_token_ids=tuple(emitted),
                     proposed_tokens=len(proposal.token_ids),
                     accepted_proposal_tokens=accepted_kept,
+                    per_position_acceptance=(
+                        committed_sample.per_position_acceptance
+                    ),
                     used_bonus_token=committed_sample.used_bonus_token,
                     fell_back_to_decode=not proposal.token_ids,
                 )
@@ -229,17 +233,17 @@ class SpecDecodeCoordinator:
 
     def _truncate(
         self, seq: Sequence, emitted: tuple[int, ...], eos_token_id: int
-    ) -> tuple[list[int], bool]:
+    ) -> tuple[list[int], str | None]:
         limit = seq.remaining_completion_tokens
         if seq.remaining_model_tokens is not None:
             limit = min(limit, seq.remaining_model_tokens)
         kept: list[int] = []
-        terminal = limit == 0
+        finish_reason = "length" if limit == 0 else None
         for token_id in emitted[:limit]:
             kept.append(token_id)
             if not seq.ignore_eos and token_id == eos_token_id:
-                terminal = True
+                finish_reason = "eos"
                 break
         if len(kept) >= limit:
-            terminal = True
-        return kept, terminal
+            finish_reason = finish_reason or "length"
+        return kept, finish_reason

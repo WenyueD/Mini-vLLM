@@ -175,6 +175,83 @@ This environment had no CUDA device, so the real-model test is provided but was
 not reported as passed. CPU tests validate coordinator, scheduler, acceptance,
 verification metadata, and KV transaction behavior with deterministic targets.
 
+## Online request processing
+
+The online layer has three explicit boundaries:
+
+- `LLMEngine` owns request IDs, incremental committed-token events, cancellation,
+  scheduler state, and step-level metrics.
+- `OnlineEngine` is the single background writer to `LLMEngine` and GPU state.
+  HTTP threads only enqueue add/cancel commands and consume output queues. When no
+  requests exist, the loop blocks on the command queue and does not busy-spin.
+- The standard-library HTTP server handles JSON/SSE only. It does not call the
+  model runner or speculative coordinator directly, and adds no new dependency.
+
+Edit the model path in `examples/online_qwen3_config.json`, then start the server:
+
+```bash
+uv run python -m myvllm.online.server \
+  --config examples/online_qwen3_config.json --host 0.0.0.0 --port 8000
+```
+
+Non-streaming completion:
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"red blue red blue","temperature":0,"max_tokens":32}'
+```
+
+SSE streaming (`-N` disables curl buffering):
+
+```bash
+curl -N http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"red blue red blue","temperature":0,"max_tokens":32,"stream":true,"request_id":"demo-stream"}'
+```
+
+Cancel explicitly with
+`POST /v1/requests/demo-stream/cancel`. A disconnected streaming client also
+causes the handler to enqueue cancellation. Health and step-level statistics are
+available at `/health` and `/stats`.
+
+This is a minimal OpenAI-style completions surface, not full OpenAI API
+compatibility. SSE detokenization retains an eight-token mutable suffix so common
+BPE boundary rewrites do not corrupt concatenated chunks; a rewrite extending
+beyond that window is reported as an explicit stream error. After a terminal event
+is consumed, request/channel state is released and `/stats` retains only a bounded
+terminal status history while keeping lifetime submitted/released counters.
+
+The speculative online endpoint rejects positive temperatures with HTTP 400 rather
+than silently changing sampling semantics. To serve positive-temperature requests,
+start a target-only configuration with `speculative_config.enabled=false`.
+
+Send concurrent requests from a shell:
+
+```bash
+seq 1 8 | xargs -P 8 -I{} curl -s http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain paged KV cache","temperature":0,"max_tokens":64,"request_id":"curl-{}"}'
+curl -s http://127.0.0.1:8000/stats
+```
+
+Or run the repeatable HTTP benchmark:
+
+```bash
+uv run python benchmark_online.py --requests 32 --concurrency 8 --max-tokens 64
+```
+
+The benchmark reports `max_observed_decode_batch_size` and
+`observed_continuous_batching`. A single client issuing one request after another
+is only serial inference wrapped in HTTP. Dynamic continuous batching is actually
+demonstrated only when overlapping requests produce a recorded decode batch size
+greater than one.
+
+For a real Qwen3-0.6B server smoke test, run the server command on a CUDA host, then
+run both the concurrent benchmark and the `/stats` query above. This local
+environment has no CUDA and did not permit reading an SSH configuration, so no
+remote GPU/online result is claimed here.
+
 
 ## Star History
 

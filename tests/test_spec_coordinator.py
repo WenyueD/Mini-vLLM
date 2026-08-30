@@ -72,6 +72,8 @@ def test_coordinator_variable_lengths_rejection_bonus_and_metrics():
     assert results[0].used_bonus_token
     assert not results[1].used_bonus_token
     snapshot = coordinator.metrics.snapshot()
+    assert snapshot["sequence_records"] == 2
+    assert "steps" not in snapshot
     assert snapshot["proposed_tokens"] == 3
     assert snapshot["accepted_tokens"] == 2
     assert snapshot["acceptance_lengths"] == [2, 0]

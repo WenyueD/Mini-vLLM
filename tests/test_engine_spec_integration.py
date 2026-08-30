@@ -78,11 +78,20 @@ def test_engine_step_mixes_multi_commit_greedy_and_ordinary_decode():
     engine.scheduler = scheduler
     engine.model_runner = FakeRunner()
 
-    _, processed, is_prefill = engine.step()
-    assert not is_prefill
+    step = engine.step()
+    assert not step.is_prefill
     assert len(greedy.completion_token_ids) == 4  # initial + 2 drafts + bonus
     assert len(ordinary.completion_token_ids) == 2  # initial + ordinary one-token step
-    assert processed == 4
+    assert step.num_processed_tokens == 4
+    assert {output.request_id for output in step.outputs} == {
+        greedy.request_id,
+        ordinary.request_id,
+    }
+    assert step.speculative is not None
+    assert step.speculative.active_batch_size == 2
+    assert step.speculative.speculative_batch_size == 1
+    assert step.speculative.proposed_tokens == 2
+    assert step.speculative.accepted_tokens == 2
     scheduler.block_manager.assert_consistent()
     scheduler.block_manager.deallocate(greedy)
     scheduler.block_manager.deallocate(ordinary)

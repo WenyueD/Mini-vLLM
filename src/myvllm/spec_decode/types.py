@@ -51,5 +51,6 @@ class SpecDecodeStepResult:
     emitted_token_ids: tuple[int, ...]
     proposed_tokens: int
     accepted_proposal_tokens: int
+    per_position_acceptance: tuple[bool, ...]
     used_bonus_token: bool
     fell_back_to_decode: bool

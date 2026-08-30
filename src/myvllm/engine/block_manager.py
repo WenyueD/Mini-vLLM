@@ -276,6 +276,14 @@ class BlockManager:
         reservation.state = ReservationState.ROLLED_BACK
         del self._active_reservations[seq.seq_id]
 
+    def rollback_active(self, seq: Sequence) -> bool:
+        """Rollback this sequence's active reservation, if any."""
+        reservation = self._active_reservations.get(seq.seq_id)
+        if reservation is None:
+            return False
+        self.rollback(seq, reservation)
+        return True
+
     def slot_for(self, seq: Sequence, logical_token_index: int) -> int:
         if logical_token_index < 0:
             raise IndexError("logical token index must be non-negative")

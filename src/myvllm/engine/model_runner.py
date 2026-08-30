@@ -6,9 +6,6 @@ from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from myvllm.models.qwen3 import Qwen3ForCausalLM
-from myvllm.models.llama import LlamaForCausalLM
-from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.spec_decode.types import (
     SpecDecodeBatch,
@@ -19,6 +16,10 @@ from myvllm.utils import *
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+        from myvllm.layers.sampler import SamplerLayer
+        from myvllm.models.llama import LlamaForCausalLM
+        from myvllm.models.qwen3 import Qwen3ForCausalLM
+
         self.config = config
         self.event = event
 

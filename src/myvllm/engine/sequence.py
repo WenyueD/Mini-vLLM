@@ -13,6 +13,7 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    ABORTED = auto()
 
 
 class TransactionState(Enum):
@@ -47,13 +48,16 @@ class Sequence:
         token_ids: list[int],
         block_size: int = 4,
         sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
     ):
         if block_size <= 0:
             raise ValueError("block_size must be positive")
         sampling_params = sampling_params or SamplingParams()
         self.block_size = block_size
         self.seq_id = next(Sequence.counter)
+        self.request_id = request_id or str(self.seq_id)
         self.status = SequenceStatus.WAITING
+        self.finish_reason: str | None = None
         self.token_ids = copy(token_ids)
         self.last_token = self.token_ids[-1] if self.token_ids else None
         self.num_tokens = len(self.token_ids)
@@ -77,7 +81,7 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status in {SequenceStatus.FINISHED, SequenceStatus.ABORTED}
 
     @property
     def is_greedy(self) -> bool:
@@ -249,7 +253,9 @@ class Sequence:
         return {
             "block_size": self.block_size,
             "seq_id": self.seq_id,
+            "request_id": self.request_id,
             "status": self.status,
+            "finish_reason": self.finish_reason,
             "token_ids": token_payload,
             "last_token": self.last_token,
             "num_tokens": self.num_tokens,

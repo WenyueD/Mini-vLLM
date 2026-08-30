@@ -1,10 +1,17 @@
 import atexit
+from itertools import count
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
 
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.metrics import EngineMetrics
+from myvllm.engine.output import (
+    EngineStepResult,
+    RequestOutput,
+    SpeculativeBatchObservation,
+)
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.spec_decode import (
     MockProposer,
@@ -35,6 +42,9 @@ class LLMEngine:
 
         self.config = config
         self._closed = False
+        self._request_counter = count()
+        self.requests: dict[str, Sequence] = {}
+        self.metrics = EngineMetrics(config.get("max_metrics_history", 256))
         self.speculative_config = SpeculativeConfig.from_value(
             config.get("speculative_config")
         )
@@ -93,13 +103,33 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
-    def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
+    def _ensure_runtime_state(self) -> None:
+        """Keep lightweight test/fake engines constructed with ``__new__`` working."""
+        if not hasattr(self, "requests"):
+            self.requests = {}
+        if not hasattr(self, "_request_counter"):
+            self._request_counter = count()
+        if not hasattr(self, "metrics"):
+            self.metrics = EngineMetrics()
+
+    def step(self) -> EngineStepResult:
+        self._ensure_runtime_state()
         scheduled_sequences, is_prefill = self.scheduler.schedule(
             speculative=self.speculative_config.enabled
         )
         num_processed_tokens = 0
         if not scheduled_sequences:
-            return [], num_processed_tokens, is_prefill
+            return EngineStepResult(
+                engine_step=self.metrics.engine_steps,
+                outputs=(),
+                num_processed_tokens=0,
+                is_prefill=is_prefill,
+            )
+        engine_step = self.metrics.next_engine_step()
+        completion_offsets = {
+            seq.seq_id: len(seq.completion_token_ids) for seq in scheduled_sequences
+        }
+        spec_results = []
         if is_prefill:
             outputs = self.model_runner.call("run", scheduled_sequences, True)
             if outputs is not None:
@@ -140,9 +170,63 @@ class LLMEngine:
                 )
                 self.scheduler.finalize_speculative(speculative_sequences)
 
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
+        outputs = []
+        for seq in scheduled_sequences:
+            start = completion_offsets[seq.seq_id]
+            committed = tuple(seq.completion_token_ids[start:])
+            if committed or seq.is_finished:
+                outputs.append(
+                    RequestOutput(
+                        request_id=seq.request_id,
+                        token_ids=committed,
+                        finished=seq.is_finished,
+                        finish_reason=seq.finish_reason,
+                    )
+                )
 
-        return outputs, num_processed_tokens, is_prefill
+        observation = None
+        if not is_prefill:
+            per_request = {seq.request_id: 0 for seq in scheduled_sequences}
+            proposed_tokens = 0
+            accepted_tokens = 0
+            per_position_proposed: list[int] = []
+            per_position_accepted: list[int] = []
+            by_seq_id = {seq.seq_id: seq for seq in scheduled_sequences}
+            for result in spec_results:
+                seq = by_seq_id[result.sequence_id]
+                proposed_tokens += result.proposed_tokens
+                accepted_tokens += result.accepted_proposal_tokens
+                per_request[seq.request_id] = result.accepted_proposal_tokens
+                while len(per_position_proposed) < result.proposed_tokens:
+                    per_position_proposed.append(0)
+                    per_position_accepted.append(0)
+                for position, accepted in enumerate(
+                    result.per_position_acceptance
+                ):
+                    per_position_proposed[position] += 1
+                    per_position_accepted[position] += int(accepted)
+            observation = SpeculativeBatchObservation(
+                engine_step=engine_step,
+                active_batch_size=len(scheduled_sequences),
+                speculative_batch_size=len(speculative_sequences),
+                proposed_tokens=proposed_tokens,
+                accepted_tokens=accepted_tokens,
+                batch_acceptance_rate=(
+                    accepted_tokens / proposed_tokens if proposed_tokens else 0.0
+                ),
+                per_request_accepted_length=per_request,
+                per_position_proposed=tuple(per_position_proposed),
+                per_position_accepted=tuple(per_position_accepted),
+            )
+            self.metrics.record_decode(observation)
+
+        return EngineStepResult(
+            engine_step=engine_step,
+            outputs=tuple(outputs),
+            num_processed_tokens=num_processed_tokens,
+            is_prefill=is_prefill,
+            speculative=observation,
+        )
 
     def get_speculative_stats(self) -> dict:
         if self.spec_decode_coordinator is None:
@@ -156,30 +240,109 @@ class LLMEngine:
             **self.spec_decode_coordinator.metrics.snapshot(),
         }
 
+    def get_stats(self) -> dict:
+        self._ensure_runtime_state()
+        result = self.metrics.snapshot()
+        result["speculative"] = self.get_speculative_stats()
+        result["requests"] = {
+            "total": len(self.requests),
+            "waiting": len(self.scheduler.waiting),
+            "running": len(self.scheduler.running),
+            "finished": sum(seq.is_finished for seq in self.requests.values()),
+        }
+        return result
+
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
-    def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
-        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
+    def add_request(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str | None = None,
+    ) -> str:
+        self._ensure_runtime_state()
+        request_id = request_id or f"request-{next(self._request_counter)}"
+        if request_id in self.requests:
+            raise ValueError(f"duplicate request_id: {request_id}")
+        token_ids = self.tokenizer.encode(prompt)
+        if not token_ids:
+            raise ValueError("prompt must encode to at least one token")
+        sequence = Sequence(
+            token_ids=token_ids,
+            block_size=self.config["block_size"],
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
+        self.scheduler.add_sequence(sequence)
+        self.requests[request_id] = sequence
+        return request_id
+
+    def add_prompt(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str | None = None,
+    ) -> str:
+        return self.add_request(prompt, sampling_params, request_id)
+
+    def get_request_status(self, request_id: str) -> dict:
+        self._ensure_runtime_state()
+        seq = self.requests.get(request_id)
+        if seq is None:
+            raise KeyError(request_id)
+        return {
+            "request_id": request_id,
+            "status": seq.status.name.lower(),
+            "finished": seq.is_finished,
+            "finish_reason": seq.finish_reason,
+            "num_prompt_tokens": seq.num_prompt_tokens,
+            "num_completion_tokens": seq.num_completion_tokens,
+        }
+
+    def abort_request(self, request_id: str) -> bool:
+        self._ensure_runtime_state()
+        seq = self.requests.get(request_id)
+        if seq is None:
+            return False
+        return self.scheduler.abort(seq)
+
+    def forget_request(self, request_id: str) -> bool:
+        """Release a terminal request from the engine registry.
+
+        Online consumers call this only after dequeuing the terminal event.  Keeping
+        this separate from scheduler finalization prevents a fast producer from
+        deleting status/usage before the consumer has observed completion.
+        """
+        self._ensure_runtime_state()
+        seq = self.requests.get(request_id)
+        if seq is None:
+            return False
+        if not seq.is_finished:
+            raise RuntimeError(f"request is not terminal: {request_id}")
+        del self.requests[request_id]
+        return True
 
     # given a list of prompts
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        for prompt in prompts:
-            self.add_prompt(prompt, sampling_params)
-        generated_tokens = {}
+        request_ids = [
+            self.add_prompt(prompt, sampling_params) for prompt in prompts
+        ]
+        generated_tokens = {request_id: [] for request_id in request_ids}
         while not self.scheduler.is_finished():
             start_t = time.time()
-            outputs, num_processed_tokens, is_prefill = self.step()
+            step_result = self.step()
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
-            if is_prefill:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
+            if step_result.is_prefill:
+                print(step_result.num_processed_tokens, 'number of processed tokens', step_result.num_processed_tokens/running_time, "tokens/sec during prefilling")
             else:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
-            generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
+                print(step_result.num_processed_tokens, 'number of processed tokens', step_result.num_processed_tokens/running_time, "tokens/sec during decoding")
+            for output in step_result.outputs:
+                generated_tokens[output.request_id].extend(output.token_ids)
 
-        generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
-        output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
+        ordered_tokens = [generated_tokens[request_id] for request_id in request_ids]
+        output = {'text': [self.tokenizer.decode(tokens) for tokens in ordered_tokens], 'token_ids': ordered_tokens}
         return output
