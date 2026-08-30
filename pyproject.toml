@@ -8,7 +8,7 @@ dependencies = [
     "transformers",
     "torch",
     "xxhash",
-    "vllm>=0.15.0",
+    "vllm>=0.15.0; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]

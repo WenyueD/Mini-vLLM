@@ -100,6 +100,81 @@ myvllm/
 - CUDA-capable GPU
 - Dependencies: `transformers`, `torch`, `xxhash` (managed by uv)
 
+## Speculative decoding MVP
+
+MiniVLLM now has an opt-in, proposer-independent speculative decode path:
+
+```python
+config["speculative_config"] = {
+    "enabled": True,
+    "proposer": "ngram",
+    "num_speculative_tokens": 4,
+    "ngram_min_size": 2,
+    "ngram_max_size": 4,
+}
+sampling_params = SamplingParams(temperature=0, max_tokens=128)
+```
+
+`temperature=0` is exact deterministic argmax. Target-only and speculative
+decoding use the same logits-to-token decision function. The MVP supports prompt
+n-gram lookup, a deterministic mock proposer, heterogeneous proposal/acceptance
+lengths, K+1 eager verification (including the bonus token), EOS/length limits,
+and transactional paged-KV reserve/commit/rollback. When prompt lookup finds no
+match or draft capacity is unavailable, that request performs ordinary one-token
+greedy decode.
+
+Runtime statistics are available through `engine.get_speculative_stats()`. They
+include proposed/accepted counts, acceptance lengths and per-position rates, plus
+proposal/verify/sample/commit wall times. A CPU-only correctness and overhead smoke
+benchmark is available without model weights:
+
+```bash
+uv run python benchmark_speculative.py
+uv run pytest -q
+```
+
+`benchmark_speculative.py` uses a deterministic fake target/verifier whose output
+is the repeating cycle `0,1,2,3,4`, with a matching repeated prompt. Its K=4 / high
+acceptance result validates the lossless coordinator, transaction pipeline, and
+statistics plumbing only. It is **not** a real-model throughput measurement, an
+n-gram quality claim, or evidence of GPU speedup. Real performance and acceptance
+numbers must come from the Qwen3 GPU command below.
+
+The implementation does **not** claim probability rejection sampling, non-greedy
+speculation, a neural draft model, EAGLE/DFlash2, verification CUDA graphs, or
+dynamic-K kernels. Positive-temperature requests continue through the unchanged
+ordinary sampler. Speculative verification is forced eager. Prefix-cache hash
+metadata is only published on transaction commit; speculative reservations never
+publish provisional prefixes.
+
+The state/data-flow rationale and failure invariants are documented in
+[`docs/speculative_decoding_design.md`](docs/speculative_decoding_design.md).
+
+### Real Qwen3-0.6B GPU validation
+
+The repository includes an opt-in target-only versus speculative greedy equality
+test. Its primary test replays target-only baseline tokens as proposals and asserts
+positive proposed/accepted counts plus an acceptance length greater than one. Thus
+it necessarily exercises real Qwen3 K+1 verification and cannot silently pass via
+K=0 fallback. A separate n-gram equality smoke test is also included. The test
+never downloads weights implicitly; point it at a local checkpoint:
+
+```bash
+MINIVLLM_QWEN3_PATH=/absolute/path/to/Qwen3-0.6B \
+  uv run pytest -q -s tests/gpu/test_qwen3_speculative_equivalence.py
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:MINIVLLM_QWEN3_PATH = "D:\models\Qwen3-0.6B"
+uv run pytest -q -s tests/gpu/test_qwen3_speculative_equivalence.py
+```
+
+This environment had no CUDA device, so the real-model test is provided but was
+not reported as passed. CPU tests validate coordinator, scheduler, acceptance,
+verification metadata, and KV transaction behavior with deterministic targets.
+
 
 ## Star History
 

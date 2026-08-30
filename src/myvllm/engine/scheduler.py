@@ -32,7 +32,7 @@ class Scheduler:
         self.waiting.append(sequence)
 
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self, speculative: bool = False) -> tuple[list[Sequence], bool]:
         scheduled_sequences = []
         current_scheduled_tokens = 0
         # An empty schedule is only legitimate when this call freed blocks by
@@ -54,10 +54,25 @@ class Scheduler:
             return scheduled_sequences, True
         
         # try schedule for completion from running queue
+        speculative_blocks_claimed = 0
         while self.running:
             seq = self.running.popleft()
-            # use can_append to check whether we can append one more token
-            if not self.block_manager.can_append(seq):
+            # Ordinary decode historically allocates the pending token's block
+            # immediately before execution. Speculative decode must be selected
+            # without mutation; its coordinator owns reserve/commit/rollback.
+            use_speculation = speculative and seq.is_greedy
+            if use_speculation:
+                needed = self.block_manager.blocks_needed_for_reserve(seq, 0)
+                can_schedule = needed <= (
+                    len(self.block_manager.free_block_ids) - speculative_blocks_claimed
+                )
+            else:
+                needed = int(seq.num_tokens % self.block_manager.block_size == 1)
+                can_schedule = self.block_manager.can_append(seq) and needed <= (
+                    len(self.block_manager.free_block_ids)
+                    - speculative_blocks_claimed
+                )
+            if not can_schedule:
                 preempted = True
                 if self.running:
                     self.running.appendleft(seq)
@@ -69,8 +84,10 @@ class Scheduler:
                 if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
                     self.running.appendleft(seq)
                     break
-                # append one token
-                self.block_manager.append(seq)
+                if not use_speculation:
+                    self.block_manager.append(seq)
+                else:
+                    speculative_blocks_claimed += needed
                 scheduled_sequences.append(seq)
                 current_scheduled_tokens += 1 # only one token for completion
 
@@ -101,8 +118,27 @@ class Scheduler:
 
     # postprocess after generation to check whether sequences are finished
     # if finished, deallocate blocks
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        token_ids: list[int],
+        is_prefill: bool = False,
+    ) -> None:
         for seq, token_id in zip(seqs, token_ids):
+            if is_prefill:
+                seq.mark_computed(len(seq))
+            else:
+                seq.mark_computed(seq.num_computed_tokens + 1)
+            no_completion_budget = seq.num_completion_tokens >= seq.max_tokens
+            at_model_limit = (
+                seq.max_model_length is not None
+                and seq.num_tokens >= seq.max_model_length
+            )
+            if no_completion_budget or at_model_limit:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                continue
             seq.append_token(token_id)
             # Check stopping conditions:
             # EOS token
@@ -116,3 +152,11 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def finalize_speculative(self, seqs: list[Sequence]) -> None:
+        """Remove/deallocate requests whose coordinator applied a stop rule."""
+        for seq in seqs:
+            if seq.is_finished:
+                self.block_manager.deallocate(seq)
+                if seq in self.running:
+                    self.running.remove(seq)

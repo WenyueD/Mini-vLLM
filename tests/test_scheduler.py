@@ -186,3 +186,36 @@ class TestSchedulerHappyPath:
         assert len(scheduled) == 0
         assert seq in scheduler.waiting
         assert seq.status == SequenceStatus.WAITING
+
+    def test_zero_max_tokens_does_not_append_prefill_sample(self):
+        scheduler = make_scheduler()
+        from myvllm.sampling_parameters import SamplingParams
+
+        seq = Sequence(
+            [1, 2],
+            block_size=4,
+            sampling_params=SamplingParams(temperature=0, max_tokens=0),
+        )
+        scheduler.add_sequence(seq)
+        scheduled, is_prefill = scheduler.schedule()
+        assert is_prefill
+        scheduler.postprocess(scheduled, [9], is_prefill=True)
+        assert seq.completion_token_ids == []
+        assert seq.is_finished
+
+    def test_prompt_at_model_limit_does_not_append_prefill_sample(self):
+        scheduler = make_scheduler()
+        from myvllm.sampling_parameters import SamplingParams
+
+        seq = Sequence(
+            [1, 2],
+            block_size=4,
+            sampling_params=SamplingParams(
+                temperature=0, max_tokens=5, max_model_length=2
+            ),
+        )
+        scheduler.add_sequence(seq)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, [9], is_prefill=True)
+        assert seq.completion_token_ids == []
+        assert seq.is_finished

@@ -10,6 +10,11 @@ from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.spec_decode.types import (
+    SpecDecodeBatch,
+    VerificationResult,
+)
+from myvllm.spec_decode.verification import prepare_verification_input
 from myvllm.utils import *
 
 class ModelRunner:
@@ -298,6 +303,7 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
+        self._prefill_sample_indices = [end - 1 for end in cu_seqlens_q[1:]]
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
@@ -342,6 +348,33 @@ class ModelRunner:
         )
         return input_ids    
 
+    def prepare_speculative(
+        self, batch: SpecDecodeBatch
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Prepare variable-q eager verification over existing paged prefixes."""
+        plan = prepare_verification_input(batch, self.block_size)
+
+        input_tensor = torch.tensor(
+            plan.input_ids, dtype=torch.long, pin_memory=True
+        ).cuda(non_blocking=True)
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=0,
+            max_seqlen_k=0,
+            slot_mapping=torch.tensor(
+                plan.slot_mappings, dtype=torch.long, pin_memory=True
+            ).cuda(non_blocking=True),
+            context_lens=torch.tensor(
+                plan.context_lens, dtype=torch.long, pin_memory=True
+            ).cuda(non_blocking=True),
+            block_tables=torch.tensor(
+                plan.block_tables, dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True),
+        )
+        return input_tensor, plan.query_lengths
+
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -351,8 +384,13 @@ class ModelRunner:
     # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill or self.enforce_eager:
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        is_prefill: bool,
+        force_eager: bool = False,
+    ) -> torch.Tensor:
+        if is_prefill or self.enforce_eager or force_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
             hidden_states = self.model(input_ids)
@@ -389,12 +427,41 @@ class ModelRunner:
         else:
             input_ids = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, is_prefill)
+        if is_prefill:
+            logits = logits[self._prefill_sample_indices]
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
+
+    def verify(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
+        """Greedy K+1 target decisions for each speculative request."""
+        try:
+            input_ids, query_lengths = self.prepare_speculative(batch)
+            logits = self.run_model(input_ids, is_prefill=False, force_eager=True)
+            if self.rank != 0:
+                return []
+            temperatures = torch.zeros(
+                logits.shape[0], dtype=torch.float32, device=logits.device
+            )
+            flat_tokens = self.sampler(logits, temperatures).cpu().tolist()
+            results = []
+            start = 0
+            for seq, query_length in zip(batch.sequences, query_lengths):
+                results.append(
+                    VerificationResult(
+                        sequence_id=seq.seq_id,
+                        target_token_ids=tuple(
+                            flat_tokens[start : start + query_length]
+                        ),
+                    )
+                )
+                start += query_length
+            return results
+        finally:
+            reset_context()
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs

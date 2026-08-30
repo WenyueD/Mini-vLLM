@@ -5,8 +5,13 @@ import torch.multiprocessing as mp
 
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import Scheduler
-from myvllm.engine.model_runner import ModelRunner
 from myvllm.sampling_parameters import SamplingParams
+from myvllm.spec_decode import (
+    MockProposer,
+    NGramProposer,
+    SpecDecodeCoordinator,
+    SpeculativeConfig,
+)
 from transformers import AutoTokenizer
 
 
@@ -18,13 +23,21 @@ def worker_process(config, rank, event):
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
     sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
+    from myvllm.engine.model_runner import ModelRunner
+
     model_runner = ModelRunner(config, rank, event)
     model_runner.loop()
 
 
 class LLMEngine:
     def __init__(self, config: dict):
+        from myvllm.engine.model_runner import ModelRunner
+
         self.config = config
+        self._closed = False
+        self.speculative_config = SpeculativeConfig.from_value(
+            config.get("speculative_config")
+        )
         world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
         self.processes = []
@@ -51,11 +64,26 @@ class LLMEngine:
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256)
         )
+        self.spec_decode_coordinator = None
+        if self.speculative_config.enabled:
+            if self.speculative_config.proposer == "ngram":
+                proposer = NGramProposer(
+                    self.speculative_config.ngram_min_size,
+                    self.speculative_config.ngram_max_size,
+                )
+            else:
+                proposer = MockProposer()
+            self.spec_decode_coordinator = SpecDecodeCoordinator(
+                self.speculative_config, proposer
+            )
 
         atexit.register(self.exit)
 
 
     def exit(self):
+        if self._closed:
+            return
+        self._closed = True
         self.model_runner.call("exit")
         del self.model_runner
         for process in self.processes:
@@ -66,22 +94,67 @@ class LLMEngine:
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
     def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
-        scheduled_sequences, is_prefill = self.scheduler.schedule()
+        scheduled_sequences, is_prefill = self.scheduler.schedule(
+            speculative=self.speculative_config.enabled
+        )
         num_processed_tokens = 0
         if not scheduled_sequences:
             return [], num_processed_tokens, is_prefill
-        # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
-        # Move outputs to CPU and convert them to a list
-        if outputs is not None:
-            outputs = outputs.cpu().tolist()
-        # postprocess the outputs
-        self.scheduler.postprocess(scheduled_sequences, outputs)
+        if is_prefill:
+            outputs = self.model_runner.call("run", scheduled_sequences, True)
+            if outputs is not None:
+                outputs = outputs.cpu().tolist()
+            self.scheduler.postprocess(
+                scheduled_sequences, outputs, is_prefill=True
+            )
+            num_processed_tokens = sum(
+                seq.num_prompt_tokens for seq in scheduled_sequences
+            )
+        else:
+            speculative_sequences = [
+                seq
+                for seq in scheduled_sequences
+                if self.spec_decode_coordinator is not None and seq.is_greedy
+            ]
+            ordinary_sequences = [
+                seq for seq in scheduled_sequences if seq not in speculative_sequences
+            ]
+            if ordinary_sequences:
+                ordinary_outputs = self.model_runner.call(
+                    "run", ordinary_sequences, False
+                )
+                if ordinary_outputs is not None:
+                    ordinary_outputs = ordinary_outputs.cpu().tolist()
+                self.scheduler.postprocess(ordinary_sequences, ordinary_outputs)
+                num_processed_tokens += len(ordinary_sequences)
+            if speculative_sequences:
+                spec_results = self.spec_decode_coordinator.execute(
+                    speculative_sequences,
+                    self.scheduler.block_manager,
+                    lambda batch: self.model_runner.call("verify", batch),
+                    self.scheduler.eos,
+                    max_verification_tokens=self.scheduler.max_num_batched_tokens,
+                )
+                num_processed_tokens += sum(
+                    len(result.emitted_token_ids) for result in spec_results
+                )
+                self.scheduler.finalize_speculative(speculative_sequences)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
 
         return outputs, num_processed_tokens, is_prefill
+
+    def get_speculative_stats(self) -> dict:
+        if self.spec_decode_coordinator is None:
+            return {
+                "enabled": False,
+                "proposed_tokens": 0,
+                "accepted_tokens": 0,
+            }
+        return {
+            "enabled": True,
+            **self.spec_decode_coordinator.metrics.snapshot(),
+        }
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
