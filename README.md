@@ -150,6 +150,12 @@ publish provisional prefixes.
 The state/data-flow rationale and failure invariants are documented in
 [`docs/speculative_decoding_design.md`](docs/speculative_decoding_design.md).
 
+Qwen3.5/Qwen3.8 hybrid text target scaffolding is documented in
+[`docs/qwen35_target.md`](docs/qwen35_target.md). It covers nested `text_config`
+parsing, zero-based hidden taps `[5, 19, 33, 47, 61]`, B=1 eager hybrid cache
+transactions, and the current text-only support boundary for the later DFlash2
+proposer integration.
+
 ### Real Qwen3-0.6B GPU validation
 
 The repository includes an opt-in target-only versus speculative greedy equality

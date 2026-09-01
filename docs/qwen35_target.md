@@ -1,0 +1,80 @@
+# Qwen3.5/Qwen3.8 Text Target Support
+
+This repository now has a first-stage Qwen3.5/Qwen3.8 text-only target path for
+hybrid models whose outer architecture is `Qwen3_5ForConditionalGeneration` and
+whose language model lives under nested `text_config`.
+
+## Current Boundary
+
+- Supported: text-only target execution, greedy correctness scaffolding, B=1
+  eager cached target steps, Qwen3.5/Qwen3.8 config parsing, weight mapping
+  validation, hidden taps, and hybrid cache transaction semantics.
+- Not claimed: multimodal inputs, production dynamic batching, neural draft
+  loading, DFlash2 proposer execution, CUDA Graph optimization for verification,
+  or real Qwen/Qwen3.8-27B GPU acceptance numbers.
+- Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
+  `video_grid_thw` are rejected explicitly.
+- Target cache sizing can be constrained with `target_cache_memory_fraction` or
+  by reserving future draft space with `draft_memory_reservation_fraction`.
+
+## Model Facts Captured
+
+- Hidden tap IDs are zero-based layer-completion outputs:
+  `[5, 19, 33, 47, 61]`.
+- A log line showing `(6, 20, 34, 48, 62)` is a one-based display convention,
+  not the Python/API key.
+- The fixture used by tests has 64 text layers, `hidden_size=5120`, and every
+  fourth layer as `full_attention`; other layers are `linear_attention`.
+- Full-attention layers and linear/GDN layers own distinct cache state.
+
+## Cache Contract
+
+`HybridCacheManager` owns request-scoped state:
+
+- `full_attention_layers[layer_id]`: appended K/V tensors for full-attention
+  layers in the B=1 eager path.
+- `linear_layers[layer_id]`: GDN recurrent state and causal convolution state.
+- `logical_length`: committed target prefix length for that request.
+
+Transaction API:
+
+```python
+tx = cache.begin_transaction(request_ids, reserve_tokens)
+model.forward_with_cache(proposal_tokens, cache, request_id, transaction=tx)
+cache.commit(tx, {request_id: accepted_tokens})
+cache.rollback(tx)
+```
+
+`accepted_tokens` is the number of executed provisional tokens to retain. For a
+future K+1 verifier, the caller should map `accepted_proposal_tokens` to retained
+target tokens according to the verifier plan. The manager supports heterogeneous
+batch commits such as `{a: 0, b: 3, c: 7}` and restores full KV, recurrent state,
+conv state, and logical length on rollback.
+
+## Target Verification Shape Contract
+
+For the next DFlash2 stage, target verification should call the target with:
+
+- token IDs: the current mandatory target token plus up to K proposal tokens;
+- K currently expected up to 7 proposals;
+- `capture_hidden_taps=True` when DFlash2 hidden features are needed;
+- `hidden_taps[layer_id]` shaped `[1, query_tokens, hidden_size]` for B=1;
+- logits shaped `[1, query_tokens, vocab_size]`.
+
+The HTTP/online layer should continue to depend only on target logits and emitted
+token IDs; DFlash2-specific metadata belongs below the runner/coordinator boundary.
+
+## GPU Validation
+
+Real Qwen/Qwen3.8-27B validation remains pending in this local run. The minimum
+acceptance command should load the local checkpoint, force eager execution, run one
+short greedy prompt for prefill plus at least 32 decode tokens, and save:
+
+- startup arguments and environment manifest;
+- GPU name, available memory, and peak allocated memory;
+- generated token IDs, with tie-aware argmax diagnostics;
+- cache decode versus no-cache/reference logits for the first few steps;
+- TTFT and preliminary TPOT.
+
+Do not mark batch or dynamic batching as passed until those paths are explicitly
+run on the target GPU.

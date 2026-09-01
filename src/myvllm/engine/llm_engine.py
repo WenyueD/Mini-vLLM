@@ -27,8 +27,9 @@ def worker_process(config, rank, event):
     # FIRST print before any other code
     import sys
     import os
-    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
-    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
+    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)  # Line buffering
+    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
     from myvllm.engine.model_runner import ModelRunner
 
@@ -60,8 +61,10 @@ class LLMEngine:
             process.start()
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
-        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.get("model_name_or_path", "gpt2")
+        )
+
         # scheduler needs to init after model_runner: when world_size > 1,
         # ModelRunner.__init__ calls dist.init_process_group() which is a
         # collective barrier — rank-0 blocks until all worker ranks have joined.
@@ -72,7 +75,7 @@ class LLMEngine:
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
         )
         self.spec_decode_coordinator = None
         if self.speculative_config.enabled:
@@ -88,7 +91,6 @@ class LLMEngine:
             )
 
         atexit.register(self.exit)
-
 
     def exit(self):
         if self._closed:
@@ -134,9 +136,7 @@ class LLMEngine:
             outputs = self.model_runner.call("run", scheduled_sequences, True)
             if outputs is not None:
                 outputs = outputs.cpu().tolist()
-            self.scheduler.postprocess(
-                scheduled_sequences, outputs, is_prefill=True
-            )
+            self.scheduler.postprocess(scheduled_sequences, outputs, is_prefill=True)
             num_processed_tokens = sum(
                 seq.num_prompt_tokens for seq in scheduled_sequences
             )
@@ -200,9 +200,7 @@ class LLMEngine:
                 while len(per_position_proposed) < result.proposed_tokens:
                     per_position_proposed.append(0)
                     per_position_accepted.append(0)
-                for position, accepted in enumerate(
-                    result.per_position_acceptance
-                ):
+                for position, accepted in enumerate(result.per_position_acceptance):
                     per_position_proposed[position] += 1
                     per_position_accepted[position] += int(accepted)
             observation = SpeculativeBatchObservation(
@@ -219,6 +217,14 @@ class LLMEngine:
                 per_position_accepted=tuple(per_position_accepted),
             )
             self.metrics.record_decode(observation)
+
+        finished_request_ids = [
+            seq.request_id for seq in scheduled_sequences if seq.is_finished
+        ]
+        if finished_request_ids and hasattr(
+            self.model_runner, "release_hybrid_requests"
+        ):
+            self.model_runner.call("release_hybrid_requests", finished_request_ids)
 
         return EngineStepResult(
             engine_step=engine_step,
@@ -251,7 +257,6 @@ class LLMEngine:
             "finished": sum(seq.is_finished for seq in self.requests.values()),
         }
         return result
-
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_request(
@@ -326,10 +331,10 @@ class LLMEngine:
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
-    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        request_ids = [
-            self.add_prompt(prompt, sampling_params) for prompt in prompts
-        ]
+    def generate(
+        self, prompts: list[str], sampling_params: SamplingParams
+    ) -> list[str]:
+        request_ids = [self.add_prompt(prompt, sampling_params) for prompt in prompts]
         generated_tokens = {request_id: [] for request_id in request_ids}
         while not self.scheduler.is_finished():
             start_t = time.time()
@@ -337,12 +342,25 @@ class LLMEngine:
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
             if step_result.is_prefill:
-                print(step_result.num_processed_tokens, 'number of processed tokens', step_result.num_processed_tokens/running_time, "tokens/sec during prefilling")
+                print(
+                    step_result.num_processed_tokens,
+                    "number of processed tokens",
+                    step_result.num_processed_tokens / running_time,
+                    "tokens/sec during prefilling",
+                )
             else:
-                print(step_result.num_processed_tokens, 'number of processed tokens', step_result.num_processed_tokens/running_time, "tokens/sec during decoding")
+                print(
+                    step_result.num_processed_tokens,
+                    "number of processed tokens",
+                    step_result.num_processed_tokens / running_time,
+                    "tokens/sec during decoding",
+                )
             for output in step_result.outputs:
                 generated_tokens[output.request_id].extend(output.token_ids)
 
         ordered_tokens = [generated_tokens[request_id] for request_id in request_ids]
-        output = {'text': [self.tokenizer.decode(tokens) for tokens in ordered_tokens], 'token_ids': ordered_tokens}
+        output = {
+            "text": [self.tokenizer.decode(tokens) for tokens in ordered_tokens],
+            "token_ids": ordered_tokens,
+        }
         return output

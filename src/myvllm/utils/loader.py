@@ -2,18 +2,201 @@ import torch
 from torch import nn
 import os
 from safetensors import safe_open
-from transformers import AutoConfig
 import re
+from dataclasses import dataclass
 
 
 def default_weight_loader(param, weight):
     """Default weight loader that copies weight data to parameter."""
     if param.shape != weight.shape:
-        raise ValueError(f"Shape mismatch: param {param.shape} vs weight {weight.shape}")
+        raise ValueError(
+            f"Shape mismatch: param {param.shape} vs weight {weight.shape}"
+        )
     param.data.copy_(weight)
 
 
-def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
+@dataclass(frozen=True)
+class WeightLoadSummary:
+    loaded_model_params: frozenset[str]
+    consumed_checkpoint_weights: frozenset[str]
+    skipped_vision_weights: tuple[str, ...]
+    skipped_merged_weights: tuple[str, ...]
+    unknown_language_weights: tuple[str, ...]
+    unloaded_model_params: tuple[str, ...]
+
+
+def _is_vision_or_multimodal_weight(name: str) -> bool:
+    return (
+        name.startswith("visual.")
+        or name.startswith("vision.")
+        or name.startswith("model.visual.")
+        or name.startswith("model.vision.")
+        or name.startswith("multi_modal_projector.")
+        or ".vision_tower." in name
+    )
+
+
+def load_weights_from_state_dict(
+    model: nn.Module,
+    hf_weights: dict[str, torch.Tensor],
+    *,
+    strict_language: bool = True,
+) -> WeightLoadSummary:
+    # Now map and load weights into custom model
+    loaded_model_params = set()
+    consumed_checkpoint_weights = set()
+    skipped_vision_weights = []
+    skipped_merged_weights = []
+    unknown_language_weights = []
+
+    # Process each HF weight
+    for hf_name, hf_weight in hf_weights.items():
+        try:
+            if _is_vision_or_multimodal_weight(hf_name):
+                skipped_vision_weights.append(hf_name)
+                consumed_checkpoint_weights.add(hf_name)
+                continue
+
+            # 0. Direct names first. Qwen3.5 text layers deliberately keep the
+            # HF module names, while the legacy Qwen3 model still falls through
+            # to packed qkv/gate_up handling below.
+            try:
+                param = model.get_parameter(hf_name)
+            except AttributeError:
+                param = None
+            if param is not None:
+                default_weight_loader(param, hf_weight)
+                loaded_model_params.add(hf_name)
+                consumed_checkpoint_weights.add(hf_name)
+                continue
+
+            # 1. Handle QKV merge (q_proj + k_proj + v_proj -> qkv_projection)
+            if ".self_attn.q_proj.weight" in hf_name:
+                layer_match = re.search(r"layers\.(\d+)", hf_name)
+                if layer_match:
+                    layer_idx = layer_match.group(1)
+                    k_name = hf_name.replace("q_proj", "k_proj")
+                    v_name = hf_name.replace("q_proj", "v_proj")
+
+                    if k_name in hf_weights and v_name in hf_weights:
+                        q_weight = hf_weight
+                        k_weight = hf_weights[k_name]
+                        v_weight = hf_weights[v_name]
+
+                        # Concatenate q, k, v along output dimension
+                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+                        custom_name = (
+                            f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
+                        )
+                        try:
+                            param = model.get_parameter(custom_name)
+                            default_weight_loader(param, qkv_weight)
+                            loaded_model_params.add(custom_name)
+                            consumed_checkpoint_weights.update(
+                                {hf_name, k_name, v_name}
+                            )
+                            continue
+                        except AttributeError:
+                            pass
+
+            # 2. Handle gate_up merge (gate_proj + up_proj -> gate_up)
+            elif ".mlp.gate_proj.weight" in hf_name:
+                layer_match = re.search(r"layers\.(\d+)", hf_name)
+                if layer_match:
+                    layer_idx = layer_match.group(1)
+                    up_name = hf_name.replace("gate_proj", "up_proj")
+
+                    if up_name in hf_weights:
+                        gate_weight = hf_weight
+                        up_weight = hf_weights[up_name]
+
+                        # Concatenate gate and up along output dimension
+                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
+
+                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.weight"
+                        try:
+                            param = model.get_parameter(custom_name)
+                            default_weight_loader(param, gate_up_weight)
+                            loaded_model_params.add(custom_name)
+                            consumed_checkpoint_weights.update({hf_name, up_name})
+                            continue
+                        except AttributeError:
+                            pass
+
+            # 3. Handle gate_up merge for bias (if present)
+            elif ".mlp.gate_proj.bias" in hf_name:
+                layer_match = re.search(r"layers\.(\d+)", hf_name)
+                if layer_match:
+                    layer_idx = layer_match.group(1)
+                    up_bias_name = hf_name.replace("gate_proj", "up_proj")
+
+                    if up_bias_name in hf_weights:
+                        gate_bias = hf_weight
+                        up_bias = hf_weights[up_bias_name]
+                        gate_up_bias = torch.cat([gate_bias, up_bias], dim=0)
+
+                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.bias"
+                        try:
+                            param = model.get_parameter(custom_name)
+                            default_weight_loader(param, gate_up_bias)
+                            loaded_model_params.add(custom_name)
+                            consumed_checkpoint_weights.update({hf_name, up_bias_name})
+                            continue
+                        except AttributeError:
+                            pass
+
+            # 4. Skip k_proj, v_proj, up_proj only when their partner merge consumed them.
+            if hf_name in consumed_checkpoint_weights and any(
+                x in hf_name for x in [".k_proj.", ".v_proj.", ".up_proj."]
+            ):
+                skipped_merged_weights.append(hf_name)
+            else:
+                unknown_language_weights.append(hf_name)
+
+        except Exception as e:
+            unknown_language_weights.append(f"{hf_name}: {str(e)}")
+
+    # Check for model parameters that weren't loaded. A tied lm_head may not be
+    # yielded by named_parameters(), which is fine; get_parameter() was loaded via
+    # the shared embedding weight when tie_word_embeddings=True.
+    unloaded_model_params = []
+    for name, param in model.named_parameters():
+        if name not in loaded_model_params:
+            unloaded_model_params.append(name)
+
+    summary = WeightLoadSummary(
+        loaded_model_params=frozenset(loaded_model_params),
+        consumed_checkpoint_weights=frozenset(consumed_checkpoint_weights),
+        skipped_vision_weights=tuple(skipped_vision_weights),
+        skipped_merged_weights=tuple(skipped_merged_weights),
+        unknown_language_weights=tuple(unknown_language_weights),
+        unloaded_model_params=tuple(unloaded_model_params),
+    )
+    if strict_language and (
+        summary.unknown_language_weights or summary.unloaded_model_params
+    ):
+        details = []
+        if summary.unknown_language_weights:
+            details.append(
+                "unknown language checkpoint weights: "
+                + ", ".join(summary.unknown_language_weights[:10])
+            )
+        if summary.unloaded_model_params:
+            details.append(
+                "unloaded model parameters: "
+                + ", ".join(summary.unloaded_model_params[:10])
+            )
+        raise RuntimeError("Incomplete language weight load: " + "; ".join(details))
+    return summary
+
+
+def load_weights_from_checkpoint(
+    model: nn.Module,
+    model_name_or_path: str,
+    *,
+    strict_language: bool = True,
+) -> WeightLoadSummary:
     """
     Load weights from a Hugging Face model checkpoint into the custom model.
     Handles QKV and gate_up weight merging for optimized layers.
@@ -28,7 +211,7 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     checkpoint_path = None
 
     # First, try local paths
-    if model_name_or_path.startswith('~'):
+    if model_name_or_path.startswith("~"):
         checkpoint_path = os.path.expanduser(model_name_or_path)
     elif os.path.isdir(model_name_or_path):
         checkpoint_path = model_name_or_path
@@ -39,7 +222,11 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
             checkpoint_path = snapshot_download(
                 repo_id=model_name_or_path,
                 allow_patterns=["*.safetensors", "*.json"],
-                ignore_patterns=["*.msgpack", "*.h5", "*.bin"]  # Skip non-safetensors weights
+                ignore_patterns=[
+                    "*.msgpack",
+                    "*.h5",
+                    "*.bin",
+                ],  # Skip non-safetensors weights
             )
         except Exception as e:
             raise ValueError(
@@ -52,7 +239,9 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
         raise ValueError(f"Checkpoint path not found: {checkpoint_path}")
 
     # Load all safetensors files in the checkpoint directory
-    safetensor_files = [f for f in os.listdir(checkpoint_path) if f.endswith('.safetensors')]
+    safetensor_files = [
+        f for f in os.listdir(checkpoint_path) if f.endswith(".safetensors")
+    ]
 
     if not safetensor_files:
         raise ValueError(f"No .safetensors files found in {checkpoint_path}")
@@ -61,154 +250,37 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     hf_weights = {}
     for file in sorted(safetensor_files):
         file_path = os.path.join(checkpoint_path, file)
-        with safe_open(file_path, framework='pt', device='cpu') as f:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
             for weight_name in f.keys():
                 hf_weights[weight_name] = f.get_tensor(weight_name)
 
-    # Now map and load weights into custom model
-    loaded_params = set()
-    skipped_params = []
-
-    # Process each HF weight
-    for hf_name, hf_weight in hf_weights.items():
-        try:
-            # 1. Handle QKV merge (q_proj + k_proj + v_proj → qkv_projection)
-            if '.self_attn.q_proj.weight' in hf_name:
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    k_name = hf_name.replace('q_proj', 'k_proj')
-                    v_name = hf_name.replace('q_proj', 'v_proj')
-
-                    if k_name in hf_weights and v_name in hf_weights:
-                        q_weight = hf_weight
-                        k_weight = hf_weights[k_name]
-                        v_weight = hf_weights[v_name]
-
-                        # Concatenate q, k, v along output dimension
-                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
-                        try:
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(qkv_weight)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(k_name)
-                            loaded_params.add(v_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
-
-            # 2. Handle gate_up merge (gate_proj + up_proj → gate_up)
-            elif '.mlp.gate_proj.weight' in hf_name:
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    up_name = hf_name.replace('gate_proj', 'up_proj')
-
-                    if up_name in hf_weights:
-                        gate_weight = hf_weight
-                        up_weight = hf_weights[up_name]
-
-                        # Concatenate gate and up along output dimension
-                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.weight"
-                        try:
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(gate_up_weight)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(up_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
-
-            # 3. Handle gate_up merge for bias (if present)
-            elif '.mlp.gate_proj.bias' in hf_name:
-                layer_match = re.search(r'layers\.(\d+)', hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    up_bias_name = hf_name.replace('gate_proj', 'up_proj')
-
-                    if up_bias_name in hf_weights:
-                        gate_bias = hf_weight
-                        up_bias = hf_weights[up_bias_name]
-                        gate_up_bias = torch.cat([gate_bias, up_bias], dim=0)
-
-                        custom_name = f"model.layers.{layer_idx}.mlp.gate_up.bias"
-                        try:
-                            param = model.get_parameter(custom_name)
-                            param.data.copy_(gate_up_bias)
-                            loaded_params.add(custom_name)
-                            loaded_params.add(hf_name)
-                            loaded_params.add(up_bias_name)
-                        except AttributeError:
-                            skipped_params.append((custom_name, "Parameter not found"))
-
-            # 4. Skip k_proj, v_proj, up_proj (already merged)
-            elif any(x in hf_name for x in ['.k_proj.', '.v_proj.', '.up_proj.']):
-                if hf_name not in loaded_params:
-                    skipped_params.append((hf_name, "Merged into qkv_projection or gate_up"))
-
-            # 5. All other parameters: load directly (names match HF)
-            else:
-                try:
-                    param = model.get_parameter(hf_name)
-                    if param.shape != hf_weight.shape:
-                        # Handle vocab size mismatch for embeddings/lm_head
-                        if len(param.shape) > 0 and len(hf_weight.shape) > 0:
-                            min_size = min(param.shape[0], hf_weight.shape[0])
-                            param.data[:min_size].copy_(hf_weight[:min_size])
-                        else:
-                            param.data.copy_(hf_weight)
-                    else:
-                        param.data.copy_(hf_weight)
-                    loaded_params.add(hf_name)
-                except AttributeError:
-                    skipped_params.append((hf_name, "Parameter not found"))
-
-        except Exception as e:
-            skipped_params.append((hf_name, f"Error: {str(e)}"))
-
-    # Check for model parameters that weren't loaded
-    unloaded_params = []
-    for name, param in model.named_parameters():
-        if name not in loaded_params:
-            unloaded_params.append(name)
+    summary = load_weights_from_state_dict(
+        model, hf_weights, strict_language=strict_language
+    )
 
     print(f"\n{'='*80}")
     print(f"Weight Loading Summary:")
     print(f"{'='*80}")
-    print(f"Successfully loaded: {len([p for p in loaded_params if not any(x in p for x in ['.k_proj.', '.v_proj.', '.up_proj.'])])} parameter groups")
+    print(f"Successfully loaded: {len(summary.loaded_model_params)} model parameters")
+    print(f"Skipped vision/multimodal weights: {len(summary.skipped_vision_weights)}")
+    print(f"Consumed checkpoint weights: {len(summary.consumed_checkpoint_weights)}")
 
-    if unloaded_params:
-        print(f"\n⚠️  WARNING: {len(unloaded_params)} model parameters NOT loaded from checkpoint:")
-        for name in unloaded_params[:15]:
+    if summary.unloaded_model_params:
+        print(
+            f"\nWARNING: {len(summary.unloaded_model_params)} model parameters NOT loaded from checkpoint:"
+        )
+        for name in summary.unloaded_model_params[:15]:
             param = dict(model.named_parameters())[name]
             print(f"  - {name} (shape: {param.shape}, mean: {param.data.mean():.6f})")
-        if len(unloaded_params) > 15:
-            print(f"  ... and {len(unloaded_params) - 15} more")
+        if len(summary.unloaded_model_params) > 15:
+            print(f"  ... and {len(summary.unloaded_model_params) - 15} more")
 
-    if skipped_params:
-        # Group skipped by reason
-        merged_skips = [s for s in skipped_params if "Merged" in s[1]]
-        not_found_skips = [s for s in skipped_params if "not found" in s[1]]
-        no_mapping_skips = [s for s in skipped_params if "No mapping" in s[1]]
-
-        if merged_skips:
-            print(f"Skipped (merged into other weights): {len(merged_skips)}")
-        if not_found_skips:
-            print(f"Skipped (not found in model): {len(not_found_skips)}")
-            for name, reason in not_found_skips[:5]:
-                print(f"  - {name}")
-            if len(not_found_skips) > 5:
-                print(f"  ... and {len(not_found_skips) - 5} more")
-        if no_mapping_skips:
-            print(f"Skipped (no mapping rule): {len(no_mapping_skips)}")
-            for name, reason in no_mapping_skips[:5]:
-                print(f"  - {name}")
-            if len(no_mapping_skips) > 5:
-                print(f"  ... and {len(no_mapping_skips) - 5} more")
+    if summary.unknown_language_weights:
+        print(f"Unknown language weights: {len(summary.unknown_language_weights)}")
+        for name in summary.unknown_language_weights[:15]:
+            print(f"  - {name}")
+        if len(summary.unknown_language_weights) > 15:
+            print(f"  ... and {len(summary.unknown_language_weights) - 15} more")
 
     print(f"{'='*80}")
-    return loaded_params
+    return summary
