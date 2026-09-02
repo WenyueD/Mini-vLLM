@@ -59,6 +59,20 @@ ls "$MINIVLLM_QWEN38_PATH" | head
 python scripts/check_qwen38_config.py | tee results/qwen38_target/config_check.txt
 ```
 
+## Weight Name Audit Before Loading 27B
+
+This step reads only safetensors headers and instantiates the Mini-vLLM target on
+the `meta` device.  It must pass before attempting to allocate the 27B target on
+the GPU.
+
+```bash
+python scripts/audit_qwen38_weights.py | tee results/qwen38_target/weight_audit.txt
+```
+
+If this reports missing model parameters, unknown language weights, or shape
+mismatches, stop and fix the mapping first.  Do not start a real 27B load while
+the audit fails.
+
 ## Test Commands
 
 ```bash
