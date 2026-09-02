@@ -36,6 +36,19 @@ def _is_vision_or_multimodal_weight(name: str) -> bool:
     )
 
 
+def canonical_language_weight_name(name: str) -> str:
+    """Map Qwen3.5 multimodal wrapper names onto Mini-vLLM text target names."""
+    if name.startswith("model.language_model.lm_head."):
+        return name.removeprefix("model.language_model.")
+    if name.startswith("language_model.lm_head."):
+        return name.removeprefix("language_model.")
+    if name.startswith("model.language_model."):
+        return "model." + name.removeprefix("model.language_model.")
+    if name.startswith("language_model."):
+        return "model." + name.removeprefix("language_model.")
+    return name
+
+
 def load_weights_from_state_dict(
     model: nn.Module,
     hf_weights: dict[str, torch.Tensor],
@@ -56,23 +69,24 @@ def load_weights_from_state_dict(
                 skipped_vision_weights.append(hf_name)
                 consumed_checkpoint_weights.add(hf_name)
                 continue
+            model_name = canonical_language_weight_name(hf_name)
 
             # 0. Direct names first. Qwen3.5 text layers deliberately keep the
             # HF module names, while the legacy Qwen3 model still falls through
             # to packed qkv/gate_up handling below.
             try:
-                param = model.get_parameter(hf_name)
+                param = model.get_parameter(model_name)
             except AttributeError:
                 param = None
             if param is not None:
                 default_weight_loader(param, hf_weight)
-                loaded_model_params.add(hf_name)
+                loaded_model_params.add(model_name)
                 consumed_checkpoint_weights.add(hf_name)
                 continue
 
             # 1. Handle QKV merge (q_proj + k_proj + v_proj -> qkv_projection)
-            if ".self_attn.q_proj.weight" in hf_name:
-                layer_match = re.search(r"layers\.(\d+)", hf_name)
+            if ".self_attn.q_proj.weight" in model_name:
+                layer_match = re.search(r"layers\.(\d+)", model_name)
                 if layer_match:
                     layer_idx = layer_match.group(1)
                     k_name = hf_name.replace("q_proj", "k_proj")
@@ -101,8 +115,8 @@ def load_weights_from_state_dict(
                             pass
 
             # 2. Handle gate_up merge (gate_proj + up_proj -> gate_up)
-            elif ".mlp.gate_proj.weight" in hf_name:
-                layer_match = re.search(r"layers\.(\d+)", hf_name)
+            elif ".mlp.gate_proj.weight" in model_name:
+                layer_match = re.search(r"layers\.(\d+)", model_name)
                 if layer_match:
                     layer_idx = layer_match.group(1)
                     up_name = hf_name.replace("gate_proj", "up_proj")
@@ -125,8 +139,8 @@ def load_weights_from_state_dict(
                             pass
 
             # 3. Handle gate_up merge for bias (if present)
-            elif ".mlp.gate_proj.bias" in hf_name:
-                layer_match = re.search(r"layers\.(\d+)", hf_name)
+            elif ".mlp.gate_proj.bias" in model_name:
+                layer_match = re.search(r"layers\.(\d+)", model_name)
                 if layer_match:
                     layer_idx = layer_match.group(1)
                     up_bias_name = hf_name.replace("gate_proj", "up_proj")

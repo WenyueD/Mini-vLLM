@@ -386,7 +386,7 @@ class Qwen35DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         if self.block_type == "linear_attention":
-            self.self_attn = Qwen35GatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen35GatedDeltaNet(config, layer_idx)
         else:
             self.self_attn = Qwen35Attention(config, layer_idx)
         self.mlp = Qwen35MLP(config)
@@ -400,7 +400,7 @@ class Qwen35DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.block_type == "linear_attention":
-            hidden_states = self.self_attn(hidden_states)
+            hidden_states = self.linear_attn(hidden_states)
         else:
             hidden_states = self.self_attn(
                 hidden_states, position_embeddings, attention_mask=attention_mask
@@ -484,11 +484,11 @@ class Qwen35TextModel(nn.Module):
             if layer.block_type == "linear_attention":
                 previous = request_state.linear_layers.get(layer_idx)
                 if previous is None:
-                    attn_out, recurrent, conv = layer.self_attn(
+                    attn_out, recurrent, conv = layer.linear_attn(
                         normed, return_final_state=True
                     )
                 else:
-                    attn_out, recurrent, conv = layer.self_attn(
+                    attn_out, recurrent, conv = layer.linear_attn(
                         normed,
                         recurrent_state=previous.recurrent_state,
                         conv_state=previous.conv_state,

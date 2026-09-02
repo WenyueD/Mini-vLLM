@@ -64,6 +64,22 @@ def test_qwen35_loader_maps_complete_language_weights_and_skips_vision():
     assert summary.unloaded_model_params == ()
 
 
+def test_qwen35_loader_accepts_multimodal_language_model_prefix():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    weights = {
+        f"model.language_model.{name.removeprefix('model.')}": value
+        for name, value in synthetic_weights_for(model).items()
+    }
+
+    summary = load_weights_from_state_dict(model, weights, strict_language=True)
+
+    assert set(summary.loaded_model_params) == {
+        name for name, _ in model.named_parameters()
+    }
+    assert summary.unknown_language_weights == ()
+    assert summary.unloaded_model_params == ()
+
+
 def test_qwen35_loader_rejects_unknown_language_weight():
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=1))
     weights = synthetic_weights_for(model)
