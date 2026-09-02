@@ -69,14 +69,24 @@ class ModelRunner:
         # set model
         path_str = self.config["model_name_or_path"]
         model_name = Path(path_str).name
+        qwen35_raw_config = None
         qwen35_text_config = None
         configured_dtype = _dtype_from_config(config.get("dtype"))
         if configured_dtype is not None:
             torch.set_default_dtype(configured_dtype)
-        if is_qwen35_config(config) or model_name in {"Qwen3.8-27B", "Qwen3.5-27B"}:
+        if is_qwen35_config(config):
             qwen35_raw_config = config
-            if not is_qwen35_config(qwen35_raw_config):
-                qwen35_raw_config = load_qwen35_config_dict(path_str)
+        elif model_name in {"Qwen3.8-27B", "Qwen3.5-27B"} or Path(path_str).is_dir():
+            try:
+                candidate_config = load_qwen35_config_dict(path_str)
+            except Exception:
+                if model_name in {"Qwen3.8-27B", "Qwen3.5-27B"}:
+                    raise
+            else:
+                if is_qwen35_config(candidate_config):
+                    qwen35_raw_config = candidate_config
+
+        if qwen35_raw_config is not None:
             qwen35_text_config = normalize_qwen35_text_config(qwen35_raw_config)
             if self.world_size != 1:
                 raise NotImplementedError(

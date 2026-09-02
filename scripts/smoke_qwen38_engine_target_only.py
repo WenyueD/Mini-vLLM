@@ -147,7 +147,8 @@ def main() -> None:
     print(f"max_model_length={max_model_length}", flush=True)
     print_cuda_memory("before_engine", device)
 
-    config = {
+    config = dict(raw_config)
+    config.update({
         "model_name_or_path": str(snapshot),
         "world_size": 1,
         "block_size": args.block_size,
@@ -166,7 +167,7 @@ def main() -> None:
         "stream_weights": True,
         "safe_open_device": safe_open_device,
         "strict_language_weights": True,
-    }
+    })
 
     engine = None
     started = time.time()
