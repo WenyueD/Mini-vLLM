@@ -1,8 +1,12 @@
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from myvllm.models.qwen3_8 import Qwen35ForCausalLM
-from myvllm.utils.loader import load_weights_from_state_dict
+from myvllm.utils.loader import (
+    load_weights_from_safetensors_streaming,
+    load_weights_from_state_dict,
+)
 
 
 def tiny_config(num_layers=2):
@@ -79,6 +83,34 @@ def test_qwen35_loader_accepts_multimodal_language_model_prefix():
 
     assert set(summary.loaded_model_params) == {
         name for name, _ in model.named_parameters()
+    }
+    assert summary.unknown_language_weights == ()
+    assert summary.unloaded_model_params == ()
+
+
+def test_qwen35_streaming_loader_accepts_multimodal_prefix(tmp_path):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=2))
+    weights = {
+        f"model.language_model.{name.removeprefix('model.')}": value
+        for name, value in synthetic_weights_for(model).items()
+    }
+    weights["visual.patch_embed.proj.weight"] = torch.randn(4, 4)
+    weights["mtp.fc.weight"] = torch.randn(4, 4)
+    save_file(weights, tmp_path / "model.safetensors")
+
+    summary = load_weights_from_safetensors_streaming(
+        model,
+        str(tmp_path),
+        strict_language=True,
+        safe_open_device="cpu",
+    )
+
+    assert set(summary.loaded_model_params) == {
+        name for name, _ in model.named_parameters()
+    }
+    assert set(summary.skipped_vision_weights) == {
+        "visual.patch_embed.proj.weight",
+        "mtp.fc.weight",
     }
     assert summary.unknown_language_weights == ()
     assert summary.unloaded_model_params == ()

@@ -22,6 +22,27 @@ from myvllm.models.qwen3_8_config import (
 )
 
 
+_CONFIG_DTYPES = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def _dtype_from_config(value) -> torch.dtype | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    try:
+        return _CONFIG_DTYPES[str(value)]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported model dtype: {value}") from exc
+
+
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         from myvllm.layers.sampler import SamplerLayer
@@ -49,6 +70,9 @@ class ModelRunner:
         path_str = self.config["model_name_or_path"]
         model_name = Path(path_str).name
         qwen35_text_config = None
+        configured_dtype = _dtype_from_config(config.get("dtype"))
+        if configured_dtype is not None:
+            torch.set_default_dtype(configured_dtype)
         if is_qwen35_config(config) or model_name in {"Qwen3.8-27B", "Qwen3.5-27B"}:
             qwen35_raw_config = config
             if not is_qwen35_config(qwen35_raw_config):
@@ -59,7 +83,11 @@ class ModelRunner:
                     "Qwen3.5/Qwen3.8 text-only target currently supports "
                     "world_size=1 in Mini-vLLM"
                 )
-            self.model = Qwen35ForCausalLM(qwen35_text_config)
+            if config.get("init_on_meta", False):
+                with torch.device("meta"):
+                    self.model = Qwen35ForCausalLM(qwen35_text_config)
+            else:
+                self.model = Qwen35ForCausalLM(qwen35_text_config)
             self.config["num_layers"] = qwen35_text_config.num_hidden_layers
             self.config["num_kv_heads"] = qwen35_text_config.num_key_value_heads
             self.config["head_dim"] = qwen35_text_config.head_dim
@@ -119,17 +147,25 @@ class ModelRunner:
                     )
 
         # Load weights in GPU (model moved to GPU before loading weights)
-        self.model = self.model.cuda(rank)
+        if any(param.is_meta for param in self.model.parameters()):
+            self.model.to_empty(device=f"cuda:{rank}")
+        else:
+            self.model = self.model.cuda(rank)
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get("model_name_or_path"):
             from myvllm.utils.loader import load_weights_from_checkpoint
 
             strict_language = bool(config.get("strict_language_weights", True))
+            safe_open_device = str(config.get("safe_open_device", "cpu"))
+            if safe_open_device == "cuda":
+                safe_open_device = f"cuda:{rank}"
             load_weights_from_checkpoint(
                 self.model,
                 config["model_name_or_path"],
                 strict_language=strict_language,
+                stream_safetensors=bool(config.get("stream_weights", False)),
+                safe_open_device=safe_open_device,
             )
 
         # Load weights in CPU (move the model to GPU after loading weights)
@@ -138,7 +174,7 @@ class ModelRunner:
         self.sampler = SamplerLayer()
 
         # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
+        self.default_dtype = next(self.model.parameters()).dtype
 
         # Debug flag for first decode step
         self._first_decode = False
@@ -259,7 +295,12 @@ class ModelRunner:
             )
             for _ in range(batch_size)
         ]
-        self.run(seqs, is_prefill=True)
+        try:
+            self.run(seqs, is_prefill=True)
+        finally:
+            if self.hybrid_cache_manager is not None:
+                for seq in seqs:
+                    self.hybrid_cache_manager.release_request(seq.request_id)
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model

@@ -102,6 +102,70 @@ python scripts/smoke_qwen38_load_only.py \
 
 The pass marker for this phase is `qwen38_load_only=PASS`.
 
+## Forward, Decode, And Engine Smokes
+
+Run these after load-only passes.  The cache-vs-recompute check compares the
+B=1 cached target path with a full recompute path.  bf16 final-vocab logits may
+show small numeric drift, so the 27B smoke uses a looser all-vocab tolerance than
+the unit tests while still requiring the target token decision to match.
+
+```bash
+python scripts/smoke_qwen38_single_token.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  | tee results/qwen38_target/single_token_forward.txt
+
+python scripts/smoke_qwen38_generate_no_cache.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  | tee results/qwen38_target/no_cache_greedy_32.txt
+
+python scripts/smoke_qwen38_cache_vs_recompute.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --atol 0.3 \
+  --rtol 0.05 \
+  | tee results/qwen38_target/cache_vs_recompute_32_bf16_tol03.txt
+
+python scripts/smoke_qwen38_engine_target_only.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  | tee results/qwen38_target/engine_target_only_32.txt
+```
+
+If direct CUDA staging is tight in the engine smoke, retry only that step with
+CPU staging:
+
+```bash
+python scripts/smoke_qwen38_engine_target_only.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cpu \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  | tee results/qwen38_target/engine_target_only_32_cpu_staging.txt
+```
+
+The pass markers are `qwen38_single_token_forward=PASS`,
+`qwen38_no_cache_greedy_32=PASS`, `qwen38_cache_vs_recompute=PASS`, and
+`qwen38_engine_target_only=PASS`.
+
 ## Test Commands
 
 ```bash

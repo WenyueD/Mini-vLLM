@@ -213,11 +213,98 @@ def load_weights_from_state_dict(
     return summary
 
 
+def load_weights_from_safetensors_streaming(
+    model: nn.Module,
+    checkpoint_path: str,
+    *,
+    strict_language: bool = True,
+    safe_open_device: str = "cpu",
+) -> WeightLoadSummary:
+    """Load direct-name safetensors weights one tensor at a time.
+
+    This path is intended for Qwen3.5/Qwen3.8 target checkpoints whose Mini-vLLM
+    parameter names already match the canonical language-model weights.  It avoids
+    collecting the full 27B checkpoint in CPU memory before copying to the model.
+    """
+    safetensor_files = [
+        f for f in os.listdir(checkpoint_path) if f.endswith(".safetensors")
+    ]
+    if not safetensor_files:
+        raise ValueError(f"No .safetensors files found in {checkpoint_path}")
+
+    loaded_model_params = set()
+    consumed_checkpoint_weights = set()
+    skipped_vision_weights = []
+    skipped_merged_weights = []
+    unknown_language_weights = []
+
+    for file in sorted(safetensor_files):
+        file_path = os.path.join(checkpoint_path, file)
+        with safe_open(file_path, framework="pt", device=safe_open_device) as handle:
+            for hf_name in handle.keys():
+                if _is_skippable_non_target_weight(hf_name):
+                    skipped_vision_weights.append(hf_name)
+                    consumed_checkpoint_weights.add(hf_name)
+                    continue
+
+                model_name = canonical_language_weight_name(hf_name)
+                try:
+                    param = model.get_parameter(model_name)
+                except AttributeError:
+                    param = None
+                if param is None:
+                    unknown_language_weights.append(hf_name)
+                    continue
+
+                weight = handle.get_tensor(hf_name)
+                if weight.device != param.device:
+                    weight = weight.to(device=param.device)
+                try:
+                    default_weight_loader(param, weight)
+                except Exception as exc:
+                    unknown_language_weights.append(f"{hf_name}: {exc}")
+                    continue
+                loaded_model_params.add(model_name)
+                consumed_checkpoint_weights.add(hf_name)
+
+    unloaded_model_params = []
+    for name, _ in model.named_parameters():
+        if name not in loaded_model_params:
+            unloaded_model_params.append(name)
+
+    summary = WeightLoadSummary(
+        loaded_model_params=frozenset(loaded_model_params),
+        consumed_checkpoint_weights=frozenset(consumed_checkpoint_weights),
+        skipped_vision_weights=tuple(skipped_vision_weights),
+        skipped_merged_weights=tuple(skipped_merged_weights),
+        unknown_language_weights=tuple(unknown_language_weights),
+        unloaded_model_params=tuple(unloaded_model_params),
+    )
+    if strict_language and (
+        summary.unknown_language_weights or summary.unloaded_model_params
+    ):
+        details = []
+        if summary.unknown_language_weights:
+            details.append(
+                "unknown language checkpoint weights: "
+                + ", ".join(summary.unknown_language_weights[:10])
+            )
+        if summary.unloaded_model_params:
+            details.append(
+                "unloaded model parameters: "
+                + ", ".join(summary.unloaded_model_params[:10])
+            )
+        raise RuntimeError("Incomplete language weight load: " + "; ".join(details))
+    return summary
+
+
 def load_weights_from_checkpoint(
     model: nn.Module,
     model_name_or_path: str,
     *,
     strict_language: bool = True,
+    stream_safetensors: bool = False,
+    safe_open_device: str = "cpu",
 ) -> WeightLoadSummary:
     """
     Load weights from a Hugging Face model checkpoint into the custom model.
@@ -259,6 +346,47 @@ def load_weights_from_checkpoint(
 
     if not os.path.exists(checkpoint_path):
         raise ValueError(f"Checkpoint path not found: {checkpoint_path}")
+
+    if stream_safetensors:
+        summary = load_weights_from_safetensors_streaming(
+            model,
+            checkpoint_path,
+            strict_language=strict_language,
+            safe_open_device=safe_open_device,
+        )
+        print(f"\n{'='*80}")
+        print("Weight Loading Summary:")
+        print(f"{'='*80}")
+        print(
+            f"Successfully loaded: {len(summary.loaded_model_params)} "
+            "model parameters"
+        )
+        print(f"Skipped vision/MTP weights: {len(summary.skipped_vision_weights)}")
+        print(
+            f"Consumed checkpoint weights: "
+            f"{len(summary.consumed_checkpoint_weights)}"
+        )
+        if summary.unknown_language_weights:
+            print(f"Unknown language weights: {len(summary.unknown_language_weights)}")
+            for name in summary.unknown_language_weights[:15]:
+                print(f"  - {name}")
+            if len(summary.unknown_language_weights) > 15:
+                print(f"  ... and {len(summary.unknown_language_weights) - 15} more")
+        if summary.unloaded_model_params:
+            print(
+                f"\nWARNING: {len(summary.unloaded_model_params)} model "
+                "parameters NOT loaded from checkpoint:"
+            )
+            for name in summary.unloaded_model_params[:15]:
+                param = dict(model.named_parameters())[name]
+                print(
+                    f"  - {name} "
+                    f"(shape: {param.shape}, mean: {param.data.mean():.6f})"
+                )
+            if len(summary.unloaded_model_params) > 15:
+                print(f"  ... and {len(summary.unloaded_model_params) - 15} more")
+        print(f"{'='*80}")
+        return summary
 
     # Load all safetensors files in the checkpoint directory
     safetensor_files = [
