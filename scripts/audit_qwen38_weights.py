@@ -13,6 +13,8 @@ from myvllm.models.qwen3_8_config import (
     normalize_qwen35_text_config,
 )
 from myvllm.utils.loader import (
+    _is_mtp_weight,
+    _is_skippable_non_target_weight,
     _is_vision_or_multimodal_weight,
     canonical_language_weight_name,
 )
@@ -56,17 +58,18 @@ def main() -> None:
     language_ckpt = {}
     duplicate_canonical_names = []
     for name, shape in ckpt.items():
-        if _is_vision_or_multimodal_weight(name):
+        if _is_skippable_non_target_weight(name):
             continue
         canonical = canonical_language_weight_name(name)
         if canonical in language_ckpt:
             duplicate_canonical_names.append(canonical)
         language_ckpt[canonical] = shape
     vision = sorted(name for name in ckpt if _is_vision_or_multimodal_weight(name))
+    mtp = sorted(name for name in ckpt if _is_mtp_weight(name))
     original_language_names = {
         name
         for name, shape in ckpt.items()
-        if not _is_vision_or_multimodal_weight(name)
+        if not _is_skippable_non_target_weight(name)
     }
     missing = sorted(set(model) - set(language_ckpt))
     unknown = sorted(set(language_ckpt) - set(model))
@@ -82,6 +85,7 @@ def main() -> None:
     print(f"canonical_language_tensors={len(language_ckpt)}")
     print(f"duplicate_canonical_names={len(duplicate_canonical_names)}")
     print(f"vision_or_multimodal_skipped={len(vision)}")
+    print(f"mtp_skipped={len(mtp)}")
     print(f"model_parameters={len(model)}")
     print(f"missing_model_parameters={len(missing)}")
     print(f"unknown_language_weights={len(unknown)}")

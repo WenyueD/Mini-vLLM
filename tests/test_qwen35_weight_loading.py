@@ -53,13 +53,17 @@ def test_qwen35_loader_maps_complete_language_weights_and_skips_vision():
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=2))
     weights = synthetic_weights_for(model)
     weights["visual.patch_embed.proj.weight"] = torch.randn(4, 4)
+    weights["mtp.fc.weight"] = torch.randn(4, 4)
 
     summary = load_weights_from_state_dict(model, weights, strict_language=True)
 
     assert set(summary.loaded_model_params) == {
         name for name, _ in model.named_parameters()
     }
-    assert summary.skipped_vision_weights == ("visual.patch_embed.proj.weight",)
+    assert set(summary.skipped_vision_weights) == {
+        "visual.patch_embed.proj.weight",
+        "mtp.fc.weight",
+    }
     assert summary.unknown_language_weights == ()
     assert summary.unloaded_model_params == ()
 

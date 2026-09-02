@@ -36,6 +36,14 @@ def _is_vision_or_multimodal_weight(name: str) -> bool:
     )
 
 
+def _is_mtp_weight(name: str) -> bool:
+    return name.startswith("mtp.") or name.startswith("model.mtp.")
+
+
+def _is_skippable_non_target_weight(name: str) -> bool:
+    return _is_vision_or_multimodal_weight(name) or _is_mtp_weight(name)
+
+
 def canonical_language_weight_name(name: str) -> str:
     """Map Qwen3.5 multimodal wrapper names onto Mini-vLLM text target names."""
     if name.startswith("model.language_model.lm_head."):
@@ -65,7 +73,7 @@ def load_weights_from_state_dict(
     # Process each HF weight
     for hf_name, hf_weight in hf_weights.items():
         try:
-            if _is_vision_or_multimodal_weight(hf_name):
+            if _is_skippable_non_target_weight(hf_name):
                 skipped_vision_weights.append(hf_name)
                 consumed_checkpoint_weights.add(hf_name)
                 continue
