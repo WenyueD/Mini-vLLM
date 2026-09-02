@@ -73,6 +73,35 @@ If this reports missing model parameters, unknown language weights, or shape
 mismatches, stop and fix the mapping first.  Do not start a real 27B load while
 the audit fails.
 
+## Load-Only 27B Target Smoke
+
+Run this only after `weight_name_audit=PASS`.  It allocates the Mini-vLLM text
+target on one GPU in bf16, streams safetensors weights one file at a time, skips
+vision and MTP weights, prints peak CUDA memory, and exits without running
+forward or allocating KV cache.
+
+```bash
+python scripts/smoke_qwen38_load_only.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  | tee results/qwen38_target/load_only.txt
+```
+
+If direct CUDA staging causes a temporary OOM, retry once with CPU staging:
+
+```bash
+python scripts/smoke_qwen38_load_only.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cpu \
+  | tee results/qwen38_target/load_only_cpu_staging.txt
+```
+
+The pass marker for this phase is `qwen38_load_only=PASS`.
+
 ## Test Commands
 
 ```bash
