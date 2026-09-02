@@ -18,6 +18,8 @@ from myvllm.spec_decode.types import (
 )
 
 VerifyFn = Callable[[SpecDecodeBatch], list[VerificationResult]]
+CommitVerifiedCacheFn = Callable[[dict[int, int]], None]
+RollbackVerifiedCacheFn = Callable[[list[int]], None]
 
 
 class SpecDecodeCoordinator:
@@ -42,6 +44,8 @@ class SpecDecodeCoordinator:
         verify: VerifyFn,
         eos_token_id: int,
         max_verification_tokens: int | None = None,
+        commit_verified_cache: CommitVerifiedCacheFn | None = None,
+        rollback_verified_cache: RollbackVerifiedCacheFn | None = None,
     ) -> list[SpecDecodeStepResult]:
         if any(not seq.is_greedy for seq in sequences):
             raise ValueError("speculative decoding MVP only supports temperature=0")
@@ -71,6 +75,7 @@ class SpecDecodeCoordinator:
         reservations = block_manager.reserve_batch([(seq, 0) for seq in sequences])
         chosen: list[Proposal] = []
         seq_transactions: list[SequenceTransaction] = []
+        verifications: list[VerificationResult] = []
         try:
             for seq, proposal, reservation in zip(sequences, proposals, reservations):
                 try:
@@ -107,10 +112,13 @@ class SpecDecodeCoordinator:
                 reservations,
                 block_manager,
                 eos_token_id,
+                commit_verified_cache,
             )
             self.metrics.add_stage_time("commit", perf_counter() - started)
             return results
         except Exception:
+            if rollback_verified_cache is not None:
+                rollback_verified_cache([seq.seq_id for seq in sequences])
             for seq, transaction in zip(sequences, seq_transactions):
                 if seq.active_transaction is transaction:
                     seq.rollback(transaction)
@@ -153,6 +161,7 @@ class SpecDecodeCoordinator:
         reservations: list[KVReservation],
         block_manager: BlockManager,
         eos_token_id: int,
+        commit_verified_cache: CommitVerifiedCacheFn | None = None,
     ) -> list[SpecDecodeStepResult]:
         plans = []
         for seq, proposal, sample, transaction, reservation in zip(
@@ -199,6 +208,22 @@ class SpecDecodeCoordinator:
         # Every Sequence and BlockManager mutation has now been validated. The
         # second pass contains only deterministic state transitions, preventing a
         # later request's validation error from leaving an earlier request committed.
+        if commit_verified_cache is not None:
+            commit_verified_cache(
+                {
+                    seq.seq_id: 1 + committed_sample.accepted_proposal_tokens
+                    for (
+                        seq,
+                        _proposal,
+                        _transaction,
+                        _reservation,
+                        _emitted,
+                        _finish_reason,
+                        committed_sample,
+                    ) in plans
+                }
+            )
+
         results = []
         for (
             seq,

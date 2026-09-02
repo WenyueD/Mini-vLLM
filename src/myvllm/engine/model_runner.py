@@ -61,6 +61,7 @@ class ModelRunner:
         self.rank = rank
         self.is_qwen35_target = False
         self.hybrid_cache_manager = None
+        self._pending_verified_cache_transactions = {}
         dist.init_process_group(
             "nccl", "tcp://localhost:12345", world_size=config["world_size"], rank=rank
         )
@@ -688,6 +689,8 @@ class ModelRunner:
 
     def verify(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
         """Greedy K+1 target decisions for each speculative request."""
+        if getattr(self, "is_qwen35_target", False):
+            return self._verify_qwen35_cached(batch)
         try:
             input_ids, query_lengths = self.prepare_speculative(batch)
             logits = self.run_model(input_ids, is_prefill=False, force_eager=True)
@@ -712,6 +715,96 @@ class ModelRunner:
             return results
         finally:
             reset_context()
+
+    @torch.inference_mode()
+    def _verify_qwen35_cached(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
+        """Run Qwen3.5/Qwen3.8 B=1 verification through HybridCache snapshots."""
+        if self.hybrid_cache_manager is None:
+            raise RuntimeError("Qwen3.5/Qwen3.8 verifier requires HybridCacheManager")
+        if len(batch.sequences) != 1:
+            raise NotImplementedError(
+                "Qwen3.5/Qwen3.8 speculative verification currently supports B=1"
+            )
+        seq = batch.sequences[0]
+        proposal = batch.proposals[0]
+        if seq.num_tokens - seq.num_computed_tokens != 1:
+            raise RuntimeError("verification requires exactly one pending token")
+        if tuple(seq.provisional_token_ids) != proposal.token_ids:
+            raise RuntimeError("sequence/proposal provisional state mismatch")
+
+        self.rollback_verified_cache([seq.seq_id])
+        query_tokens = (seq.last_token, *proposal.token_ids)
+        transaction = self.hybrid_cache_manager.begin_transaction(
+            [seq.request_id],
+            {seq.request_id: len(query_tokens)},
+        )
+        try:
+            device = next(self.model.parameters()).device
+            input_ids = torch.tensor(query_tokens, dtype=torch.long, device=device)
+            output = self.model.forward_with_cache(
+                input_ids,
+                self.hybrid_cache_manager,
+                seq.request_id,
+                transaction=transaction,
+                capture_hidden_taps=bool(
+                    self.config.get("capture_verification_hidden_taps", False)
+                ),
+            )
+            if self.rank != 0:
+                return []
+            flat_logits = output.logits.reshape(-1, output.logits.shape[-1])
+            temperatures = torch.zeros(
+                flat_logits.shape[0],
+                dtype=torch.float32,
+                device=flat_logits.device,
+            )
+            token_ids = self.sampler(flat_logits, temperatures).detach().cpu().tolist()
+            self._pending_verified_cache_transactions[seq.seq_id] = (
+                transaction,
+                seq.request_id,
+            )
+            return [
+                VerificationResult(
+                    sequence_id=seq.seq_id,
+                    target_token_ids=tuple(token_ids),
+                    metadata={
+                        "hybrid_cache_transaction_id": transaction.transaction_id,
+                        "hybrid_cache_request_id": seq.request_id,
+                        "verified_tokens": len(query_tokens),
+                        "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
+                    },
+                )
+            ]
+        except Exception:
+            if transaction.state.name == "ACTIVE":
+                self.hybrid_cache_manager.rollback(transaction)
+            raise
+
+    def commit_verified_cache(self, accepted_lengths_by_sequence: dict[int, int]) -> None:
+        if self.hybrid_cache_manager is None:
+            return
+        pending = getattr(self, "_pending_verified_cache_transactions", {})
+        for sequence_id, accepted_length in accepted_lengths_by_sequence.items():
+            entry = pending.pop(sequence_id, None)
+            if entry is None:
+                continue
+            transaction, request_id = entry
+            self.hybrid_cache_manager.commit(
+                transaction,
+                {request_id: accepted_length},
+            )
+
+    def rollback_verified_cache(self, sequence_ids: list[int]) -> None:
+        if self.hybrid_cache_manager is None:
+            return
+        pending = getattr(self, "_pending_verified_cache_transactions", {})
+        for sequence_id in sequence_ids:
+            entry = pending.pop(sequence_id, None)
+            if entry is None:
+                continue
+            transaction, _request_id = entry
+            if transaction.state.name == "ACTIVE":
+                self.hybrid_cache_manager.rollback(transaction)
 
     def release_hybrid_requests(self, request_ids: list[str]) -> None:
         if self.hybrid_cache_manager is None:

@@ -169,11 +169,21 @@ The pass markers are `qwen38_single_token_forward=PASS`,
 ## Test Commands
 
 ```bash
-pytest -q
-pytest -q tests/test_qwen35_config_and_model.py tests/test_hybrid_cache_transactions.py tests/test_qwen35_weight_loading.py
+pytest -q --basetemp ./.pytest-tmp
+pytest -q --basetemp ./.pytest-tmp \
+  tests/test_qwen35_config_and_model.py \
+  tests/test_hybrid_cache_transactions.py \
+  tests/test_qwen35_weight_loading.py \
+  tests/test_spec_coordinator.py \
+  tests/test_dflash2_contract.py
 ```
 
 The current unit-test pass is not a real Qwen/Qwen3.8-27B target-only GPU
 acceptance result.  Mark 27B load, 32-token greedy decode, official target token
 alignment, and cache-vs-recompute logits as pending until a dedicated smoke run
 records those artifacts under `results/qwen38_target/`.
+
+The local Windows audit on 2026-09-02 used the repository `.venv` and
+`--basetemp ./.pytest-tmp` because the default user temp directory denied pytest
+access. The latest local regression at that point was `80 passed, 2 skipped`;
+GPU-only tests were skipped locally.

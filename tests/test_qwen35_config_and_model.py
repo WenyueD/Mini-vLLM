@@ -3,11 +3,15 @@ import torch
 
 from myvllm.models.qwen3_8 import Qwen35ForCausalLM, Qwen35GatedDeltaNet
 from myvllm.engine.hybrid_cache import HybridCacheManager
+from myvllm.engine.model_runner import ModelRunner
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
     load_qwen35_config_dict,
     normalize_qwen35_text_config,
 )
+from myvllm.sampling_parameters import SamplingParams
+from myvllm.spec_decode.types import Proposal, SpecDecodeBatch
+from myvllm.engine.sequence import Sequence
 
 
 def qwen38_fixture():
@@ -20,13 +24,13 @@ def qwen38_fixture():
         "model_type": "qwen3_5",
         "text_config": {
             "model_type": "qwen3_5_text",
-            "vocab_size": 151936,
+            "vocab_size": 248320,
             "hidden_size": 5120,
-            "intermediate_size": 27648,
+            "intermediate_size": 17408,
             "num_hidden_layers": 64,
-            "num_attention_heads": 40,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
             "layer_types": layer_types,
             "full_attention_interval": 4,
             "max_position_embeddings": 262144,
@@ -40,7 +44,7 @@ def qwen38_fixture():
             "linear_key_head_dim": 128,
             "linear_value_head_dim": 128,
             "linear_num_key_heads": 16,
-            "linear_num_value_heads": 32,
+            "linear_num_value_heads": 48,
             "tie_word_embeddings": False,
             "eos_token_id": 151645,
         },
@@ -93,11 +97,18 @@ def init_small(module):
 def test_qwen38_nested_text_config_fixture_parses_layer_types_and_taps():
     cfg = normalize_qwen35_text_config(qwen38_fixture())
     assert cfg.hidden_size == 5120
-    assert cfg.vocab_size == 151936
+    assert cfg.vocab_size == 248320
+    assert cfg.intermediate_size == 17408
+    assert cfg.num_attention_heads == 24
+    assert cfg.num_key_value_heads == 4
+    assert cfg.head_dim == 256
     assert cfg.num_hidden_layers == 64
     assert cfg.full_attention_layers == tuple(range(3, 64, 4))
     assert cfg.linear_attention_layers[:3] == (0, 1, 2)
     assert cfg.linear_attention_layers[-1] == 62
+    assert cfg.linear_conv_kernel_dim == 4
+    assert cfg.linear_num_key_heads == 16
+    assert cfg.linear_num_value_heads == 48
     assert QWEN35_DEFAULT_HIDDEN_TAPS == (5, 19, 33, 47, 61)
 
 
@@ -212,3 +223,54 @@ def test_qwen35_cache_transaction_rollback_and_partial_commit_replay_equivalence
         cache.get_request_state("req0"),
         replay_cache.get_request_state("req0"),
     )
+
+
+def test_qwen35_spec_verifier_records_transaction_and_commits_accepted_prefix():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    cache = HybridCacheManager()
+    prefix = torch.tensor([1, 2, 3])
+    model.forward_with_cache(prefix, cache, "req0")
+    before = cache.get_request_state("req0").clone()
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.hybrid_cache_manager = cache
+    runner.is_qwen35_target = True
+    runner.rank = 0
+    runner.config = {"capture_verification_hidden_taps": True}
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+    runner._pending_verified_cache_transactions = {}
+
+    seq = Sequence(
+        [1, 2, 3, 4],
+        4,
+        SamplingParams(temperature=0, max_tokens=16),
+        request_id="req0",
+    )
+    seq.mark_computed(3)
+    tx = seq.begin_speculation([5, 6])
+    batch = SpecDecodeBatch([seq], [Proposal(seq.seq_id, (5, 6))])
+
+    result = runner.verify(batch)[0]
+    full = model(torch.tensor([[1, 2, 3, 4, 5, 6]]), return_dict=True).logits
+    expected = full[:, 3:6, :].argmax(dim=-1).reshape(-1).tolist()
+
+    assert result.target_token_ids == tuple(expected)
+    assert result.metadata["verified_tokens"] == 3
+    assert result.metadata["hidden_tap_layers"] == ()
+    assert cache.get_request_state("req0").logical_length == 6
+
+    runner.rollback_verified_cache([seq.seq_id])
+    assert_cache_state_equal(cache.get_request_state("req0"), before)
+
+    result = runner.verify(batch)[0]
+    runner.commit_verified_cache({seq.seq_id: 2})
+    replay_cache = HybridCacheManager()
+    model.forward_with_cache(torch.tensor([1, 2, 3, 4, 5]), replay_cache, "req0")
+    assert result.metadata["hybrid_cache_request_id"] == "req0"
+    assert_cache_state_equal(
+        cache.get_request_state("req0"),
+        replay_cache.get_request_state("req0"),
+    )
+    seq.rollback(tx)

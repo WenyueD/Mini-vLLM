@@ -158,12 +158,25 @@ class LLMEngine:
                 self.scheduler.postprocess(ordinary_sequences, ordinary_outputs)
                 num_processed_tokens += len(ordinary_sequences)
             if speculative_sequences:
+                commit_verified_cache = None
+                rollback_verified_cache = None
+                if hasattr(self.model_runner, "commit_verified_cache") and hasattr(
+                    self.model_runner, "rollback_verified_cache"
+                ):
+                    commit_verified_cache = lambda accepted: self.model_runner.call(
+                        "commit_verified_cache", accepted
+                    )
+                    rollback_verified_cache = lambda sequence_ids: self.model_runner.call(
+                        "rollback_verified_cache", sequence_ids
+                    )
                 spec_results = self.spec_decode_coordinator.execute(
                     speculative_sequences,
                     self.scheduler.block_manager,
                     lambda batch: self.model_runner.call("verify", batch),
                     self.scheduler.eos,
                     max_verification_tokens=self.scheduler.max_num_batched_tokens,
+                    commit_verified_cache=commit_verified_cache,
+                    rollback_verified_cache=rollback_verified_cache,
                 )
                 num_processed_tokens += sum(
                     len(result.emitted_token_ids) for result in spec_results

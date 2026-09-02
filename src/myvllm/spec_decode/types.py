@@ -34,6 +34,7 @@ class SpecDecodeBatch:
 class VerificationResult:
     sequence_id: int
     target_token_ids: tuple[int, ...]
+    metadata: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True)

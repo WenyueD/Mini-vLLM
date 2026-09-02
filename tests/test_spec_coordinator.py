@@ -192,6 +192,90 @@ def test_validation_failure_rolls_back_both_sequence_and_kv(monkeypatch):
     monkeypatch.setattr(manager, "validate_commit", original_validate)
 
 
+def test_verified_cache_commit_lengths_include_pending_token():
+    params = SamplingParams(temperature=0, max_tokens=20)
+    manager = BlockManager(32, 4)
+    sequences = [
+        Sequence([1, 2], 4, params),
+        Sequence([3, 4], 4, params),
+        Sequence([5, 6], 4, params),
+    ]
+    drafts = {
+        sequences[0].seq_id: [11, 12, 13],
+        sequences[1].seq_id: [21, 22, 23],
+        sequences[2].seq_id: [31, 32, 33],
+    }
+    decisions = {
+        sequences[0].seq_id: [90, 91, 92, 93],  # all reject: keep pending only
+        sequences[1].seq_id: [21, 80, 81, 82],  # one accepted draft
+        sequences[2].seq_id: [31, 32, 33, 70],  # all accepted drafts
+    }
+    for seq in sequences:
+        manager.allocate(seq)
+        seq.status = SequenceStatus.RUNNING
+        seq.mark_computed(len(seq))
+        seq.append_token(next_token(seq.token_ids))
+
+    def verify_from_decisions(batch):
+        return [
+            VerificationResult(seq.seq_id, tuple(decisions[seq.seq_id]))
+            for seq in batch.sequences
+        ]
+
+    committed = []
+    coordinator = SpecDecodeCoordinator(
+        SpeculativeConfig(enabled=True, proposer="mock", num_speculative_tokens=3),
+        MockProposer(drafts),
+    )
+    results = coordinator.execute(
+        sequences,
+        manager,
+        verify_from_decisions,
+        eos_token_id=-1,
+        commit_verified_cache=lambda lengths: committed.append(dict(lengths)),
+    )
+
+    assert [result.accepted_proposal_tokens for result in results] == [0, 1, 3]
+    assert committed == [
+        {
+            sequences[0].seq_id: 1,
+            sequences[1].seq_id: 2,
+            sequences[2].seq_id: 4,
+        }
+    ]
+
+
+def test_verified_cache_rollback_hook_runs_when_commit_fails():
+    seq, manager = setup_seq([1, 2, 3])
+    coordinator = SpecDecodeCoordinator(
+        SpeculativeConfig(enabled=True, proposer="mock", num_speculative_tokens=2),
+        MockProposer({seq.seq_id: [4, 5]}),
+    )
+    rolled_back = []
+
+    def fail_commit(_lengths):
+        raise ValueError("cache commit failed")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="cache commit failed"):
+        coordinator.execute(
+            [seq],
+            manager,
+            fake_verify,
+            eos_token_id=-1,
+            commit_verified_cache=fail_commit,
+            rollback_verified_cache=lambda sequence_ids: rolled_back.extend(
+                sequence_ids
+            ),
+        )
+
+    assert rolled_back == [seq.seq_id]
+    assert seq.active_transaction is None
+    assert not manager._active_reservations
+    manager.assert_consistent()
+
+
 def test_late_batch_validation_failure_does_not_partially_commit(monkeypatch):
     import pytest
 

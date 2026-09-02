@@ -23,9 +23,17 @@ whose language model lives under nested `text_config`.
   `[5, 19, 33, 47, 61]`.
 - A log line showing `(6, 20, 34, 48, 62)` is a one-based display convention,
   not the Python/API key.
-- The fixture used by tests has 64 text layers, `hidden_size=5120`, and every
-  fourth layer as `full_attention`; other layers are `linear_attention`.
+- The fixture used by tests mirrors the public Qwen/Qwen3.8-27B text config:
+  64 text layers, `hidden_size=5120`, `intermediate_size=17408`,
+  `num_attention_heads=24`, `num_key_value_heads=4`, `head_dim=256`,
+  `vocab_size=248320`, and every fourth layer as `full_attention`; other layers
+  are `linear_attention`.
 - Full-attention layers and linear/GDN layers own distinct cache state.
+- The DFlash2 draft-side contract is separate from the target text config:
+  `block_size=8`, K=7, `target_layer_ids=[5,19,33,47,61]`,
+  `selector_top_k=16`, `selector_rank=256`, `conv_kernel_size=2`,
+  `conv_group_size=16`, 5 sliding-attention layers, and
+  `sliding_window=2048`.
 
 ## Cache Contract
 
@@ -46,10 +54,18 @@ cache.rollback(tx)
 ```
 
 `accepted_tokens` is the number of executed provisional tokens to retain. For a
-future K+1 verifier, the caller should map `accepted_proposal_tokens` to retained
-target tokens according to the verifier plan. The manager supports heterogeneous
-batch commits such as `{a: 0, b: 3, c: 7}` and restores full KV, recurrent state,
-conv state, and logical length on rollback.
+K+1 verifier, Mini-vLLM maps `accepted_proposal_tokens` to retained target cache
+tokens as `1 + accepted_proposal_tokens`, because the verifier first computes the
+already-committed pending token and then up to K draft tokens. The bonus target
+token emitted after all K drafts are accepted is not yet in cache. The manager
+supports heterogeneous batch commits such as `{a: 0, b: 3, c: 7}` and restores
+full KV, recurrent state, conv state, and logical length on rollback.
+
+`SpecDecodeCoordinator.execute()` accepts optional `commit_verified_cache` and
+`rollback_verified_cache` hooks. The Qwen3.5/Qwen3.8 `ModelRunner.verify()` path
+uses these hooks to begin a `HybridCacheManager` transaction before verification,
+record one snapshot per verifier token, commit the accepted prefix after
+rejection sampling, and roll back on validation/commit errors.
 
 ## Target Verification Shape Contract
 
@@ -63,6 +79,23 @@ For the next DFlash2 stage, target verification should call the target with:
 
 The HTTP/online layer should continue to depend only on target logits and emitted
 token IDs; DFlash2-specific metadata belongs below the runner/coordinator boundary.
+
+## DFlash2 Boundary
+
+`myvllm.spec_decode.dflash2` now contains the draft-side interface contract:
+
+- `DFlash2Config` validates the known Qwen3.8-DFlash2 constants and rejects
+  one-based target tap IDs.
+- `select_topk_candidates()` covers the selector top-k tensor path without
+  treating it as a complete DFlash2 neural block.
+- `ProposalBatch` carries `[batch, K]` token IDs plus per-request valid lengths.
+- `DFlash2DraftCache` tracks sliding-window request lengths.
+- `DFlash2StandaloneProposer` only accepts a draft model advertising
+  `supports_block_parallel=True` and calls `propose_block()` once per batch.
+
+This is not yet a real DFlash2 neural implementation or checkpoint loader. It is
+intentionally guarded so target outputs or seven serial draft forwards cannot be
+presented as DFlash2 block-parallel proposal.
 
 ## GPU Validation
 
