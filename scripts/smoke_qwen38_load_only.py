@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -63,7 +64,8 @@ def print_cuda_memory(label: str, device: torch.device) -> None:
         f"{label}: allocated={bytes_to_gib(torch.cuda.memory_allocated(device)):.2f} GiB "
         f"reserved={bytes_to_gib(torch.cuda.memory_reserved(device)):.2f} GiB "
         f"max_allocated={bytes_to_gib(torch.cuda.max_memory_allocated(device)):.2f} GiB "
-        f"free={bytes_to_gib(free):.2f} GiB total={bytes_to_gib(total):.2f} GiB"
+        f"free={bytes_to_gib(free):.2f} GiB total={bytes_to_gib(total):.2f} GiB",
+        flush=True,
     )
 
 
@@ -117,7 +119,8 @@ def load_streaming(
             torch.cuda.empty_cache()
             print(
                 f"loaded {tensor_file.name}: language_tensors={file_loaded} "
-                f"elapsed={time.time() - started:.2f}s"
+                f"elapsed={time.time() - started:.2f}s",
+                flush=True,
             )
             print_cuda_memory("after_file", device)
 
@@ -136,6 +139,7 @@ def load_streaming(
 
 
 def main() -> None:
+    sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
     if not args.model:
         raise SystemExit("Pass --model or set MINIVLLM_QWEN38_PATH")
@@ -150,29 +154,38 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats(device)
     torch.set_default_dtype(dtype)
 
-    print(f"snapshot={snapshot}")
-    print(f"device={device}")
-    print(f"dtype={dtype}")
-    print(f"safe_open_device={args.safe_open_device}")
-    print(f"torch={torch.__version__} cuda={torch.version.cuda}")
-    print(f"device_name={torch.cuda.get_device_name(device)}")
+    print(f"snapshot={snapshot}", flush=True)
+    print(f"device={device}", flush=True)
+    print(f"dtype={dtype}", flush=True)
+    print(f"safe_open_device={args.safe_open_device}", flush=True)
+    print(f"torch={torch.__version__} cuda={torch.version.cuda}", flush=True)
+    print(f"device_name={torch.cuda.get_device_name(device)}", flush=True)
     print_cuda_memory("before_model", device)
 
     raw = load_qwen35_config_dict(str(snapshot))
     config = normalize_qwen35_text_config(raw)
     started = time.time()
-    model = Qwen35ForCausalLM(config).to(device=device, dtype=dtype)
+    print("initializing model on meta device", flush=True)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device("meta"):
+            model = Qwen35ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    print("materializing empty parameters on target GPU", flush=True)
+    model.to_empty(device=device)
     model.eval()
-    print(f"model_initialized_elapsed={time.time() - started:.2f}s")
+    print(f"model_initialized_elapsed={time.time() - started:.2f}s", flush=True)
     print_cuda_memory("after_model_init", device)
 
     started = time.time()
     stats = load_streaming(model, snapshot, device, args.safe_open_device)
-    print(f"weights_loaded_elapsed={time.time() - started:.2f}s")
+    print(f"weights_loaded_elapsed={time.time() - started:.2f}s", flush=True)
     print_cuda_memory("after_weight_load", device)
     for key, value in stats.items():
-        print(f"{key}={value}")
-    print("qwen38_load_only=PASS")
+        print(f"{key}={value}", flush=True)
+    print("qwen38_load_only=PASS", flush=True)
 
 
 if __name__ == "__main__":
