@@ -1,0 +1,72 @@
+# AutoDL Qwen3.8 Validation
+
+Run Mini-vLLM in its own Python 3.11 virtual environment.  Do not reuse the
+Oracle environment, which may have Python 3.12 and different torch, triton,
+transformers, and vLLM versions.
+
+## Fresh Mini-vLLM Environment
+
+```bash
+cd /root/autodl-tmp/Mini-vLLM
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip uv
+
+export HF_HOME=/root/autodl-tmp/huggingface
+export TRANSFORMERS_CACHE="$HF_HOME/hub"
+export TORCHINDUCTOR_CACHE_DIR=/root/autodl-tmp/minivllm_cache/torchinductor
+export TRITON_CACHE_DIR=/root/autodl-tmp/minivllm_cache/triton
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+
+uv sync
+```
+
+`HF_HOME` may point at the same Hugging Face cache used by the Oracle project to
+avoid downloading Qwen weights twice.  The `.venv`, `TORCHINDUCTOR_CACHE_DIR`,
+and `TRITON_CACHE_DIR` must be separate from the Oracle project.
+
+## Environment Manifest
+
+```bash
+mkdir -p results/qwen38_target
+
+{
+  date
+  hostname
+  pwd
+  git rev-parse HEAD
+  git status --short
+  python --version
+  python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda', torch.version.cuda); print('device_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+  python -c "import transformers; print('transformers', transformers.__version__)"
+  python -c "import triton; print('triton', triton.__version__)"
+  python -c "import os; print('HF_HOME', os.environ.get('HF_HOME')); print('TORCHINDUCTOR_CACHE_DIR', os.environ.get('TORCHINDUCTOR_CACHE_DIR')); print('TRITON_CACHE_DIR', os.environ.get('TRITON_CACHE_DIR'))"
+  nvidia-smi
+} | tee results/qwen38_target/env_manifest.txt
+```
+
+## Config Check Without AutoConfig
+
+Transformers 4.57.3 does not recognize `model_type=qwen3_5` through
+`AutoConfig`, so use Mini-vLLM's direct `config.json` parser:
+
+```bash
+export MINIVLLM_QWEN38_PATH=/root/autodl-tmp/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+
+ls -lah "$MINIVLLM_QWEN38_PATH"
+ls "$MINIVLLM_QWEN38_PATH" | head
+python scripts/check_qwen38_config.py | tee results/qwen38_target/config_check.txt
+```
+
+## Test Commands
+
+```bash
+pytest -q
+pytest -q tests/test_qwen35_config_and_model.py tests/test_hybrid_cache_transactions.py tests/test_qwen35_weight_loading.py
+```
+
+The current unit-test pass is not a real Qwen/Qwen3.8-27B target-only GPU
+acceptance result.  Mark 27B load, 32-token greedy decode, official target token
+alignment, and cache-vs-recompute logits as pending until a dedicated smoke run
+records those artifacts under `results/qwen38_target/`.

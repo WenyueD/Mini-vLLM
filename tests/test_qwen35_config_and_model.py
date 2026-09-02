@@ -5,6 +5,7 @@ from myvllm.models.qwen3_8 import Qwen35ForCausalLM, Qwen35GatedDeltaNet
 from myvllm.engine.hybrid_cache import HybridCacheManager
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
+    load_qwen35_config_dict,
     normalize_qwen35_text_config,
 )
 
@@ -98,6 +99,18 @@ def test_qwen38_nested_text_config_fixture_parses_layer_types_and_taps():
     assert cfg.linear_attention_layers[:3] == (0, 1, 2)
     assert cfg.linear_attention_layers[-1] == 62
     assert QWEN35_DEFAULT_HIDDEN_TAPS == (5, 19, 33, 47, 61)
+
+
+def test_qwen38_config_json_loader_does_not_require_transformers_autoconfig(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        __import__("json").dumps(qwen38_fixture()),
+        encoding="utf-8",
+    )
+    raw = load_qwen35_config_dict(str(tmp_path))
+    cfg = normalize_qwen35_text_config(raw)
+    assert cfg.num_hidden_layers == 64
+    assert cfg.full_attention_layers == tuple(range(3, 64, 4))
 
 
 def test_qwen35_text_only_rejects_multimodal_inputs():

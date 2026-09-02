@@ -1204,7 +1204,7 @@ source = { editable = "." }
 dependencies = [
     { name = "torch" },
     { name = "transformers" },
-    { name = "vllm", marker = "sys_platform != 'win32'" },
+    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "xxhash" },
 ]
 
@@ -1213,6 +1213,9 @@ dev = [
     { name = "black" },
     { name = "isort" },
     { name = "pytest" },
+]
+oracle = [
+    { name = "vllm", marker = "sys_platform != 'win32'" },
 ]
 
 [package.dev-dependencies]
@@ -1227,12 +1230,13 @@ requires-dist = [
     { name = "black", marker = "extra == 'dev'" },
     { name = "isort", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'" },
-    { name = "torch" },
-    { name = "transformers" },
-    { name = "vllm", marker = "sys_platform != 'win32'", specifier = ">=0.15.0" },
+    { name = "torch", specifier = "==2.9.1" },
+    { name = "transformers", specifier = "==4.57.3" },
+    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==3.5.1" },
+    { name = "vllm", marker = "sys_platform != 'win32' and extra == 'oracle'", specifier = ">=0.15.0" },
     { name = "xxhash" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "oracle"]
 
 [package.metadata.requires-dev]
 dev = [

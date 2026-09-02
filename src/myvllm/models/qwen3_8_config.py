@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -75,6 +77,33 @@ def is_qwen35_config(config: Mapping[str, Any]) -> bool:
             and text_config.get("model_type") == "qwen3_5_text"
         )
     )
+
+
+def load_qwen35_config_dict(model_name_or_path: str) -> dict[str, Any]:
+    """Load Qwen3.5/Qwen3.8 config.json without AutoConfig registration.
+
+    Transformers 4.57.x can read the tokenizer files but does not register
+    `model_type=qwen3_5` for AutoConfig.  Mini-vLLM only needs the JSON fields
+    here, so reading config.json directly keeps the target runner independent of
+    the Oracle/vLLM environment.
+    """
+    path = Path(model_name_or_path).expanduser()
+    if path.is_dir():
+        config_path = path / "config.json"
+    else:
+        from huggingface_hub import snapshot_download
+
+        config_dir = Path(
+            snapshot_download(
+                repo_id=model_name_or_path,
+                allow_patterns=["config.json"],
+            )
+        )
+        config_path = config_dir / "config.json"
+    if not config_path.exists():
+        raise ValueError(f"Qwen3.5/Qwen3.8 config.json not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def normalize_qwen35_text_config(config: Mapping[str, Any]) -> Qwen35TextConfig:

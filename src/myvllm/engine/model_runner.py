@@ -17,6 +17,7 @@ from myvllm.engine.hybrid_cache import HybridCacheManager
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
     is_qwen35_config,
+    load_qwen35_config_dict,
     normalize_qwen35_text_config,
 )
 
@@ -51,11 +52,7 @@ class ModelRunner:
         if is_qwen35_config(config) or model_name in {"Qwen3.8-27B", "Qwen3.5-27B"}:
             qwen35_raw_config = config
             if not is_qwen35_config(qwen35_raw_config):
-                from transformers import AutoConfig
-
-                qwen35_raw_config = AutoConfig.from_pretrained(
-                    path_str, trust_remote_code=True
-                ).to_dict()
+                qwen35_raw_config = load_qwen35_config_dict(path_str)
             qwen35_text_config = normalize_qwen35_text_config(qwen35_raw_config)
             if self.world_size != 1:
                 raise NotImplementedError(
