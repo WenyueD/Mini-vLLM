@@ -209,8 +209,12 @@ Oracle path.
 
 ## DFlash2 Oracle Proposal Alignment
 
-Run this after `dflash2_online_b1=PASS`.  First export the Mini-vLLM fixture
-from the exact same prompt and checkpoints:
+Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query
+layout: the anchor is the target-generated bonus token, and only the following
+mask positions produce proposal tokens.  Regenerate both fixtures whenever this
+section changes; do not compare against an older prompt-final-anchor fixture.
+
+First export the Mini-vLLM fixture from the exact same prompt and checkpoints:
 
 ```bash
 mkdir -p results/qwen38_target/oracle_alignment
@@ -226,35 +230,42 @@ python scripts/smoke_dflash2_standalone_proposal.py \
   | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Export the Oracle implementation's proposal for the same prompt into:
+Then run the Oracle/vLLM exporter from the Oracle environment.  This script
+monkey-patches vLLM's DFlash speculator and captures the first non-dummy draft
+proposal block returned by Oracle:
 
-```text
-results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json
+```bash
+cd /root/autodl-tmp/Mini-vLLM
+source /path/to/oracle/.venv/bin/activate
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_WORKER_MULTIPROC_METHOD=fork
+
+python scripts/export_oracle_dflash2_fixture.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --prompt "Hello" \
+  --max-tokens 16 \
+  --num-speculative-tokens 7 \
+  --method dflash \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 256 \
+  --anchor-token-mode minivllm \
+  --anchor-position-mode minivllm \
+  --trust-remote-code \
+  --enforce-eager \
+  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```
 
-The Oracle JSON must include these keys:
-
-```json
-{
-  "prompt": "Hello",
-  "prompt_token_ids": [],
-  "anchor_token_id": 0,
-  "anchor_position": 0,
-  "target_layer_ids": [5, 19, 33, 47, 61],
-  "proposal_token_ids": [],
-  "context_checksum": 0.0,
-  "proposal_hidden_checksum": 0.0
-}
-```
-
-`context_checksum` and `proposal_hidden_checksum` are optional but useful.  If
-they are present in both files, the comparator checks them with a small bf16
-tolerance; otherwise it compares only the exact structural fields and proposal
-token IDs.
+If the Oracle build expects a different speculative method name, retry only the
+Oracle export with `--method dflash2`.
 
 Then compare:
 
 ```bash
+source .venv/bin/activate
+
 python scripts/compare_dflash2_oracle_fixture.py \
   --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
   --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \

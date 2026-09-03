@@ -62,6 +62,7 @@ The real DFlash2 checkpoint audit shows:
   - `scripts/smoke_qwen38_dflash2_engine_b1.py`
   - `scripts/smoke_qwen38_dflash2_online_b1.py`
   - `scripts/compare_dflash2_oracle_fixture.py`
+  - `scripts/export_oracle_dflash2_fixture.py`
 - Added tests for nested config, expected shapes, header-only audit, selector
   top-k, and guarded block-parallel proposer behavior.
 
@@ -241,4 +242,29 @@ python scripts/compare_dflash2_oracle_fixture.py \
   --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
   --checksum-atol 0.5 \
   | tee results/qwen38_target/oracle_alignment/dflash2_oracle_alignment_hello.txt
+```
+
+Oracle fixture generation command:
+
+```bash
+source /path/to/oracle/.venv/bin/activate
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_WORKER_MULTIPROC_METHOD=fork
+
+python scripts/export_oracle_dflash2_fixture.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --prompt "Hello" \
+  --max-tokens 16 \
+  --num-speculative-tokens 7 \
+  --method dflash \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 256 \
+  --anchor-token-mode minivllm \
+  --anchor-position-mode minivllm \
+  --trust-remote-code \
+  --enforce-eager \
+  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```

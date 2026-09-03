@@ -775,6 +775,7 @@ class ModelRunner:
                 self.hybrid_cache_manager.get_request_state(seq.request_id).logical_length
                 - output.logits.shape[1]
                 + decision_index
+                + 1
             ),
             "hidden_taps": hidden_taps,
         }
@@ -950,7 +951,7 @@ class ModelRunner:
                     self._dflash2_contexts[sequence_id] = {
                         "request_id": request_id,
                         "anchor_token_id": int(target_token_ids[decision_index]),
-                        "anchor_position": start_position + decision_index,
+                        "anchor_position": start_position + decision_index + 1,
                         "hidden_taps": hidden_taps,
                     }
             else:

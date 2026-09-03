@@ -98,9 +98,10 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
 - `audit_dflash2_checkpoint()` validates safetensors headers without loading
   large tensor payloads.
 - `forward_block()` is the standalone B=1/Batched draft path: target hidden taps
-  are fused through `fc`, anchor+mask tokens are embedded with the target
-  embedding table, the DFlash2 draft backbone runs once over the whole block, and
-  the target `lm_head` supplies unary logits for candidate selection.
+  are fused through `fc`, the target-generated bonus token plus mask tokens are
+  embedded with the target embedding table, the DFlash2 draft backbone runs once
+  over the whole block, and the target `lm_head` supplies unary logits for
+  candidate selection on mask positions.
 - `DFlash2StandaloneProposer` only accepts a draft model advertising
   `supports_block_parallel=True` and calls `propose_block()` once per batch.
 - `SpeculativeConfig(proposer="dflash2")` wires a runner-bound proposer into

@@ -174,10 +174,16 @@ def main() -> None:
             layer_id: value[:, -min(value.shape[1], draft.config.sliding_window) :, :]
             for layer_id, value in target_output.hidden_taps.items()
         }
+        anchor_token_id = int(target_output.logits[:, -1, :].argmax(dim=-1).item())
+        anchor_position = len(token_ids)
         proposal_batch, debug = draft.forward_block(
-            anchor_token_ids=input_ids[-1:].reshape(1),
+            anchor_token_ids=torch.tensor(
+                [anchor_token_id],
+                dtype=torch.long,
+                device=device,
+            ),
             anchor_positions=torch.tensor(
-                [len(token_ids) - 1],
+                [anchor_position],
                 dtype=torch.long,
                 device=device,
             ),
@@ -197,14 +203,16 @@ def main() -> None:
         "source": "minivllm",
         "prompt": args.prompt,
         "prompt_token_ids": token_ids,
-        "anchor_token_id": int(token_ids[-1]),
-        "anchor_position": len(token_ids) - 1,
+        "anchor_token_id": anchor_token_id,
+        "anchor_position": anchor_position,
         "target_layer_ids": list(draft.config.target_layer_ids),
         "proposal_valid_length": valid_length,
         "proposal_token_ids": proposed,
         **debug_json,
     }
     print(f"prompt_token_ids={token_ids}", flush=True)
+    print(f"anchor_token_id={anchor_token_id}", flush=True)
+    print(f"anchor_position={anchor_position}", flush=True)
     print(f"hidden_tap_keys={sorted(hidden_taps)}", flush=True)
     print(f"proposal_valid_lengths={proposal_batch.valid_lengths.tolist()}", flush=True)
     print(f"proposal_token_ids={proposed}", flush=True)

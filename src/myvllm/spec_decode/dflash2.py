@@ -602,7 +602,6 @@ class DFlash2DraftModel(nn.Module):
         context_positions = (
             anchor_positions.reshape(-1, 1)
             - context_len
-            + 1
             + torch.arange(
                 context_len,
                 device=anchor_positions.device,
