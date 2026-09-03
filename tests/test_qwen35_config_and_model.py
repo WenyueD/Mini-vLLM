@@ -1,7 +1,7 @@
-import pytest
 import torch
+import pytest
 
-from myvllm.models.qwen3_8 import Qwen35ForCausalLM, Qwen35GatedDeltaNet
+from myvllm.models.qwen3_8 import Qwen35ForCausalLM, Qwen35GatedDeltaNet, Qwen35RMSNorm
 from myvllm.engine.hybrid_cache import HybridCacheManager
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.models.qwen3_8_config import (
@@ -92,6 +92,17 @@ def init_small(module):
     with torch.no_grad():
         for param in module.parameters():
             param.normal_(mean=0.0, std=0.02, generator=generator)
+
+
+def test_qwen35_rms_norm_uses_checkpoint_weight_directly():
+    norm = Qwen35RMSNorm(2, eps=0.0)
+    with torch.no_grad():
+        norm.weight.copy_(torch.tensor([2.0, 3.0]))
+
+    x = torch.tensor([[[3.0, 4.0]]])
+    normalized = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True))
+
+    assert torch.allclose(norm(x), normalized * torch.tensor([2.0, 3.0]))
 
 
 def test_qwen38_nested_text_config_fixture_parses_layer_types_and_taps():
