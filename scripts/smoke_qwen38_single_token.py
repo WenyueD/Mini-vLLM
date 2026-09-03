@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -47,6 +48,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional expected greedy next token ID for Oracle target parity.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Number of top logits to print for target-parity debugging.",
+    )
+    parser.add_argument(
+        "--json-output",
+        default=None,
+        help="Optional path for a JSON diagnostic artifact.",
     )
     return parser.parse_args()
 
@@ -130,16 +142,54 @@ def main() -> None:
         last_logits = logits[:, -1, :]
         if not torch.isfinite(last_logits).all().item():
             raise RuntimeError("last-token logits contain NaN or Inf")
-        next_token_id = int(last_logits.argmax(dim=-1).item())
-        max_logit = float(last_logits.max().item())
-        min_logit = float(last_logits.min().item())
+        last_logits_1d = last_logits[0].float()
+        next_token_id = int(last_logits_1d.argmax(dim=-1).item())
+        max_logit = float(last_logits_1d.max().item())
+        min_logit = float(last_logits_1d.min().item())
+        top_k = min(max(args.top_k, 1), last_logits_1d.shape[-1])
+        top_values, top_indices = torch.topk(last_logits_1d, k=top_k)
+        top_token_ids = [int(token_id) for token_id in top_indices.detach().cpu().tolist()]
+        top_logits = [float(value) for value in top_values.detach().cpu().tolist()]
+        expected_logit = None
+        expected_rank = None
+        if args.expected_next_token_id is not None:
+            expected_index = int(args.expected_next_token_id)
+            if expected_index < 0 or expected_index >= last_logits_1d.shape[-1]:
+                raise ValueError(
+                    f"--expected-next-token-id out of vocabulary range: {expected_index}"
+                )
+            expected_logit = float(last_logits_1d[expected_index].item())
+            expected_rank = int((last_logits_1d > last_logits_1d[expected_index]).sum().item() + 1)
     torch.cuda.synchronize(device)
     print(f"forward_elapsed={time.time() - started:.4f}s", flush=True)
     print(f"logits_shape={tuple(logits.shape)}", flush=True)
     print(f"hidden_tap_keys={sorted(output.hidden_taps)}", flush=True)
     print(f"next_token_id={next_token_id}", flush=True)
+    print(f"top_{top_k}_token_ids={top_token_ids}", flush=True)
+    print(f"top_{top_k}_logits={[round(value, 6) for value in top_logits]}", flush=True)
     if args.expected_next_token_id is not None:
         print(f"expected_next_token_id={args.expected_next_token_id}", flush=True)
+        print(f"expected_next_token_logit={expected_logit:.6f}", flush=True)
+        print(f"expected_next_token_rank={expected_rank}", flush=True)
+    diagnostic = {
+        "prompt": args.prompt,
+        "input_ids": token_ids,
+        "logits_shape": list(logits.shape),
+        "hidden_tap_keys": sorted(output.hidden_taps),
+        "next_token_id": next_token_id,
+        "top_k": top_k,
+        "top_token_ids": top_token_ids,
+        "top_logits": top_logits,
+        "expected_next_token_id": args.expected_next_token_id,
+        "expected_next_token_logit": expected_logit,
+        "expected_next_token_rank": expected_rank,
+    }
+    if args.json_output:
+        json_path = Path(args.json_output)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8")
+        print(f"json_output={json_path}", flush=True)
+    if args.expected_next_token_id is not None:
         if next_token_id != args.expected_next_token_id:
             raise SystemExit(
                 "qwen38_target_oracle_anchor=FAIL "

@@ -178,11 +178,17 @@ python scripts/smoke_qwen38_single_token.py \
   --safe-open-device cuda \
   --prompt "Hello" \
   --expected-next-token-id 11 \
+  --top-k 50 \
+  --json-output results/qwen38_target/target_oracle_anchor_hello.json \
   | tee results/qwen38_target/target_oracle_anchor_hello.txt
 ```
 
 The pass marker is `qwen38_target_oracle_anchor=PASS`.  Do not run DFlash2
-proposal-ID comparison while this target-anchor check fails.
+proposal-ID comparison while this target-anchor check fails.  If it fails, keep
+the JSON artifact and inspect `expected_next_token_rank`,
+`expected_next_token_logit`, and `top_token_ids` first; the DFlash2 comparison is
+not meaningful until the Mini-vLLM target's first greedy token matches Oracle
+target-only.
 
 ## DFlash2 B=1 Online Smoke
 

@@ -20,6 +20,9 @@ The user also reported:
 - `qwen38_dflash2_engine_b1=PASS` under old prompt-final/single-context semantics; STALE after anchor/context/selector fixes
 - `dflash2_online_b1=PASS` under old prompt-final/single-context semantics; STALE after anchor/context/selector fixes
 - `dflash2_oracle_alignment=PENDING`; Oracle/vLLM method is `dflash`, and the current blocker is fixture/semantic parity, not Oracle capability
+- `qwen38_target_oracle_anchor=FAIL` for prompt `"Hello"`: Oracle
+  target-only first completion token is `11`, while Mini-vLLM currently predicts
+  `846`
 
 ## DFlash2 Checkpoint Audit Input
 
@@ -101,13 +104,13 @@ Result: PASS.
 | Priority | Status | Evidence |
 | --- | --- | --- |
 | P0 regression | PASS local | `84 passed, 2 skipped`; compileall passed. |
-| P1 target real baseline | PASS remote/user-reported | All four Qwen3.8 target smoke scripts reported PASS on AutoDL A800. |
+| P1 target real baseline | PARTIAL | Load/forward/cache/engine smokes PASS on AutoDL A800, but Oracle target-token parity FAILS: expected `11`, actual `846` for prompt `"Hello"`. |
 | P2 cache transaction | PASS local | Hybrid transaction/coordinator/Qwen cached verifier tests. |
 | P3 hidden taps | PASS local | Zero-based taps and logits-invariance tests. |
-| P4 DFlash2 standalone | PARTIAL | Real config + 81-key checkpoint audit/load-only PASS; draft model executes. Proposal semantic parity with Oracle remains PENDING. |
+| P4 DFlash2 standalone | BLOCKED | Real config + 81-key checkpoint audit/load-only PASS; draft model executes. Proposal semantic parity with Oracle is blocked until target-only token parity is fixed. |
 | P5 B=1 end-to-end | STALE/PENDING | Offline engine B=1 and online B=1 passed under old semantics; rerun required after anchor/context/selector fixes. |
 | P6 batch | PENDING | Real DFlash2 batch not implemented. |
-| P7 performance | PENDING | Oracle alignment, fresh B=1 validation, and batch validation are not complete. |
+| P7 performance | PENDING | Oracle target parity, Oracle alignment, fresh B=1 validation, and batch validation are not complete. |
 
 ## Next Remote Commands
 
