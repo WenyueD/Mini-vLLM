@@ -31,19 +31,29 @@ class Qwen35ForwardOutput:
 class Qwen35RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.zeros(dim))
         self.eps = eps
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
+        return (self._norm(x) * (1.0 + self.weight.float())).to(dtype)
+
+
+class Qwen35RMSNormGated(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
-
-
-class Qwen35RMSNormGated(Qwen35RMSNorm):
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        return super().forward(x) * F.silu(gate).to(x.dtype)
+        return (x * self.weight.float() * F.silu(gate.float())).to(dtype)
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:

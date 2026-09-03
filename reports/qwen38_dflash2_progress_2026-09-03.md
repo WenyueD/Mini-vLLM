@@ -60,9 +60,11 @@ The real DFlash2 checkpoint audit shows:
   - runner-bound proposer in `LLMEngine`
   - DFlash2 draft loading inside `ModelRunner`
   - target hidden context capture and verifier-commit context refresh
-- Fixed `Qwen35RMSNorm` to use checkpoint RMSNorm weights directly instead of
-  treating them as delta weights.  This affects both Qwen3.8 target layers and
-  DFlash2 draft layers, and must be revalidated on AutoDL.
+- Split Qwen3.5 normalization semantics to match the official implementation:
+  ordinary `Qwen35RMSNorm` keeps delta checkpoint semantics (`1 + weight`), while
+  the GDN `Qwen35RMSNormGated` uses checkpoint weights directly.  This affects
+  both Qwen3.8 target linear-attention layers and DFlash2 draft layers, and must
+  be revalidated on AutoDL.
 - Added scripts:
   - `scripts/audit_dflash2_weights.py`
   - `scripts/smoke_dflash2_load_only.py`
@@ -96,13 +98,14 @@ Latest local regression after standalone proposal math:
 
 Result: `87 passed, 2 skipped`.
 
-Latest local regression after the RMSNorm checkpoint-semantics fix:
+Latest local regression after the split RMSNorm/GatedRMSNorm checkpoint-semantics
+fix:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .\.pytest-tmp
 ```
 
-Result: `90 passed, 2 skipped`.
+Result: `91 passed, 2 skipped`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q src scripts tests
