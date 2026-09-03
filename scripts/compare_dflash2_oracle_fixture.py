@@ -50,6 +50,8 @@ def main() -> None:
     oracle = load_json(args.oracle)
 
     required_equal_keys = [
+        "fixture_schema_version",
+        "anchor_semantics",
         "prompt",
         "prompt_token_ids",
         "anchor_token_id",

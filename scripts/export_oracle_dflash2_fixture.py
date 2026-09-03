@@ -239,6 +239,8 @@ def main() -> None:
         anchor_token_id = minivllm_anchor_token_id
 
     fixture = {
+        "fixture_schema_version": 2,
+        "anchor_semantics": "target_bonus_token",
         "source": "oracle-vllm",
         "prompt": args.prompt,
         "prompt_token_ids": prompt_token_ids,

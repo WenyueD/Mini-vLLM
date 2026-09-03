@@ -200,6 +200,8 @@ def main() -> None:
         for key, value in debug.items()
     }
     fixture = {
+        "fixture_schema_version": 2,
+        "anchor_semantics": "target_bonus_token",
         "source": "minivllm",
         "prompt": args.prompt,
         "prompt_token_ids": token_ids,

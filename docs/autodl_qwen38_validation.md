@@ -215,6 +215,8 @@ mask positions produce proposal tokens.  Regenerate both fixtures whenever this
 section changes; do not compare against an older prompt-final-anchor fixture.
 
 First export the Mini-vLLM fixture from the exact same prompt and checkpoints:
+The JSON should contain `fixture_schema_version=2` and
+`anchor_semantics=target_bonus_token`.
 
 ```bash
 mkdir -p results/qwen38_target/oracle_alignment
