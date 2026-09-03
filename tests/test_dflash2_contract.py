@@ -1,5 +1,7 @@
 import pytest
 import torch
+import json
+import struct
 
 from myvllm.engine.sequence import Sequence
 from myvllm.sampling_parameters import SamplingParams
@@ -9,6 +11,8 @@ from myvllm.spec_decode.dflash2 import (
     DFlash2DraftCache,
     DFlash2StandaloneProposer,
     ProposalBatch,
+    audit_dflash2_checkpoint,
+    expected_dflash2_weight_shapes,
     select_topk_candidates,
 )
 
@@ -33,6 +37,37 @@ def test_dflash2_config_contract_uses_zero_based_target_taps():
     assert config.target_layer_ids == DRAFT_TARGET_TAP_LAYERS
 
 
+def test_dflash2_config_reads_real_nested_dflash_config():
+    config = DFlash2Config.from_mapping(
+        {
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "num_hidden_layers": 5,
+            "sliding_window": 2048,
+            "vocab_size": 248320,
+            "rope_parameters": {"rope_theta": 10000000},
+            "dflash_config": {
+                "block_size": 8,
+                "conv_group_size": 16,
+                "conv_kernel_size": 2,
+                "mask_token_id": 248070,
+                "selector_rank": 256,
+                "selector_top_k": 16,
+                "target_layer_ids": [5, 19, 33, 47, 61],
+            },
+        }
+    )
+
+    config.validate_contract()
+    assert config.mask_token_id == 248070
+    assert config.rope_theta == 10000000
+    assert config.num_sliding_attention_layers == 5
+
+
 def test_dflash2_config_rejects_one_based_target_taps():
     config = DFlash2Config(target_layer_ids=(6, 20, 34, 48, 62))
     with pytest.raises(ValueError, match="zero-based"):
@@ -50,6 +85,71 @@ def test_proposal_batch_shape_and_budget_contract():
 
     assert proposal.token_ids == (10, 11, 12)
     assert proposal.metadata == {"kind": "dflash2", "block_parallel": True}
+
+
+def test_expected_dflash2_weight_shapes_match_checkpoint_audit():
+    shapes = expected_dflash2_weight_shapes(DFlash2Config())
+
+    assert len(shapes) == 81
+    assert shapes["candidate_selector.hidden_projection.weight"] == (256, 5120)
+    assert shapes["candidate_selector.predecessor_codebook"] == (248320, 256)
+    assert shapes["fc.weight"] == (5120, 25600)
+    assert shapes["layers.0.attention_conv.base_kernel"] == (2, 2, 5120)
+    assert shapes["layers.0.attention_conv.kernel_projection.weight"] == (1280, 5120)
+    assert shapes["layers.4.self_attn.q_proj.weight"] == (4096, 5120)
+    assert shapes["layers.4.self_attn.k_proj.weight"] == (1024, 5120)
+
+
+def write_header_only_safetensors(path, shapes):
+    header = {
+        name: {
+            "dtype": "BF16",
+            "shape": list(shape),
+            "data_offsets": [0, 0],
+        }
+        for name, shape in shapes.items()
+    }
+    payload = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(payload)) + payload)
+
+
+def test_audit_dflash2_checkpoint_passes_header_only_fixture(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hidden_size": 5120,
+                "intermediate_size": 17408,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "num_hidden_layers": 5,
+                "sliding_window": 2048,
+                "vocab_size": 248320,
+                "dflash_config": {
+                    "block_size": 8,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2,
+                    "mask_token_id": 248070,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                    "target_layer_ids": [5, 19, 33, 47, 61],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_header_only_safetensors(
+        tmp_path / "model.safetensors",
+        expected_dflash2_weight_shapes(DFlash2Config()),
+    )
+
+    audit = audit_dflash2_checkpoint(str(tmp_path))
+
+    assert audit.passed
+    assert audit.checkpoint_tensors == 81
+    assert audit.expected_tensors == 81
+    assert audit.dtype_counts == {"BF16": 81}
 
 
 def test_dflash2_candidate_selector_returns_topk_path():

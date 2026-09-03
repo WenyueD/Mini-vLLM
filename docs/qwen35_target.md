@@ -85,17 +85,25 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
 `myvllm.spec_decode.dflash2` now contains the draft-side interface contract:
 
 - `DFlash2Config` validates the known Qwen3.8-DFlash2 constants and rejects
-  one-based target tap IDs.
+  one-based target tap IDs. It reads the real nested `dflash_config` object from
+  the checkpoint config.
 - `select_topk_candidates()` covers the selector top-k tensor path without
   treating it as a complete DFlash2 neural block.
 - `ProposalBatch` carries `[batch, K]` token IDs plus per-request valid lengths.
 - `DFlash2DraftCache` tracks sliding-window request lengths.
+- `DFlash2DraftModel` is a loadable module shell whose parameter names match the
+  observed 81-tensor checkpoint: candidate selector, `fc`, `hidden_norm`, 5
+  sliding-attention layers, dynamic conv weights, and final `norm`.
+- `audit_dflash2_checkpoint()` validates safetensors headers without loading
+  large tensor payloads.
 - `DFlash2StandaloneProposer` only accepts a draft model advertising
   `supports_block_parallel=True` and calls `propose_block()` once per batch.
 
-This is not yet a real DFlash2 neural implementation or checkpoint loader. It is
+This is not yet a real DFlash2 neural proposal implementation. It is
 intentionally guarded so target outputs or seven serial draft forwards cannot be
-presented as DFlash2 block-parallel proposal.
+presented as DFlash2 block-parallel proposal. The draft checkpoint can now be
+audited and loaded into the shell, but `supports_block_parallel` remains disabled
+until the proposal math is implemented and aligned with Oracle.
 
 ## GPU Validation
 

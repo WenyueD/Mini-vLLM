@@ -4,8 +4,13 @@ from myvllm.spec_decode.dflash2 import (
     CandidateSelection,
     DFlash2Config,
     DFlash2DraftCache,
+    DFlash2DraftModel,
     DFlash2StandaloneProposer,
+    DFlash2WeightAudit,
     ProposalBatch,
+    audit_dflash2_checkpoint,
+    expected_dflash2_weight_shapes,
+    load_dflash2_weights_from_safetensors,
     select_topk_candidates,
 )
 from myvllm.spec_decode.metrics import SpecDecodeMetrics
