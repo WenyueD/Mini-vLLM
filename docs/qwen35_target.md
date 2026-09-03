@@ -11,8 +11,9 @@ whose language model lives under nested `text_config`.
   validation, hidden taps, hybrid cache transaction semantics, and B=1 DFlash2
   draft execution behind the speculative verifier.
 - Not claimed: multimodal inputs, production dynamic batching, CUDA Graph
-  optimization for verification, online DFlash2 validation, oracle proposal-ID
-  alignment, or performance numbers.
+  optimization for verification, fresh B=1 validation after DFlash2
+  anchor/context/selector fixes, Oracle proposal-ID alignment, or performance
+  numbers.
 - Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
   `video_grid_thw` are rejected explicitly.
 - Target cache sizing can be constrained with `target_cache_memory_fraction` or
@@ -97,11 +98,11 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   sliding-attention layers, dynamic conv weights, and final `norm`.
 - `audit_dflash2_checkpoint()` validates safetensors headers without loading
   large tensor payloads.
-- `forward_block()` is the standalone B=1/Batched draft path: target hidden taps
-  are fused through `fc`, the target-generated bonus token plus mask tokens are
-  embedded with the target embedding table, the DFlash2 draft backbone runs once
-  over the whole block, and the target `lm_head` supplies unary logits for
-  candidate selection on mask positions.
+- `forward_block()` is the standalone B=1/Batched draft path: rolling target
+  hidden-tap history is fused through `fc`, the target-generated bonus token plus
+  mask tokens are embedded with the target embedding table, the DFlash2 draft
+  backbone runs once over the whole block, and the target `lm_head` supplies
+  unary logits for lattice-based candidate path selection on mask positions.
 - `DFlash2StandaloneProposer` only accepts a draft model advertising
   `supports_block_parallel=True` and calls `propose_block()` once per batch.
 - `SpeculativeConfig(proposer="dflash2")` wires a runner-bound proposer into
@@ -109,10 +110,11 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   standalone proposal, and verifier-commit context refresh.
 
 This path is still not a production DFlash2 integration. The draft checkpoint
-can be audited and loaded, standalone block proposal can be run, and the offline
-B=1 engine smoke has passed on AutoDL by user report. Online B=1 validation,
-Oracle proposal-ID alignment, batch execution, and performance runs remain
-required before broader claims.
+can be audited and loaded, and standalone block proposal can be run. Earlier
+offline/online B=1 smokes passed on AutoDL by user report, but they are stale
+after the DFlash2 anchor/context/selector fixes and must be rerun. Oracle
+proposal-ID alignment, batch execution, and performance runs remain required
+before broader claims.
 
 ## GPU Validation
 

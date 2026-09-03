@@ -166,6 +166,24 @@ The pass markers are `qwen38_single_token_forward=PASS`,
 `qwen38_no_cache_greedy_32=PASS`, `qwen38_cache_vs_recompute=PASS`, and
 `qwen38_engine_target_only=PASS`.
 
+Before DFlash2 Oracle proposal alignment, verify that Mini-vLLM and Oracle
+target-only agree on the first greedy token for the same raw prompt.  For the
+current Oracle target-only run, `"Hello"` produced first completion token `11`:
+
+```bash
+python scripts/smoke_qwen38_single_token.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --expected-next-token-id 11 \
+  | tee results/qwen38_target/target_oracle_anchor_hello.txt
+```
+
+The pass marker is `qwen38_target_oracle_anchor=PASS`.  Do not run DFlash2
+proposal-ID comparison while this target-anchor check fails.
+
 ## DFlash2 B=1 Online Smoke
 
 Run this after `qwen38_dflash2_engine_b1=PASS`.  It compares target-only online
@@ -233,8 +251,12 @@ python scripts/smoke_dflash2_standalone_proposal.py \
 ```
 
 Then run the Oracle/vLLM exporter from the Oracle environment.  This script
-monkey-patches vLLM's DFlash speculator and captures the first non-dummy draft
-proposal block returned by Oracle:
+monkey-patches vLLM's DFlash speculator and captures the first non-dummy,
+post-target-sample draft proposal block returned by Oracle.  Prefill captures
+with `num_sampled=0` are skipped by default because their anchor is still a
+prompt token, not the target-generated bonus token.  The exporter also runs an
+Oracle target-only preflight and stops if Oracle DFlash is not target-lossless
+for the selected prompt.
 
 ```bash
 cd /root/autodl-tmp/Mini-vLLM
@@ -260,8 +282,9 @@ python scripts/export_oracle_dflash2_fixture.py \
   | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```
 
-If the Oracle build expects a different speculative method name, retry only the
-Oracle export with `--method dflash2`.
+If the exporter reports an Oracle target-lossless preflight failure, do not
+compare fixtures yet; first find a prompt/config where Oracle target-only and
+Oracle DFlash start with the same completion token.
 
 Then compare:
 

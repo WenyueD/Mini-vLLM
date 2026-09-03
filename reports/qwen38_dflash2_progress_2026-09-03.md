@@ -17,9 +17,9 @@ The user also reported:
 - `dflash2_weight_name_audit=PASS`
 - `dflash2_load_only=PASS`
 - `dflash2_standalone_proposal=PASS`
-- `qwen38_dflash2_engine_b1=PASS`
-- `dflash2_online_b1=PASS`
-- `dflash2_oracle_alignment=PENDING`
+- `qwen38_dflash2_engine_b1=PASS` under old prompt-final/single-context semantics; STALE after anchor/context/selector fixes
+- `dflash2_online_b1=PASS` under old prompt-final/single-context semantics; STALE after anchor/context/selector fixes
+- `dflash2_oracle_alignment=PENDING`; Oracle/vLLM method is `dflash`, and the current blocker is fixture/semantic parity, not Oracle capability
 
 ## DFlash2 Checkpoint Audit Input
 
@@ -46,8 +46,10 @@ The real DFlash2 checkpoint audit shows:
 - Added `audit_dflash2_checkpoint()` for header-only safetensors validation.
 - Added `load_dflash2_weights_from_safetensors()` for load-only validation.
 - Added standalone draft math for `combine_hidden_taps`, grouped dynamic conv,
-  dense sliding attention, MLP, target-lm-head unary logits, and candidate path
-  selection.
+  dense sliding attention, MLP, target-lm-head unary logits, and lattice-based
+  candidate path selection.
+- DFlash2 target context now keeps rolling target hidden-tap history up to the
+  sliding window instead of a single decision token.
 - Added `DFlash2TargetContext` provider support to `DFlash2StandaloneProposer`,
   so one target-context fetch can drive one block proposal.
 - Added engine-level DFlash2 proposer wiring for B=1:
@@ -102,10 +104,10 @@ Result: PASS.
 | P1 target real baseline | PASS remote/user-reported | All four Qwen3.8 target smoke scripts reported PASS on AutoDL A800. |
 | P2 cache transaction | PASS local | Hybrid transaction/coordinator/Qwen cached verifier tests. |
 | P3 hidden taps | PASS local | Zero-based taps and logits-invariance tests. |
-| P4 DFlash2 standalone | PASS/PENDING align | Real config + 81-key checkpoint audit/load-only PASS; remote standalone proposal PASS; Oracle proposal-ID alignment still PENDING. |
-| P5 B=1 end-to-end | PASS B=1 | Offline engine B=1 and online B=1 PASS remote/user-reported. |
+| P4 DFlash2 standalone | PARTIAL | Real config + 81-key checkpoint audit/load-only PASS; draft model executes. Proposal semantic parity with Oracle remains PENDING. |
+| P5 B=1 end-to-end | STALE/PENDING | Offline engine B=1 and online B=1 passed under old semantics; rerun required after anchor/context/selector fixes. |
 | P6 batch | PENDING | Real DFlash2 batch not implemented. |
-| P7 performance | PENDING | Oracle alignment and batch validation are not complete. |
+| P7 performance | PENDING | Oracle alignment, fresh B=1 validation, and batch validation are not complete. |
 
 ## Next Remote Commands
 
@@ -245,6 +247,10 @@ python scripts/compare_dflash2_oracle_fixture.py \
 ```
 
 Oracle fixture generation command:
+The exporter skips prefill captures with `num_sampled=0` by default and selects
+the first post-target-sample DFlash proposal block.  The current Oracle/vLLM
+build accepts `--method dflash`; `--method dflash2` is rejected by its
+SpeculativeConfig validation.
 
 ```bash
 source /path/to/oracle/.venv/bin/activate

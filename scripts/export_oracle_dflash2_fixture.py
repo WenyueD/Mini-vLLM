@@ -31,6 +31,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
+        "--skip-target-preflight",
+        action="store_true",
+        help=(
+            "Skip the Oracle target-only comparison. By default the exporter "
+            "first confirms that Oracle DFlash generation starts with the same "
+            "completion token as Oracle target-only generation."
+        ),
+    )
+    parser.add_argument(
+        "--allow-prefill-anchor",
+        action="store_true",
+        help=(
+            "Allow comparing a DFlash capture whose anchor came from "
+            "next_prefill_tokens. By default the exporter selects the first "
+            "capture with num_sampled > 0, matching target_bonus_token semantics."
+        ),
+    )
+    parser.add_argument(
         "--anchor-position-mode",
         choices=("oracle", "minivllm", "prompt-final"),
         default="minivllm",
@@ -154,6 +172,35 @@ def first_output_token_ids(output: Any) -> list[int]:
     return []
 
 
+def completion_token_ids(raw_token_ids: list[int], prompt_token_ids: list[int]) -> list[int]:
+    if raw_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
+        return raw_token_ids[len(prompt_token_ids) :]
+    return raw_token_ids
+
+
+def build_llm_kwargs(args: argparse.Namespace, speculative: bool) -> dict[str, Any]:
+    extra_kwargs = json.loads(args.extra_llm_kwargs)
+    if not isinstance(extra_kwargs, dict):
+        raise SystemExit("--extra-llm-kwargs must be a JSON object")
+
+    llm_kwargs = {
+        "model": args.target_model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "trust_remote_code": args.trust_remote_code,
+        "enforce_eager": args.enforce_eager,
+        **extra_kwargs,
+    }
+    if speculative:
+        llm_kwargs["speculative_config"] = {
+            "method": args.method,
+            "model": args.draft_model,
+            "num_speculative_tokens": args.num_speculative_tokens,
+        }
+    return llm_kwargs
+
+
 def main() -> None:
     args = parse_args()
     if not args.target_model:
@@ -162,12 +209,6 @@ def main() -> None:
         raise SystemExit("Pass --draft-model or set MINIVLLM_DFLASH2_PATH")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
-
-    extra_kwargs = json.loads(args.extra_llm_kwargs)
-    if not isinstance(extra_kwargs, dict):
-        raise SystemExit("--extra-llm-kwargs must be a JSON object")
-
-    install_dflash_capture_hook()
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
@@ -180,27 +221,23 @@ def main() -> None:
     if not prompt_token_ids:
         raise SystemExit("prompt encoded to zero tokens")
 
-    speculative_config = {
-        "method": args.method,
-        "model": args.draft_model,
-        "num_speculative_tokens": args.num_speculative_tokens,
-    }
-    llm_kwargs = {
-        "model": args.target_model,
-        "tensor_parallel_size": args.tensor_parallel_size,
-        "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_model_len": args.max_model_len,
-        "trust_remote_code": args.trust_remote_code,
-        "enforce_eager": args.enforce_eager,
-        "speculative_config": speculative_config,
-        **extra_kwargs,
-    }
-    llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=args.max_tokens,
         seed=args.seed,
     )
+    target_only_token_ids: list[int] = []
+    if not args.skip_target_preflight:
+        target_llm = LLM(**build_llm_kwargs(args, speculative=False))
+        target_outputs = target_llm.generate([args.prompt], sampling_params)
+        target_raw = first_output_token_ids(target_outputs[0]) if target_outputs else []
+        target_only_token_ids = completion_token_ids(target_raw, prompt_token_ids)
+        print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
+        del target_llm
+
+    install_dflash_capture_hook()
+
+    llm = LLM(**build_llm_kwargs(args, speculative=True))
     outputs = llm.generate([args.prompt], sampling_params)
     if not CAPTURES:
         raise SystemExit(
@@ -212,12 +249,43 @@ def main() -> None:
             f"{os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')!r}."
         )
 
-    capture = CAPTURES[0]
+    selected_index = None
+    for index, candidate in enumerate(CAPTURES):
+        if args.allow_prefill_anchor or as_int(candidate["num_sampled"]) > 0:
+            selected_index = index
+            break
+    if selected_index is None:
+        summary = [
+            {
+                "index": index,
+                "num_sampled": candidate.get("num_sampled"),
+                "anchor_token_id": candidate.get("anchor_token_id"),
+                "proposal_rows": candidate.get("proposal_rows"),
+            }
+            for index, candidate in enumerate(CAPTURES)
+        ]
+        raise SystemExit(
+            "Only prefill-anchor DFlash captures were found; no capture with "
+            f"num_sampled > 0 is available. Captures={summary}"
+        )
+
+    capture = CAPTURES[selected_index]
     proposal_rows = capture["proposal_rows"]
     proposal_token_ids = [int(value) for value in proposal_rows[0]]
-    output_token_ids = first_output_token_ids(outputs[0]) if outputs else []
+    raw_output_token_ids = first_output_token_ids(outputs[0]) if outputs else []
+    output_token_ids = completion_token_ids(raw_output_token_ids, prompt_token_ids)
     if not output_token_ids:
         raise SystemExit("Oracle generation produced no output tokens")
+    if target_only_token_ids and output_token_ids[0] != target_only_token_ids[0]:
+        raise SystemExit(
+            "Oracle DFlash generation is not target-lossless for this prompt: "
+            f"target_first={target_only_token_ids[0]} "
+            f"dflash_first={output_token_ids[0]} "
+            f"target_tokens={target_only_token_ids} "
+            f"dflash_tokens={output_token_ids}. "
+            "Retry with --method dflash2 if supported, or align a prompt/config "
+            "where Oracle target-only and Oracle DFlash outputs match first."
+        )
     sampled_count = as_int(capture["num_sampled"])
     oracle_anchor_position = len(prompt_token_ids) + max(0, sampled_count - 1)
     minivllm_anchor_position = len(prompt_token_ids)
@@ -229,7 +297,10 @@ def main() -> None:
     else:
         anchor_position = minivllm_anchor_position
     oracle_anchor_token_id = int(capture["anchor_token_id"])
-    minivllm_anchor_token_id = int(output_token_ids[0])
+    output_anchor_index = max(0, sampled_count - 1)
+    if output_anchor_index >= len(output_token_ids):
+        output_anchor_index = 0
+    minivllm_anchor_token_id = int(output_token_ids[output_anchor_index])
     prompt_final_anchor_token_id = int(prompt_token_ids[-1])
     if args.anchor_token_mode == "oracle":
         anchor_token_id = oracle_anchor_token_id
@@ -246,6 +317,7 @@ def main() -> None:
         "prompt_token_ids": prompt_token_ids,
         "anchor_token_id": int(anchor_token_id),
         "anchor_token_mode": args.anchor_token_mode,
+        "selected_capture_index": int(selected_index),
         "oracle_capture_anchor_token_id": int(oracle_anchor_token_id),
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
         "prompt_final_anchor_token_id": int(prompt_final_anchor_token_id),
@@ -257,6 +329,8 @@ def main() -> None:
         "target_layer_ids": [5, 19, 33, 47, 61],
         "proposal_valid_length": len(proposal_token_ids),
         "proposal_token_ids": proposal_token_ids,
+        "oracle_target_only_token_ids": target_only_token_ids,
+        "raw_output_token_ids": raw_output_token_ids,
         "output_token_ids": output_token_ids,
         "capture": capture,
     }
@@ -268,6 +342,10 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"prompt_token_ids={prompt_token_ids}", flush=True)
+    print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
+    print(f"selected_capture_index={selected_index}", flush=True)
+    print(f"capture_num_sampled={capture['num_sampled']}", flush=True)
+    print(f"raw_output_token_ids={raw_output_token_ids}", flush=True)
     print(f"output_token_ids={output_token_ids}", flush=True)
     print(f"anchor_token_id={fixture['anchor_token_id']}", flush=True)
     print(f"oracle_capture_anchor_token_id={oracle_anchor_token_id}", flush=True)

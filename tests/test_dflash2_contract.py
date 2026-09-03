@@ -7,6 +7,7 @@ from myvllm.engine.sequence import Sequence
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.spec_decode.dflash2 import (
     DRAFT_TARGET_TAP_LAYERS,
+    DFlash2CandidateSelector,
     DFlash2Config,
     DFlash2DraftCache,
     DFlash2DraftModel,
@@ -169,6 +170,56 @@ def test_dflash2_candidate_selector_returns_topk_path():
 
     assert selected.token_ids.tolist() == [[[1, 3], [0, 2]]]
     assert selected.scores.tolist() == [[[4.0, 3.0], [8.0, 7.0]]]
+
+
+def test_dflash2_candidate_selector_uses_lattice_path_scores():
+    config = DFlash2Config(
+        block_size=3,
+        target_layer_ids=(0,),
+        selector_top_k=2,
+        selector_rank=1,
+        vocab_size=4,
+        hidden_size=1,
+    )
+    selector = DFlash2CandidateSelector(config)
+    with torch.no_grad():
+        selector.hidden_projection.weight.fill_(1.0)
+        selector.predecessor_codebook.zero_()
+        selector.successor_codebook.zero_()
+        selector.predecessor_codebook[2, 0] = 10.0
+        selector.successor_codebook[3, 0] = 1.0
+
+    unary_logits = torch.tensor([[[0.0, 10.0, 9.0, -1.0], [0.0, -1.0, -2.0, 0.0]]])
+    hidden_states = torch.ones(1, 2, 1)
+
+    proposal = selector.select_path(
+        unary_logits,
+        hidden_states,
+        anchor_token_ids=torch.tensor([0]),
+    )
+
+    assert proposal.token_ids.tolist() == [[2, 3]]
+
+
+def test_dflash2_draft_cache_stores_sliding_target_context():
+    cache = DFlash2DraftCache(sliding_window=2)
+    hidden_taps = {
+        5: torch.arange(12, dtype=torch.float32).view(1, 3, 4),
+        19: torch.arange(12, 24, dtype=torch.float32).view(1, 3, 4),
+    }
+
+    cache.update_target_context("req", hidden_taps, anchor_token_id=11, anchor_position=7)
+
+    assert cache.anchor_token_ids_by_request == {"req": 11}
+    assert cache.anchor_positions_by_request == {"req": 7}
+    assert cache.hidden_taps_by_request["req"][5].shape == (1, 2, 4)
+    assert cache.hidden_taps_by_request["req"][5].tolist() == hidden_taps[5][:, 1:, :].tolist()
+
+    cache.release("req")
+
+    assert "req" not in cache.hidden_taps_by_request
+    assert "req" not in cache.anchor_token_ids_by_request
+    assert "req" not in cache.anchor_positions_by_request
 
 
 def test_grouped_dynamic_conv_resets_at_block_boundaries():

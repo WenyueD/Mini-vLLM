@@ -764,10 +764,22 @@ class ModelRunner:
             return
         if decision_index is None:
             decision_index = output.logits.shape[1] - 1
-        hidden_taps = {
-            layer_id: value[:, decision_index : decision_index + 1, :].detach()
-            for layer_id, value in output.hidden_taps.items()
-        }
+            hidden_taps = {
+                layer_id: value[
+                    :,
+                    -min(
+                        value.shape[1],
+                        self.dflash2_draft_model.config.sliding_window,
+                    ) :,
+                    :,
+                ].detach()
+                for layer_id, value in output.hidden_taps.items()
+            }
+        else:
+            hidden_taps = {
+                layer_id: value[:, decision_index : decision_index + 1, :].detach()
+                for layer_id, value in output.hidden_taps.items()
+            }
         self._dflash2_contexts[seq.seq_id] = {
             "request_id": seq.request_id,
             "anchor_token_id": int(anchor_token_id),
@@ -779,6 +791,34 @@ class ModelRunner:
             ),
             "hidden_taps": hidden_taps,
         }
+        if self.dflash2_draft_cache is not None:
+            self.dflash2_draft_cache.update_target_context(
+                seq.request_id,
+                hidden_taps,
+                int(anchor_token_id),
+                int(self._dflash2_contexts[seq.seq_id]["anchor_position"]),
+            )
+
+    def _append_dflash2_hidden_history(
+        self,
+        sequence_id: int,
+        request_id: str,
+        output,
+        token_count: int,
+    ) -> dict[int, torch.Tensor]:
+        if token_count <= 0:
+            return self._dflash2_contexts.get(sequence_id, {}).get("hidden_taps", {})
+        previous = self._dflash2_contexts.get(sequence_id, {})
+        old_taps = previous.get("hidden_taps", {})
+        window = self.dflash2_draft_model.config.sliding_window
+        merged = {}
+        for layer_id, value in output.hidden_taps.items():
+            new_value = value[:, :token_count, :].detach()
+            old_value = old_taps.get(layer_id)
+            if old_value is not None:
+                new_value = torch.cat([old_value, new_value], dim=1)
+            merged[layer_id] = new_value[:, -min(new_value.shape[1], window) :, :]
+        return merged
 
     @torch.inference_mode()
     def propose_dflash2(
@@ -942,18 +982,27 @@ class ModelRunner:
                     and output.hidden_taps
                     and decision_index < len(target_token_ids)
                 ):
-                    hidden_taps = {
-                        layer_id: value[:, decision_index : decision_index + 1, :].detach()
-                        for layer_id, value in output.hidden_taps.items()
-                    }
                     if not hasattr(self, "_dflash2_contexts"):
                         self._dflash2_contexts = {}
+                    hidden_taps = self._append_dflash2_hidden_history(
+                        sequence_id,
+                        request_id,
+                        output,
+                        decision_index + 1,
+                    )
                     self._dflash2_contexts[sequence_id] = {
                         "request_id": request_id,
                         "anchor_token_id": int(target_token_ids[decision_index]),
                         "anchor_position": start_position + decision_index + 1,
                         "hidden_taps": hidden_taps,
                     }
+                    if self.dflash2_draft_cache is not None:
+                        self.dflash2_draft_cache.update_target_context(
+                            request_id,
+                            hidden_taps,
+                            int(target_token_ids[decision_index]),
+                            start_position + decision_index + 1,
+                        )
             else:
                 transaction, request_id = entry
             self.hybrid_cache_manager.commit(

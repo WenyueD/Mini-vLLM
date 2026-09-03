@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional comma-separated token IDs. Skips tokenizer if provided.",
     )
+    parser.add_argument(
+        "--expected-next-token-id",
+        type=int,
+        default=None,
+        help="Optional expected greedy next token ID for Oracle target parity.",
+    )
     return parser.parse_args()
 
 
@@ -132,6 +138,14 @@ def main() -> None:
     print(f"logits_shape={tuple(logits.shape)}", flush=True)
     print(f"hidden_tap_keys={sorted(output.hidden_taps)}", flush=True)
     print(f"next_token_id={next_token_id}", flush=True)
+    if args.expected_next_token_id is not None:
+        print(f"expected_next_token_id={args.expected_next_token_id}", flush=True)
+        if next_token_id != args.expected_next_token_id:
+            raise SystemExit(
+                "qwen38_target_oracle_anchor=FAIL "
+                f"expected={args.expected_next_token_id} actual={next_token_id}"
+            )
+        print("qwen38_target_oracle_anchor=PASS", flush=True)
     print(f"last_logit_min={min_logit:.6f}", flush=True)
     print(f"last_logit_max={max_logit:.6f}", flush=True)
     print_cuda_memory("after_forward", device)

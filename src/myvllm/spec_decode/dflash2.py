@@ -188,6 +188,22 @@ class DFlash2CandidateSelector(nn.Module):
         )
         return unary_scores + transition.to(unary_scores.dtype)
 
+    def score_edges(
+        self,
+        hidden_states: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        successor_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.dim() != 2:
+            raise ValueError("edge hidden states must have shape [batch, hidden]")
+        if predecessor_ids.dim() != 2 or successor_ids.dim() != 2:
+            raise ValueError("edge token IDs must have shape [batch, width]")
+        projected_hidden = self.hidden_projection(hidden_states)
+        predecessors = self.predecessor_codebook[predecessor_ids.long()]
+        successors = self.successor_codebook[successor_ids.long()]
+        context = predecessors * projected_hidden[:, None, :].to(predecessors.dtype)
+        return torch.einsum("bpr,bsr->bps", context, successors)
+
     def select(
         self,
         unary_logits: torch.Tensor,
@@ -213,29 +229,49 @@ class DFlash2CandidateSelector(nn.Module):
         if unary_logits.dim() != 3:
             raise ValueError("unary logits must have shape [batch, K, vocab]")
         batch_size, num_steps, _ = unary_logits.shape
-        selected_tokens = []
-        predecessor = anchor_token_ids.reshape(batch_size)
-        for step in range(num_steps):
-            selection = self.select(
-                unary_logits[:, step : step + 1, :],
-                hidden_states[:, step : step + 1, :],
-                predecessor[:, None],
-            )
-            choice = selection.scores[:, 0, :].argmax(dim=-1)
-            predecessor = selection.token_ids[:, 0, :].gather(
-                -1,
-                choice[:, None],
-            ).squeeze(-1)
-            selected_tokens.append(predecessor)
-        if selected_tokens:
-            token_ids = torch.stack(selected_tokens, dim=1)
-        else:
+        if hidden_states.shape[:2] != (batch_size, num_steps):
+            raise ValueError("selector hidden states must match unary logits")
+        candidates = unary_logits.topk(self.top_k, dim=-1).indices
+        unary_scores = unary_logits.gather(-1, candidates)
+        if num_steps == 0:
             token_ids = torch.empty(
                 batch_size,
                 0,
                 dtype=torch.long,
                 device=unary_logits.device,
             )
+        else:
+            initial_edges = self.score_edges(
+                hidden_states[:, 0, :],
+                anchor_token_ids.reshape(batch_size, 1),
+                candidates[:, 0, :],
+            )[:, 0, :]
+            path_scores = unary_scores[:, 0, :] + initial_edges.to(unary_scores.dtype)
+            backpointers = []
+            for step in range(1, num_steps):
+                edges = self.score_edges(
+                    hidden_states[:, step, :],
+                    candidates[:, step - 1, :],
+                    candidates[:, step, :],
+                ).to(unary_scores.dtype)
+                transition_scores = path_scores[:, :, None] + edges
+                best_scores, best_prev = transition_scores.max(dim=1)
+                path_scores = best_scores + unary_scores[:, step, :]
+                backpointers.append(best_prev)
+
+            best_last = path_scores.argmax(dim=-1)
+            chosen_by_step = [best_last]
+            for backpointer in reversed(backpointers):
+                chosen_by_step.append(
+                    backpointer.gather(1, chosen_by_step[-1][:, None]).squeeze(1)
+                )
+            chosen_by_step.reverse()
+            selected_tokens = []
+            for step, chosen_index in enumerate(chosen_by_step):
+                selected_tokens.append(
+                    candidates[:, step, :].gather(1, chosen_index[:, None]).squeeze(1)
+                )
+            token_ids = torch.stack(selected_tokens, dim=1)
         return ProposalBatch(
             token_ids=token_ids,
             valid_lengths=torch.full(
@@ -894,6 +930,11 @@ def select_topk_candidates(scores: torch.Tensor, top_k: int) -> CandidateSelecti
 class DFlash2DraftCache:
     sliding_window: int
     lengths_by_request: dict[str, int] = field(default_factory=dict)
+    hidden_taps_by_request: dict[str, dict[int, torch.Tensor]] = field(
+        default_factory=dict
+    )
+    anchor_token_ids_by_request: dict[str, int] = field(default_factory=dict)
+    anchor_positions_by_request: dict[str, int] = field(default_factory=dict)
 
     def advance(self, request_id: str, tokens: int) -> None:
         if tokens < 0:
@@ -904,6 +945,20 @@ class DFlash2DraftCache:
             current + tokens,
         )
 
+    def update_target_context(
+        self,
+        request_id: str,
+        hidden_taps: Mapping[int, torch.Tensor],
+        anchor_token_id: int,
+        anchor_position: int,
+    ) -> None:
+        self.hidden_taps_by_request[request_id] = {
+            layer_id: value[:, -min(value.shape[1], self.sliding_window) :, :].detach()
+            for layer_id, value in hidden_taps.items()
+        }
+        self.anchor_token_ids_by_request[request_id] = int(anchor_token_id)
+        self.anchor_positions_by_request[request_id] = int(anchor_position)
+
     def rollback(self, request_id: str, length: int) -> None:
         if length < 0:
             raise ValueError("draft cache length cannot be negative")
@@ -911,6 +966,9 @@ class DFlash2DraftCache:
 
     def release(self, request_id: str) -> None:
         self.lengths_by_request.pop(request_id, None)
+        self.hidden_taps_by_request.pop(request_id, None)
+        self.anchor_token_ids_by_request.pop(request_id, None)
+        self.anchor_positions_by_request.pop(request_id, None)
 
 
 @dataclass(frozen=True)
