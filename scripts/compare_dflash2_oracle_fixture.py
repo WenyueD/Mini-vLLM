@@ -54,6 +54,24 @@ def normalize_fixture_schema(
         and normalized.get("anchor_position_mode") == "minivllm"
     )
     if has_v2_shape and uses_minivllm_anchor:
+        if "minivllm_anchor_token_id" in normalized:
+            previous = normalized.get("anchor_token_id")
+            normalized["anchor_token_id"] = normalized["minivllm_anchor_token_id"]
+            if previous != normalized["anchor_token_id"]:
+                print(
+                    f"legacy_anchor_token_rewritten={label} path={path} "
+                    f"old={previous} new={normalized['anchor_token_id']}",
+                    flush=True,
+                )
+        if "minivllm_anchor_position" in normalized:
+            previous = normalized.get("anchor_position")
+            normalized["anchor_position"] = normalized["minivllm_anchor_position"]
+            if previous != normalized["anchor_position"]:
+                print(
+                    f"legacy_anchor_position_rewritten={label} path={path} "
+                    f"old={previous} new={normalized['anchor_position']}",
+                    flush=True,
+                )
         normalized.setdefault("fixture_schema_version", 2)
         normalized.setdefault("anchor_semantics", "target_bonus_token")
         print(
@@ -87,6 +105,28 @@ def optional_checksum_delta(
     return abs(float(left[key]) - float(right[key]))
 
 
+def print_mismatch_context(fixture: dict[str, Any], *, label: str) -> None:
+    debug_keys = (
+        "anchor_token_id",
+        "anchor_token_mode",
+        "minivllm_anchor_token_id",
+        "oracle_capture_anchor_token_id",
+        "prompt_final_anchor_token_id",
+        "anchor_position",
+        "anchor_position_mode",
+        "minivllm_anchor_position",
+        "oracle_anchor_position",
+        "prompt_final_anchor_position",
+        "oracle_target_only_token_ids",
+        "raw_output_token_ids",
+        "output_token_ids",
+        "proposal_token_ids",
+    )
+    for debug_key in debug_keys:
+        if debug_key in fixture:
+            print(f"{label}_{debug_key}={fixture[debug_key]}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     minivllm = normalize_fixture_schema(
@@ -115,6 +155,8 @@ def main() -> None:
         right = get_required(oracle, key, label="oracle", path=args.oracle)
         print(f"{key}: minivllm={left} oracle={right}", flush=True)
         if left != right:
+            print_mismatch_context(minivllm, label="minivllm")
+            print_mismatch_context(oracle, label="oracle")
             raise SystemExit(f"dflash2_oracle_alignment=FAIL key={key}")
 
     for key in ("context_checksum", "proposal_hidden_checksum"):

@@ -47,10 +47,14 @@ def test_compare_fixture_infers_legacy_oracle_schema_v2():
         "source": "oracle-vllm",
         "prompt": "Hello",
         "prompt_token_ids": [9419],
-        "anchor_token_id": 11,
+        "anchor_token_id": 9419,
         "anchor_token_mode": "minivllm",
+        "minivllm_anchor_token_id": 11,
+        "oracle_capture_anchor_token_id": 9419,
         "anchor_position": 1,
         "anchor_position_mode": "minivllm",
+        "minivllm_anchor_position": 1,
+        "oracle_anchor_position": 0,
         "target_layer_ids": [5, 19, 33, 47, 61],
         "proposal_token_ids": [478, 0, 198],
     }
@@ -63,6 +67,8 @@ def test_compare_fixture_infers_legacy_oracle_schema_v2():
 
     assert normalized["fixture_schema_version"] == 2
     assert normalized["anchor_semantics"] == "target_bonus_token"
+    assert normalized["anchor_token_id"] == 11
+    assert normalized["anchor_position"] == 1
 
 
 def test_dflash2_config_reads_real_nested_dflash_config():
