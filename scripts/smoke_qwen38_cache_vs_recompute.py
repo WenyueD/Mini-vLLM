@@ -44,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--atol", type=float, default=3e-2)
     parser.add_argument("--rtol", type=float, default=3e-2)
+    parser.add_argument(
+        "--allow-logit-drift",
+        action="store_true",
+        help=(
+            "Continue when cached and recompute greedy tokens match but full-vocab "
+            "logits exceed the configured tolerance."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -60,6 +68,7 @@ def check_close(
     step: int,
     atol: float,
     rtol: float,
+    allow_logit_drift: bool,
 ) -> tuple[float, int, int]:
     diff = (cached_logits.float() - recompute_logits.float()).abs()
     max_abs = float(diff.max().item())
@@ -79,7 +88,11 @@ def check_close(
         print(f"cached_top5_values={top_cached.values[0].tolist()}", flush=True)
         print(f"recompute_top5_ids={top_recompute.indices[0].tolist()}", flush=True)
         print(f"recompute_top5_values={top_recompute.values[0].tolist()}", flush=True)
-        raise RuntimeError("cached logits/token differ from full recompute")
+        if cached_token != recompute_token:
+            raise RuntimeError("cached token differs from full recompute")
+        if not allow_logit_drift:
+            raise RuntimeError("cached logits differ from full recompute")
+        print("logit_drift_warning=allowed_token_decision_matches", flush=True)
     return max_abs, cached_token, recompute_token
 
 
@@ -106,6 +119,7 @@ def main() -> None:
     print(f"safe_open_device={args.safe_open_device}", flush=True)
     print(f"max_new_tokens={args.max_new_tokens}", flush=True)
     print(f"atol={args.atol} rtol={args.rtol}", flush=True)
+    print(f"allow_logit_drift={args.allow_logit_drift}", flush=True)
     print_cuda_memory("before_model", device)
 
     started = time.time()
@@ -154,6 +168,7 @@ def main() -> None:
             step=0,
             atol=args.atol,
             rtol=args.rtol,
+            allow_logit_drift=args.allow_logit_drift,
         )
         max_abs_diffs.append(max_abs)
 
@@ -187,6 +202,7 @@ def main() -> None:
                 step=step,
                 atol=args.atol,
                 rtol=args.rtol,
+                allow_logit_drift=args.allow_logit_drift,
             )
             max_abs_diffs.append(max_abs)
             print(

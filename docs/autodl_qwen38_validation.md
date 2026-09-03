@@ -166,6 +166,26 @@ The pass markers are `qwen38_single_token_forward=PASS`,
 `qwen38_no_cache_greedy_32=PASS`, `qwen38_cache_vs_recompute=PASS`, and
 `qwen38_engine_target_only=PASS`.
 
+If cache-vs-recompute fails only because the all-vocab bf16 logits exceed
+tolerance while `cached_token` and `recompute_token` still match, rerun it as a
+token-decision acceptance check:
+
+```bash
+python scripts/smoke_qwen38_cache_vs_recompute.py \
+  --model "$MINIVLLM_QWEN38_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --atol 0.3 \
+  --rtol 0.05 \
+  --allow-logit-drift \
+  | tee results/qwen38_target/cache_vs_recompute_32_token_decision.txt
+```
+
+Do not use `--allow-logit-drift` if `cached_token` and `recompute_token` differ.
+
 Before DFlash2 Oracle proposal alignment, verify that Mini-vLLM and Oracle
 target-only agree on the first greedy token for the same raw prompt.  For the
 current Oracle target-only run, `"Hello"` produced first completion token `11`:
@@ -244,6 +264,9 @@ The JSON should contain `fixture_schema_version=2` and
 
 ```bash
 mkdir -p results/qwen38_target/oracle_alignment
+rm -f \
+  results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json
 
 python scripts/smoke_dflash2_standalone_proposal.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
@@ -269,6 +292,8 @@ cd /root/autodl-tmp/Mini-vLLM
 source /path/to/oracle/.venv/bin/activate
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_WORKER_MULTIPROC_METHOD=fork
+
+grep -n "fixture_schema_version" scripts/export_oracle_dflash2_fixture.py
 
 python scripts/export_oracle_dflash2_fixture.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \

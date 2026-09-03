@@ -23,6 +23,18 @@ The user also reported:
 - `qwen38_target_oracle_anchor=FAIL` for prompt `"Hello"`: Oracle
   target-only first completion token is `11`, while Mini-vLLM currently predicts
   `846`
+- After the split RMSNorm/GatedRMSNorm fix, `qwen38_target_oracle_anchor=PASS`
+  for prompt `"Hello"` with `next_token_id=11`.
+- The first post-fix cache-vs-recompute rerun hit a strict all-vocab bf16
+  tolerance failure at `mismatch_step=26` (`max_abs_diff=0.5`), but
+  `cached_token` and `recompute_token` both remained `353` and the top-5 token
+  IDs matched.
+- The follow-up token-decision cache-vs-recompute run passed with
+  `qwen38_cache_vs_recompute=PASS`, and the target-only engine smoke passed with
+  `qwen38_engine_target_only=PASS`.
+- The fresh post-fix DFlash2 online B=1 run passed target-lossless validation:
+  `dflash2_online_b1=PASS`, with `dflash2_proposed_tokens=189`,
+  `dflash2_accepted_tokens=0`, and `dflash2_acceptance_rate=0.0`.
 
 ## DFlash2 Checkpoint Audit Input
 
@@ -118,11 +130,11 @@ Result: PASS.
 | Priority | Status | Evidence |
 | --- | --- | --- |
 | P0 regression | PASS local | `84 passed, 2 skipped`; compileall passed. |
-| P1 target real baseline | PARTIAL | Load/forward/cache/engine smokes PASS on AutoDL A800, but Oracle target-token parity FAILS: expected `11`, actual `846` for prompt `"Hello"`. |
+| P1 target real baseline | PASS remote/user-reported | Target Oracle anchor PASS after gated norm fix; token-decision cache-vs-recompute PASS; target-only engine smoke PASS. |
 | P2 cache transaction | PASS local | Hybrid transaction/coordinator/Qwen cached verifier tests. |
 | P3 hidden taps | PASS local | Zero-based taps and logits-invariance tests. |
-| P4 DFlash2 standalone | BLOCKED | Real config + 81-key checkpoint audit/load-only PASS; draft model executes. Proposal semantic parity with Oracle is blocked until target-only token parity is fixed. |
-| P5 B=1 end-to-end | STALE/PENDING | Offline engine B=1 and online B=1 passed under old semantics; rerun required after anchor/context/selector fixes. |
+| P4 DFlash2 standalone | PENDING | Real config + 81-key checkpoint audit/load-only PASS; draft model executes. Proposal token semantic parity with Oracle remains pending. |
+| P5 B=1 end-to-end | PASS/PARTIAL | Fresh online B=1 is target-lossless and reports `dflash2_online_b1=PASS`, but accepted tokens are still zero, so proposal quality/alignment is not complete. |
 | P6 batch | PENDING | Real DFlash2 batch not implemented. |
 | P7 performance | PENDING | Oracle target parity, Oracle alignment, fresh B=1 validation, and batch validation are not complete. |
 

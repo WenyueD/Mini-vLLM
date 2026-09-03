@@ -28,9 +28,16 @@ def load_json(path: str) -> dict[str, Any]:
     return value
 
 
-def get_required(fixture: dict[str, Any], key: str) -> Any:
+def get_required(fixture: dict[str, Any], key: str, *, label: str, path: str) -> Any:
     if key not in fixture:
-        raise KeyError(f"missing required fixture key: {key}")
+        keys = ", ".join(sorted(fixture))
+        raise SystemExit(
+            f"dflash2_oracle_alignment=FAIL missing_key={key} fixture={label} "
+            f"path={path}\n"
+            f"{label}_fixture_keys=[{keys}]\n"
+            "Regenerate both fixtures with the latest scripts so they contain "
+            "fixture_schema_version=2 and anchor_semantics=target_bonus_token."
+        )
     return fixture[key]
 
 
@@ -60,8 +67,8 @@ def main() -> None:
         "proposal_token_ids",
     ]
     for key in required_equal_keys:
-        left = get_required(minivllm, key)
-        right = get_required(oracle, key)
+        left = get_required(minivllm, key, label="minivllm", path=args.minivllm)
+        right = get_required(oracle, key, label="oracle", path=args.oracle)
         print(f"{key}: minivllm={left} oracle={right}", flush=True)
         if left != right:
             raise SystemExit(f"dflash2_oracle_alignment=FAIL key={key}")
