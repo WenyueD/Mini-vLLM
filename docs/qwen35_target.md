@@ -8,10 +8,11 @@ whose language model lives under nested `text_config`.
 
 - Supported: text-only target execution, greedy correctness scaffolding, B=1
   eager cached target steps, Qwen3.5/Qwen3.8 config parsing, weight mapping
-  validation, hidden taps, and hybrid cache transaction semantics.
-- Not claimed: multimodal inputs, production dynamic batching, neural draft
-  loading, DFlash2 proposer execution, CUDA Graph optimization for verification,
-  or real Qwen/Qwen3.8-27B GPU acceptance numbers.
+  validation, hidden taps, hybrid cache transaction semantics, and B=1 DFlash2
+  draft execution behind the speculative verifier.
+- Not claimed: multimodal inputs, production dynamic batching, CUDA Graph
+  optimization for verification, online DFlash2 validation, oracle proposal-ID
+  alignment, or performance numbers.
 - Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
   `video_grid_thw` are rejected explicitly.
 - Target cache sizing can be constrained with `target_cache_memory_fraction` or
@@ -106,10 +107,11 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   `LLMEngine`; `ModelRunner` owns draft loading, target hidden-context capture,
   standalone proposal, and verifier-commit context refresh.
 
-This path is still not an end-to-end DFlash2 integration. The draft checkpoint
-can be audited and loaded, standalone block proposal can be run, and an offline
-B=1 engine smoke is available. Oracle proposal-ID alignment and online validation
-remain required before performance claims.
+This path is still not a production DFlash2 integration. The draft checkpoint
+can be audited and loaded, standalone block proposal can be run, and the offline
+B=1 engine smoke has passed on AutoDL by user report. Online B=1 validation,
+Oracle proposal-ID alignment, batch execution, and performance runs remain
+required before broader claims.
 
 ## GPU Validation
 

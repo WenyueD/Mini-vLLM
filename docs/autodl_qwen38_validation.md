@@ -166,6 +166,47 @@ The pass markers are `qwen38_single_token_forward=PASS`,
 `qwen38_no_cache_greedy_32=PASS`, `qwen38_cache_vs_recompute=PASS`, and
 `qwen38_engine_target_only=PASS`.
 
+## DFlash2 B=1 Online Smoke
+
+Run this after `qwen38_dflash2_engine_b1=PASS`.  It compares target-only online
+streaming with DFlash2 online streaming for one request, requires exact token ID
+equality, and verifies that the DFlash2 path produced speculative proposals.
+
+```bash
+export MINIVLLM_DFLASH2_PATH=/root/autodl-tmp/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/<snapshot>
+mkdir -p results/qwen38_target
+
+python scripts/smoke_qwen38_dflash2_online_b1.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --dflash2-safe-open-device cuda \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  | tee results/qwen38_target/dflash2_online_b1_hello_32.txt
+```
+
+If direct CUDA staging is tight, retry the online smoke with CPU staging:
+
+```bash
+python scripts/smoke_qwen38_dflash2_online_b1.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cpu \
+  --dflash2-safe-open-device cpu \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  | tee results/qwen38_target/dflash2_online_b1_hello_32_cpu_staging.txt
+```
+
+The pass marker is `dflash2_online_b1=PASS`.  Keep
+`dflash2_oracle_alignment=PENDING` until proposal IDs are compared against the
+Oracle path.
+
 ## Test Commands
 
 ```bash
