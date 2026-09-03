@@ -12,6 +12,12 @@ The AutoDL A800 target baseline commands all passed:
 This moves P1 target real baseline to PASS, assuming the server logs are retained
 under `results/qwen38_target/`.
 
+The user also reported:
+
+- `dflash2_weight_name_audit=PASS`
+- `dflash2_load_only=PASS`
+- `dflash2_block_parallel_proposer=PENDING`
+
 ## DFlash2 Checkpoint Audit Input
 
 The real DFlash2 checkpoint audit shows:
@@ -36,9 +42,15 @@ The real DFlash2 checkpoint audit shows:
   dynamic-conv parameters, 5 attention layers, and MLPs.
 - Added `audit_dflash2_checkpoint()` for header-only safetensors validation.
 - Added `load_dflash2_weights_from_safetensors()` for load-only validation.
+- Added standalone draft math for `combine_hidden_taps`, grouped dynamic conv,
+  dense sliding attention, MLP, target-lm-head unary logits, and candidate path
+  selection.
+- Added `DFlash2TargetContext` provider support to `DFlash2StandaloneProposer`,
+  so one target-context fetch can drive one block proposal.
 - Added scripts:
   - `scripts/audit_dflash2_weights.py`
   - `scripts/smoke_dflash2_load_only.py`
+  - `scripts/smoke_dflash2_standalone_proposal.py`
 - Added tests for nested config, expected shapes, header-only audit, selector
   top-k, and guarded block-parallel proposer behavior.
 
@@ -56,6 +68,14 @@ Result: `9 passed`.
 
 Result: `84 passed, 2 skipped`.
 
+Latest local regression after standalone proposal math:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q --basetemp .\.pytest-tmp
+```
+
+Result: `87 passed, 2 skipped`.
+
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q src scripts tests
 ```
@@ -70,7 +90,7 @@ Result: PASS.
 | P1 target real baseline | PASS remote/user-reported | All four Qwen3.8 target smoke scripts reported PASS on AutoDL A800. |
 | P2 cache transaction | PASS local | Hybrid transaction/coordinator/Qwen cached verifier tests. |
 | P3 hidden taps | PASS local | Zero-based taps and logits-invariance tests. |
-| P4 DFlash2 standalone | PARTIAL | Real config + 81-key checkpoint audit/load-only path implemented; proposal math still PENDING. |
+| P4 DFlash2 standalone | PARTIAL | Real config + 81-key checkpoint audit/load-only PASS; standalone proposal script added but remote proposal run and Oracle alignment still PENDING. |
 | P5 B=1 end-to-end | PENDING | Real DFlash2 proposer not implemented. |
 | P6 batch | PENDING | Real DFlash2 batch not implemented. |
 | P7 performance | PENDING | Correctness stage not complete. |
@@ -89,6 +109,32 @@ python scripts/smoke_dflash2_load_only.py \
   --dtype bfloat16 \
   --safe-open-device cuda \
   | tee results/qwen38_target/dflash2_load_only.txt
+```
+
+Then run one real standalone block proposal:
+
+```bash
+python scripts/smoke_dflash2_standalone_proposal.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  | tee results/qwen38_target/dflash2_standalone_proposal_hello.txt
+```
+
+If CUDA staging is tight, retry with CPU staging:
+
+```bash
+python scripts/smoke_dflash2_standalone_proposal.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cpu \
+  --prompt "Hello" \
+  | tee results/qwen38_target/dflash2_standalone_proposal_hello_cpu_staging.txt
 ```
 
 If CUDA staging is tight, retry only load-only with CPU staging:

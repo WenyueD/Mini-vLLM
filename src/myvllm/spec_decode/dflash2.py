@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from myvllm.engine.sequence import Sequence
-from myvllm.models.qwen3_8 import Qwen35RMSNorm
+from myvllm.models.qwen3_8 import Qwen35RMSNorm, rotate_half
 from myvllm.spec_decode.proposer import Proposer
 from myvllm.spec_decode.types import Proposal
 
@@ -141,6 +143,7 @@ class DFlash2Config:
 class DFlash2CandidateSelector(nn.Module):
     def __init__(self, config: DFlash2Config):
         super().__init__()
+        self.top_k = config.selector_top_k
         self.hidden_projection = nn.Linear(
             config.hidden_size,
             config.selector_rank,
@@ -153,23 +156,195 @@ class DFlash2CandidateSelector(nn.Module):
             torch.empty(config.vocab_size, config.selector_rank)
         )
 
+    def context(
+        self, hidden_states: torch.Tensor, predecessor_ids: torch.Tensor
+    ) -> torch.Tensor:
+        predecessor = self.predecessor_codebook[predecessor_ids.long()]
+        projected_hidden = self.hidden_projection(hidden_states)
+        return predecessor * projected_hidden.to(predecessor.dtype)
+
+    def transition_scores(
+        self,
+        hidden_states: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        context = self.context(hidden_states, predecessor_ids)
+        successors = self.successor_codebook[candidate_ids.long()]
+        return (context.unsqueeze(-2) * successors).sum(dim=-1)
+
+    def score_candidates(
+        self,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        unary_scores = unary_logits.gather(-1, candidate_ids)
+        transition = self.transition_scores(
+            hidden_states,
+            predecessor_ids,
+            candidate_ids,
+        )
+        return unary_scores + transition.to(unary_scores.dtype)
+
+    def select(
+        self,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        top_k: int | None = None,
+    ) -> CandidateSelection:
+        candidate_ids = unary_logits.topk(top_k or self.top_k, dim=-1).indices
+        scores = self.score_candidates(
+            unary_logits,
+            hidden_states,
+            predecessor_ids,
+            candidate_ids,
+        )
+        return CandidateSelection(token_ids=candidate_ids, scores=scores)
+
+    def select_path(
+        self,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> ProposalBatch:
+        if unary_logits.dim() != 3:
+            raise ValueError("unary logits must have shape [batch, K, vocab]")
+        batch_size, num_steps, _ = unary_logits.shape
+        selected_tokens = []
+        predecessor = anchor_token_ids.reshape(batch_size)
+        for step in range(num_steps):
+            selection = self.select(
+                unary_logits[:, step : step + 1, :],
+                hidden_states[:, step : step + 1, :],
+                predecessor[:, None],
+            )
+            choice = selection.scores[:, 0, :].argmax(dim=-1)
+            predecessor = selection.token_ids[:, 0, :].gather(
+                -1,
+                choice[:, None],
+            ).squeeze(-1)
+            selected_tokens.append(predecessor)
+        if selected_tokens:
+            token_ids = torch.stack(selected_tokens, dim=1)
+        else:
+            token_ids = torch.empty(
+                batch_size,
+                0,
+                dtype=torch.long,
+                device=unary_logits.device,
+            )
+        return ProposalBatch(
+            token_ids=token_ids,
+            valid_lengths=torch.full(
+                (batch_size,),
+                num_steps,
+                dtype=torch.long,
+                device=unary_logits.device,
+            ),
+        )
+
+
+def grouped_dynamic_conv(
+    hidden_states: torch.Tensor,
+    delta_kernel: torch.Tensor,
+    base_kernel: torch.Tensor,
+    *,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    hidden_size = hidden_states.shape[-1]
+    if hidden_size % group_size:
+        raise ValueError("hidden_size must be divisible by group_size")
+    kernel_size = base_kernel.shape[0]
+    if kernel_size > block_size:
+        raise ValueError("kernel_size cannot exceed block_size")
+    num_groups = hidden_size // group_size
+    if base_kernel.shape != (kernel_size, hidden_size):
+        raise ValueError("base_kernel must have shape [kernel_size, hidden_size]")
+    expected = (*hidden_states.shape[:-1], kernel_size, num_groups)
+    if delta_kernel.shape != expected:
+        raise ValueError(f"delta_kernel must have shape {expected}")
+
+    original_shape = hidden_states.shape
+    flat_hidden = hidden_states.reshape(-1, num_groups, group_size)
+    flat_delta = delta_kernel.reshape(-1, kernel_size, num_groups)
+    positions = torch.arange(
+        flat_hidden.shape[0],
+        device=hidden_states.device,
+    ).remainder(block_size)
+    output = torch.zeros_like(flat_hidden)
+    for tap in range(kernel_size):
+        if tap == 0:
+            shifted = flat_hidden
+        else:
+            padding = flat_hidden.new_zeros(tap, num_groups, group_size)
+            shifted = torch.cat([padding, flat_hidden[:-tap]], dim=0)
+        coefficient = (
+            base_kernel[tap].to(flat_hidden.dtype).view(1, num_groups, group_size)
+            + flat_delta[:, tap, :, None]
+        )
+        output = output + shifted * coefficient * positions.ge(tap).view(-1, 1, 1)
+    return output.reshape(original_shape)
+
 
 class DFlash2DynamicConv(nn.Module):
     def __init__(self, config: DFlash2Config):
         super().__init__()
+        self.block_size = config.block_size
+        self.group_size = config.conv_group_size
+        self.kernel_size = config.conv_kernel_size
+        self.num_groups = config.hidden_size // config.conv_group_size
         self.base_kernel = nn.Parameter(
             torch.empty(config.conv_kernel_size, 2, config.hidden_size)
         )
         self.kernel_projection = nn.Linear(
             config.hidden_size,
-            config.hidden_size // 4,
+            config.conv_kernel_size * 2 * self.num_groups,
             bias=False,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        kernels = self.kernel_projection(hidden_states).view(
+            *hidden_states.shape[:-1],
+            2,
+            self.kernel_size,
+            self.num_groups,
+        )
+        prepared = grouped_dynamic_conv(
+            hidden_states,
+            kernels[..., 0, :, :],
+            self.base_kernel[0],
+            block_size=self.block_size,
+            group_size=self.group_size,
+        )
+        return prepared, kernels[..., 1, :, :]
+
+    def finish(
+        self,
+        hidden_states: torch.Tensor,
+        delta_kernel: torch.Tensor,
+    ) -> torch.Tensor:
+        return grouped_dynamic_conv(
+            hidden_states,
+            delta_kernel,
+            self.base_kernel[1],
+            block_size=self.block_size,
+            group_size=self.group_size,
         )
 
 
 class DFlash2Attention(nn.Module):
     def __init__(self, config: DFlash2Config):
         super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.head_dim = config.head_dim
+        self.scaling = config.head_dim**-0.5
+        self.sliding_window = config.sliding_window
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_attention_heads * config.head_dim,
@@ -192,6 +367,99 @@ class DFlash2Attention(nn.Module):
         )
         self.q_norm = Qwen35RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen35RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        inv_freq = 1.0 / (
+            config.rope_theta
+            ** (
+                torch.arange(0, config.head_dim, 2, dtype=torch.float32)
+                / config.head_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _position_embedding(
+        self,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        freqs = torch.einsum("bt,d->btd", positions.float(), self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    def _apply_rotary(
+        self,
+        states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        cos, sin = self._position_embedding(positions, states.dtype)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        return states * cos + rotate_half(states) * sin
+
+    def _project_kv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        key = self.k_proj(hidden_states).view(
+            batch_size,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        value = self.v_proj(hidden_states).view(
+            batch_size,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        key = self.k_norm(key).transpose(1, 2)
+        value = value.transpose(1, 2)
+        return key, value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        query_positions: torch.Tensor,
+        context_states: torch.Tensor | None = None,
+        context_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, query_len, _ = hidden_states.shape
+        query = self.q_proj(hidden_states).view(
+            batch_size,
+            query_len,
+            self.num_heads,
+            self.head_dim,
+        )
+        query = self.q_norm(query).transpose(1, 2)
+        query = self._apply_rotary(query, query_positions)
+
+        query_key, query_value = self._project_kv(hidden_states)
+        query_key = self._apply_rotary(query_key, query_positions)
+        key_parts = [query_key]
+        value_parts = [query_value]
+        position_parts = [query_positions]
+        if context_states is not None:
+            if context_positions is None:
+                raise ValueError("context_positions are required with context_states")
+            context_key, context_value = self._project_kv(context_states)
+            context_key = self._apply_rotary(context_key, context_positions)
+            key_parts.insert(0, context_key)
+            value_parts.insert(0, context_value)
+            position_parts.insert(0, context_positions)
+
+        key = torch.cat(key_parts, dim=2)
+        value = torch.cat(value_parts, dim=2)
+        key_positions = torch.cat(position_parts, dim=1)
+        if self.num_key_value_groups > 1:
+            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
+            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        scores = torch.matmul(query, key.transpose(2, 3)) * self.scaling
+        visible = (
+            key_positions[:, None, None, :]
+            >= query_positions[:, None, :, None] - self.sliding_window + 1
+        )
+        scores = scores.masked_fill(~visible, -torch.inf)
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        output = torch.matmul(probs, value).transpose(1, 2).contiguous()
+        return self.o_proj(output.reshape(batch_size, query_len, -1))
 
 
 class DFlash2MLP(nn.Module):
@@ -213,6 +481,10 @@ class DFlash2MLP(nn.Module):
             bias=False,
         )
 
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gated = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        return self.down_proj(gated)
+
 
 class DFlash2DecoderLayer(nn.Module):
     def __init__(self, config: DFlash2Config):
@@ -230,6 +502,29 @@ class DFlash2DecoderLayer(nn.Module):
         )
         self.self_attn = DFlash2Attention(config)
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        query_positions: torch.Tensor,
+        context_states: torch.Tensor | None = None,
+        context_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        conv_hidden, conv_tail = self.attention_conv.prepare(normed)
+        attn_output = self.self_attn(
+            conv_hidden,
+            query_positions,
+            context_states=context_states,
+            context_positions=context_positions,
+        )
+        hidden_states = residual + self.attention_conv.finish(attn_output, conv_tail)
+        residual = hidden_states
+        normed = self.post_attention_layernorm(hidden_states)
+        conv_hidden, conv_tail = self.mlp_conv.prepare(normed)
+        mlp_output = self.mlp(conv_hidden)
+        return residual + self.mlp_conv.finish(mlp_output, conv_tail)
+
 
 class DFlash2DraftModel(nn.Module):
     """Loadable DFlash2 checkpoint shell.
@@ -238,11 +533,12 @@ class DFlash2DraftModel(nn.Module):
     until the standalone proposal math is implemented and aligned with Oracle.
     """
 
-    supports_block_parallel = False
+    supports_block_parallel = True
 
-    def __init__(self, config: DFlash2Config):
+    def __init__(self, config: DFlash2Config, *, enforce_contract: bool = True):
         super().__init__()
-        config.validate_contract()
+        if enforce_contract:
+            config.validate_contract()
         self.config = config
         self.candidate_selector = DFlash2CandidateSelector(config)
         self.fc = nn.Linear(
@@ -256,6 +552,97 @@ class DFlash2DraftModel(nn.Module):
             for _ in range(config.num_sliding_attention_layers)
         )
         self.norm = Qwen35RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def combine_hidden_taps(
+        self,
+        hidden_taps: Mapping[int, torch.Tensor],
+    ) -> torch.Tensor:
+        missing = [layer_id for layer_id in self.config.target_layer_ids if layer_id not in hidden_taps]
+        if missing:
+            raise ValueError(f"missing DFlash2 target hidden taps: {missing}")
+        values = [hidden_taps[layer_id] for layer_id in self.config.target_layer_ids]
+        reference_shape = values[0].shape[:-1]
+        for value in values:
+            if value.shape[:-1] != reference_shape:
+                raise ValueError("DFlash2 hidden taps must share batch/sequence shape")
+            if value.shape[-1] != self.config.hidden_size:
+                raise ValueError("DFlash2 hidden tap hidden size mismatch")
+        combined = torch.cat(values, dim=-1)
+        return self.hidden_norm(self.fc(combined))
+
+    def embed_block_inputs(
+        self,
+        anchor_token_ids: torch.Tensor,
+        token_embedding,
+    ) -> torch.Tensor:
+        mask = torch.full(
+            (
+                anchor_token_ids.shape[0],
+                self.config.num_speculative_tokens,
+            ),
+            self.config.mask_token_id,
+            dtype=torch.long,
+            device=anchor_token_ids.device,
+        )
+        input_ids = torch.cat([anchor_token_ids.reshape(-1, 1), mask], dim=1)
+        return token_embedding(input_ids)
+
+    def forward_block(
+        self,
+        anchor_token_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        hidden_taps: Mapping[int, torch.Tensor],
+        token_embedding,
+        lm_head,
+        *,
+        return_debug: bool = False,
+    ) -> tuple[ProposalBatch, dict[str, Any]]:
+        context_states = self.combine_hidden_taps(hidden_taps)
+        context_len = context_states.shape[1]
+        context_positions = (
+            anchor_positions.reshape(-1, 1)
+            - context_len
+            + 1
+            + torch.arange(
+                context_len,
+                device=anchor_positions.device,
+                dtype=anchor_positions.dtype,
+            ).view(1, -1)
+        )
+        hidden_states = self.embed_block_inputs(anchor_token_ids, token_embedding)
+        query_positions = anchor_positions.reshape(-1, 1) + torch.arange(
+            self.config.block_size,
+            device=anchor_positions.device,
+            dtype=anchor_positions.dtype,
+        ).view(1, -1)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                query_positions,
+                context_states=context_states,
+                context_positions=context_positions,
+            )
+        hidden_states = self.norm(hidden_states)
+        proposal_hidden = hidden_states[:, 1:, :]
+        unary_logits = lm_head(proposal_hidden)
+        proposal_batch = self.candidate_selector.select_path(
+            unary_logits,
+            proposal_hidden,
+            anchor_token_ids,
+        )
+        debug = {}
+        if return_debug:
+            debug = {
+                "context_shape": tuple(context_states.shape),
+                "query_shape": tuple(hidden_states.shape),
+                "proposal_hidden_shape": tuple(proposal_hidden.shape),
+                "unary_logits_shape": tuple(unary_logits.shape),
+                "context_checksum": float(context_states.float().sum().item()),
+                "proposal_hidden_checksum": float(
+                    proposal_hidden.float().sum().item()
+                ),
+            }
+        return proposal_batch, debug
 
 
 def expected_dflash2_weight_shapes(config: DFlash2Config) -> dict[str, tuple[int, ...]]:
@@ -290,7 +677,9 @@ def expected_dflash2_weight_shapes(config: DFlash2Config) -> dict[str, tuple[int
                     config.hidden_size,
                 ),
                 f"{prefix}.attention_conv.kernel_projection.weight": (
-                    config.hidden_size // 4,
+                    config.conv_kernel_size
+                    * 2
+                    * (config.hidden_size // config.conv_group_size),
                     config.hidden_size,
                 ),
                 f"{prefix}.input_layernorm.weight": (config.hidden_size,),
@@ -312,7 +701,9 @@ def expected_dflash2_weight_shapes(config: DFlash2Config) -> dict[str, tuple[int
                     config.hidden_size,
                 ),
                 f"{prefix}.mlp_conv.kernel_projection.weight": (
-                    config.hidden_size // 4,
+                    config.conv_kernel_size
+                    * 2
+                    * (config.hidden_size // config.conv_group_size),
                     config.hidden_size,
                 ),
                 f"{prefix}.post_attention_layernorm.weight": (config.hidden_size,),
@@ -523,6 +914,15 @@ class DFlash2DraftCache:
         self.lengths_by_request.pop(request_id, None)
 
 
+@dataclass(frozen=True)
+class DFlash2TargetContext:
+    hidden_taps: Mapping[int, torch.Tensor]
+    anchor_token_ids: torch.Tensor
+    anchor_positions: torch.Tensor
+    token_embedding: Any
+    lm_head: Any
+
+
 class BlockParallelDFlash2Model(Protocol):
     supports_block_parallel: bool
 
@@ -545,6 +945,9 @@ class DFlash2StandaloneProposer(Proposer):
         *,
         draft_cache: DFlash2DraftCache | None = None,
         include_debug_metadata: bool = False,
+        target_context_provider: (
+            Callable[[list[Sequence]], DFlash2TargetContext] | None
+        ) = None,
     ) -> None:
         config.validate_contract()
         if not getattr(draft_model, "supports_block_parallel", False):
@@ -556,6 +959,7 @@ class DFlash2StandaloneProposer(Proposer):
         self.draft_model = draft_model
         self.draft_cache = draft_cache or DFlash2DraftCache(config.sliding_window)
         self.include_debug_metadata = include_debug_metadata
+        self.target_context_provider = target_context_provider
 
     def propose(self, sequence: Sequence, max_tokens: int) -> Proposal:
         return self.propose_batch([sequence], [max_tokens])[0]
@@ -565,17 +969,41 @@ class DFlash2StandaloneProposer(Proposer):
     ) -> list[Proposal]:
         if len(sequences) != len(max_tokens):
             raise ValueError("sequence and proposer budget counts must match")
-        bounded = [min(self.config.num_speculative_tokens, max(0, value)) for value in max_tokens]
-        batch = self.draft_model.propose_block(sequences, bounded, self.draft_cache)
+        bounded = [
+            min(self.config.num_speculative_tokens, max(0, value))
+            for value in max_tokens
+        ]
+        if self.target_context_provider is None:
+            batch = self.draft_model.propose_block(
+                sequences,
+                bounded,
+                self.draft_cache,
+            )
+        else:
+            context = self.target_context_provider(sequences)
+            batch, debug = self.draft_model.forward_block(
+                context.anchor_token_ids,
+                context.anchor_positions,
+                context.hidden_taps,
+                context.token_embedding,
+                context.lm_head,
+                return_debug=self.include_debug_metadata,
+            )
+            if self.include_debug_metadata:
+                batch.metadata.update(debug)
         if batch.token_ids.shape[0] != len(sequences):
             raise ValueError("DFlash2 draft model returned the wrong batch size")
         if batch.token_ids.shape[1] > self.config.num_speculative_tokens:
             raise ValueError("DFlash2 draft model exceeded K=7")
         proposals = []
         for row, (seq, budget) in enumerate(zip(sequences, bounded)):
-            valid_length = int(batch.valid_lengths[row].item())
-            if valid_length > budget:
-                raise ValueError("DFlash2 draft model exceeded request budget")
-            proposals.append(batch.proposal_for(seq, row, self.include_debug_metadata))
+            valid_length = min(int(batch.valid_lengths[row].item()), budget)
+            tokens = tuple(
+                int(v) for v in batch.token_ids[row, :valid_length].tolist()
+            )
+            metadata = dict(batch.metadata) if self.include_debug_metadata else {}
+            metadata["kind"] = "dflash2"
+            metadata["block_parallel"] = True
+            proposals.append(Proposal(seq.seq_id, tokens, metadata))
             self.draft_cache.advance(seq.request_id, valid_length)
         return proposals

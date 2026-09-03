@@ -6,6 +6,7 @@ from myvllm.spec_decode.dflash2 import (
     DFlash2DraftCache,
     DFlash2DraftModel,
     DFlash2StandaloneProposer,
+    DFlash2TargetContext,
     DFlash2WeightAudit,
     ProposalBatch,
     audit_dflash2_checkpoint,

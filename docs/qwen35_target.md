@@ -96,14 +96,17 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   sliding-attention layers, dynamic conv weights, and final `norm`.
 - `audit_dflash2_checkpoint()` validates safetensors headers without loading
   large tensor payloads.
+- `forward_block()` is the standalone B=1/Batched draft path: target hidden taps
+  are fused through `fc`, anchor+mask tokens are embedded with the target
+  embedding table, the DFlash2 draft backbone runs once over the whole block, and
+  the target `lm_head` supplies unary logits for candidate selection.
 - `DFlash2StandaloneProposer` only accepts a draft model advertising
   `supports_block_parallel=True` and calls `propose_block()` once per batch.
 
-This is not yet a real DFlash2 neural proposal implementation. It is
-intentionally guarded so target outputs or seven serial draft forwards cannot be
-presented as DFlash2 block-parallel proposal. The draft checkpoint can now be
-audited and loaded into the shell, but `supports_block_parallel` remains disabled
-until the proposal math is implemented and aligned with Oracle.
+This path is still not an end-to-end DFlash2 integration. The draft checkpoint
+can be audited and loaded, and standalone block proposal can be run, but Oracle
+proposal-ID alignment and verifier integration remain required before online or
+performance claims.
 
 ## GPU Validation
 

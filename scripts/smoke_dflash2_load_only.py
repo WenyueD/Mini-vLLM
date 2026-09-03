@@ -113,7 +113,7 @@ def main() -> None:
     print(f"expected_tensors={audit.expected_tensors}", flush=True)
     print(f"dtype_counts={audit.dtype_counts}", flush=True)
     print("dflash2_load_only=PASS", flush=True)
-    print("dflash2_block_parallel_proposer=PENDING", flush=True)
+    print("dflash2_standalone_proposal=PENDING", flush=True)
 
 
 if __name__ == "__main__":
