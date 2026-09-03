@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-model-len", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        help="Optional vLLM dtype, for example bfloat16, float16, or auto.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
@@ -37,6 +43,17 @@ def parse_args() -> argparse.Namespace:
             "Skip the Oracle target-only comparison. By default the exporter "
             "first confirms that Oracle DFlash generation starts with the same "
             "completion token as Oracle target-only generation."
+        ),
+    )
+    parser.add_argument(
+        "--expected-target-first-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Known Oracle target-only first completion token. When set together "
+            "with --skip-target-preflight, the exporter still checks that Oracle "
+            "DFlash generation starts with this token without loading a separate "
+            "target-only LLM in the same process."
         ),
     )
     parser.add_argument(
@@ -74,6 +91,23 @@ def parse_args() -> argparse.Namespace:
         help="JSON object merged into vLLM.LLM keyword arguments.",
     )
     return parser.parse_args()
+
+
+def release_llm(llm: Any) -> None:
+    engine = getattr(llm, "llm_engine", None)
+    shutdown = getattr(engine, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+    del llm
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def tensor_to_list(value: Any) -> Any:
@@ -192,6 +226,8 @@ def build_llm_kwargs(args: argparse.Namespace, speculative: bool) -> dict[str, A
         "enforce_eager": args.enforce_eager,
         **extra_kwargs,
     }
+    if args.dtype:
+        llm_kwargs["dtype"] = args.dtype
     if speculative:
         llm_kwargs["speculative_config"] = {
             "method": args.method,
@@ -227,13 +263,20 @@ def main() -> None:
         seed=args.seed,
     )
     target_only_token_ids: list[int] = []
-    if not args.skip_target_preflight:
+    if args.skip_target_preflight and args.expected_target_first_token_id is not None:
+        target_only_token_ids = [int(args.expected_target_first_token_id)]
+        print(
+            f"oracle_target_only_token_ids={target_only_token_ids} "
+            "source=expected-target-first-token-id",
+            flush=True,
+        )
+    elif not args.skip_target_preflight:
         target_llm = LLM(**build_llm_kwargs(args, speculative=False))
         target_outputs = target_llm.generate([args.prompt], sampling_params)
         target_raw = first_output_token_ids(target_outputs[0]) if target_outputs else []
         target_only_token_ids = completion_token_ids(target_raw, prompt_token_ids)
         print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
-        del target_llm
+        release_llm(target_llm)
 
     install_dflash_capture_hook()
 

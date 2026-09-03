@@ -304,18 +304,23 @@ python scripts/export_oracle_dflash2_fixture.py \
   --num-speculative-tokens 7 \
   --method dflash \
   --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.9 \
+  --gpu-memory-utilization 0.85 \
   --max-model-len 256 \
+  --dtype bfloat16 \
+  --skip-target-preflight \
+  --expected-target-first-token-id 11 \
   --anchor-token-mode minivllm \
   --anchor-position-mode minivllm \
   --trust-remote-code \
   --enforce-eager \
+  --extra-llm-kwargs '{"cpu_offload_gb": 8, "max_num_seqs": 1, "max_num_batched_tokens": 256}' \
   | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```
 
-If the exporter reports an Oracle target-lossless preflight failure, do not
-compare fixtures yet; first find a prompt/config where Oracle target-only and
-Oracle DFlash start with the same completion token.
+If this still OOMs, try `cpu_offload_gb` values of 12 or 16 before trying
+quantization.  If the exporter reports that Oracle DFlash is not target-lossless
+for first token `11`, do not compare fixtures yet; first find a prompt/config
+where Oracle target-only and Oracle DFlash start with the same completion token.
 
 Then compare:
 

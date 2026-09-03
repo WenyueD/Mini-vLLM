@@ -35,6 +35,11 @@ The user also reported:
 - The fresh post-fix DFlash2 online B=1 run passed target-lossless validation:
   `dflash2_online_b1=PASS`, with `dflash2_proposed_tokens=189`,
   `dflash2_accepted_tokens=0`, and `dflash2_acceptance_rate=0.0`.
+- Oracle fixture export may OOM when it loads both a target-only LLM and a
+  speculative LLM in one process.  The exporter now supports
+  `--expected-target-first-token-id 11` with `--skip-target-preflight`, explicit
+  `--dtype`, and preflight cleanup; use CPU offload before considering
+  quantization because quantization changes the Oracle proposal surface.
 
 ## DFlash2 Checkpoint Audit Input
 
