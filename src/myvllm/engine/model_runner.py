@@ -8,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.engine.sequence import Sequence
 from myvllm.spec_decode.types import (
+    Proposal,
     SpecDecodeBatch,
     VerificationResult,
 )
@@ -19,6 +20,12 @@ from myvllm.models.qwen3_8_config import (
     is_qwen35_config,
     load_qwen35_config_dict,
     normalize_qwen35_text_config,
+)
+from myvllm.spec_decode.dflash2 import (
+    DFlash2Config,
+    DFlash2DraftCache,
+    DFlash2DraftModel,
+    load_dflash2_weights_from_safetensors,
 )
 
 
@@ -62,6 +69,9 @@ class ModelRunner:
         self.is_qwen35_target = False
         self.hybrid_cache_manager = None
         self._pending_verified_cache_transactions = {}
+        self.dflash2_draft_model = None
+        self.dflash2_draft_cache = None
+        self._dflash2_contexts = {}
         dist.init_process_group(
             "nccl", "tcp://localhost:12345", world_size=config["world_size"], rank=rank
         )
@@ -179,6 +189,8 @@ class ModelRunner:
                 safe_open_device=safe_open_device,
             )
 
+        self._maybe_load_dflash2_draft(rank)
+
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
 
@@ -223,6 +235,49 @@ class ModelRunner:
                 self.shm = SharedMemory(name="myvllm")
                 # Don't call self.loop() here - let the spawning code handle it
                 # Otherwise we'll be stuck in an infinite loop during __init__
+
+    def _speculative_config_dict(self) -> dict:
+        value = self.config.get("speculative_config") or {}
+        return value if isinstance(value, dict) else getattr(value, "__dict__", {})
+
+    def _maybe_load_dflash2_draft(self, rank: int) -> None:
+        spec_config = self._speculative_config_dict()
+        if spec_config.get("proposer") != "dflash2":
+            return
+        if not self.is_qwen35_target:
+            raise ValueError("DFlash2 proposer requires a Qwen3.5/Qwen3.8 target")
+        if self.world_size != 1:
+            raise NotImplementedError("DFlash2 integration currently supports B=1/world_size=1")
+        draft_path = (
+            spec_config.get("draft_model_name_or_path")
+            or self.config.get("dflash2_model_name_or_path")
+        )
+        if not draft_path:
+            raise ValueError(
+                "DFlash2 proposer requires speculative_config.draft_model_name_or_path"
+            )
+        draft_config = DFlash2Config.from_pretrained_path(draft_path)
+        draft_config.validate_contract()
+        with torch.device("meta"):
+            draft_model = DFlash2DraftModel(draft_config)
+        draft_model.to_empty(device=f"cuda:{rank}")
+        draft_model.eval()
+        safe_open_device = str(self.config.get("dflash2_safe_open_device", "cpu"))
+        if safe_open_device == "cuda":
+            safe_open_device = f"cuda:{rank}"
+        load_dflash2_weights_from_safetensors(
+            draft_model,
+            draft_path,
+            safe_open_device=safe_open_device,
+        )
+        self.dflash2_draft_model = draft_model
+        self.dflash2_draft_cache = DFlash2DraftCache(draft_config.sliding_window)
+        print(
+            "[Rank 0] DFlash2 draft loaded: "
+            f"layers={draft_config.num_sliding_attention_layers}, "
+            f"K={draft_config.num_speculative_tokens}, "
+            f"hidden_taps={list(draft_config.target_layer_ids)}"
+        )
 
     # only use read when rank != 0
     def read_shm(self):
@@ -312,6 +367,9 @@ class ModelRunner:
             if self.hybrid_cache_manager is not None:
                 for seq in seqs:
                     self.hybrid_cache_manager.release_request(seq.request_id)
+                    self._dflash2_contexts.pop(seq.seq_id, None)
+                    if self.dflash2_draft_cache is not None:
+                        self.dflash2_draft_cache.release(seq.request_id)
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model
@@ -665,11 +723,17 @@ class ModelRunner:
                     input_ids.reshape(-1),
                     self.hybrid_cache_manager,
                     seqs[0].request_id,
+                    capture_hidden_taps=self.dflash2_draft_model is not None,
                 )
                 logits = output.logits[:, -1, :]
                 token_ids = None
                 if self.rank == 0:
                     token_ids = self.sampler(logits, self.prepare_sample(seqs))
+                    self._store_dflash2_context_from_target_output(
+                        seqs[0],
+                        output,
+                        int(token_ids.reshape(-1)[0].item()),
+                    )
                 return token_ids
             finally:
                 reset_context()
@@ -686,6 +750,83 @@ class ModelRunner:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
+
+    def _store_dflash2_context_from_target_output(
+        self,
+        seq: Sequence,
+        output,
+        anchor_token_id: int,
+        decision_index: int | None = None,
+    ) -> None:
+        if self.dflash2_draft_model is None:
+            return
+        if not output.hidden_taps:
+            return
+        if decision_index is None:
+            decision_index = output.logits.shape[1] - 1
+        hidden_taps = {
+            layer_id: value[:, decision_index : decision_index + 1, :].detach()
+            for layer_id, value in output.hidden_taps.items()
+        }
+        self._dflash2_contexts[seq.seq_id] = {
+            "request_id": seq.request_id,
+            "anchor_token_id": int(anchor_token_id),
+            "anchor_position": int(
+                self.hybrid_cache_manager.get_request_state(seq.request_id).logical_length
+                - output.logits.shape[1]
+                + decision_index
+            ),
+            "hidden_taps": hidden_taps,
+        }
+
+    @torch.inference_mode()
+    def propose_dflash2(
+        self,
+        sequences: list[Sequence],
+        max_tokens: list[int],
+    ) -> list[Proposal]:
+        if self.dflash2_draft_model is None or self.dflash2_draft_cache is None:
+            raise RuntimeError("DFlash2 draft model is not loaded")
+        if len(sequences) != 1:
+            raise NotImplementedError("DFlash2 proposer currently supports B=1")
+        seq = sequences[0]
+        budget = min(
+            self.dflash2_draft_model.config.num_speculative_tokens,
+            max(0, max_tokens[0]),
+        )
+        if budget == 0:
+            return [Proposal(seq.seq_id, (), {"kind": "dflash2", "budget": 0})]
+        context = self._dflash2_contexts.get(seq.seq_id)
+        if context is None or context["request_id"] != seq.request_id:
+            raise RuntimeError(
+                "DFlash2 target hidden context is missing for this sequence"
+            )
+        device = next(self.dflash2_draft_model.parameters()).device
+        proposal_batch, debug = self.dflash2_draft_model.forward_block(
+            anchor_token_ids=torch.tensor(
+                [context["anchor_token_id"]],
+                dtype=torch.long,
+                device=device,
+            ),
+            anchor_positions=torch.tensor(
+                [context["anchor_position"]],
+                dtype=torch.long,
+                device=device,
+            ),
+            hidden_taps=context["hidden_taps"],
+            token_embedding=self.model.model.embed_tokens,
+            lm_head=self.model.lm_head,
+            return_debug=bool(self.config.get("dflash2_debug_metadata", False)),
+        )
+        valid_length = min(int(proposal_batch.valid_lengths[0].item()), budget)
+        token_ids = tuple(
+            int(value) for value in proposal_batch.token_ids[0, :valid_length].tolist()
+        )
+        metadata = {"kind": "dflash2", "block_parallel": True}
+        if self.config.get("dflash2_debug_metadata", False):
+            metadata.update(debug)
+        self.dflash2_draft_cache.advance(seq.request_id, valid_length)
+        return [Proposal(seq.seq_id, token_ids, metadata)]
 
     def verify(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
         """Greedy K+1 target decisions for each speculative request."""
@@ -748,6 +889,7 @@ class ModelRunner:
                 transaction=transaction,
                 capture_hidden_taps=bool(
                     self.config.get("capture_verification_hidden_taps", False)
+                    or self.dflash2_draft_model is not None
                 ),
             )
             if self.rank != 0:
@@ -762,6 +904,9 @@ class ModelRunner:
             self._pending_verified_cache_transactions[seq.seq_id] = (
                 transaction,
                 seq.request_id,
+                output,
+                tuple(token_ids),
+                int(transaction.original_states[seq.request_id].logical_length),
             )
             return [
                 VerificationResult(
@@ -788,7 +933,28 @@ class ModelRunner:
             entry = pending.pop(sequence_id, None)
             if entry is None:
                 continue
-            transaction, request_id = entry
+            if len(entry) == 5:
+                transaction, request_id, output, target_token_ids, start_position = entry
+                decision_index = max(0, accepted_length - 1)
+                if (
+                    getattr(self, "dflash2_draft_model", None) is not None
+                    and output.hidden_taps
+                    and decision_index < len(target_token_ids)
+                ):
+                    hidden_taps = {
+                        layer_id: value[:, decision_index : decision_index + 1, :].detach()
+                        for layer_id, value in output.hidden_taps.items()
+                    }
+                    if not hasattr(self, "_dflash2_contexts"):
+                        self._dflash2_contexts = {}
+                    self._dflash2_contexts[sequence_id] = {
+                        "request_id": request_id,
+                        "anchor_token_id": int(target_token_ids[decision_index]),
+                        "anchor_position": start_position + decision_index,
+                        "hidden_taps": hidden_taps,
+                    }
+            else:
+                transaction, request_id = entry
             self.hybrid_cache_manager.commit(
                 transaction,
                 {request_id: accepted_length},
@@ -802,7 +968,7 @@ class ModelRunner:
             entry = pending.pop(sequence_id, None)
             if entry is None:
                 continue
-            transaction, _request_id = entry
+            transaction = entry[0]
             if transaction.state.name == "ACTIVE":
                 self.hybrid_cache_manager.rollback(transaction)
 
@@ -811,6 +977,13 @@ class ModelRunner:
             return
         for request_id in request_ids:
             self.hybrid_cache_manager.release_request(request_id)
+            if self.dflash2_draft_cache is not None:
+                self.dflash2_draft_cache.release(request_id)
+        self._dflash2_contexts = {
+            seq_id: context
+            for seq_id, context in self._dflash2_contexts.items()
+            if context.get("request_id") not in set(request_ids)
+        }
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs

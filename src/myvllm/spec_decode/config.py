@@ -8,9 +8,10 @@ class SpeculativeConfig:
     num_speculative_tokens: int = 4
     ngram_min_size: int = 2
     ngram_max_size: int = 4
+    draft_model_name_or_path: str | None = None
 
     def __post_init__(self) -> None:
-        if self.proposer not in {"ngram", "mock"}:
+        if self.proposer not in {"ngram", "mock", "dflash2"}:
             raise ValueError(f"unsupported proposer: {self.proposer}")
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")

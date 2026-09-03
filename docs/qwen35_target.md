@@ -102,11 +102,14 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   the target `lm_head` supplies unary logits for candidate selection.
 - `DFlash2StandaloneProposer` only accepts a draft model advertising
   `supports_block_parallel=True` and calls `propose_block()` once per batch.
+- `SpeculativeConfig(proposer="dflash2")` wires a runner-bound proposer into
+  `LLMEngine`; `ModelRunner` owns draft loading, target hidden-context capture,
+  standalone proposal, and verifier-commit context refresh.
 
 This path is still not an end-to-end DFlash2 integration. The draft checkpoint
-can be audited and loaded, and standalone block proposal can be run, but Oracle
-proposal-ID alignment and verifier integration remain required before online or
-performance claims.
+can be audited and loaded, standalone block proposal can be run, and an offline
+B=1 engine smoke is available. Oracle proposal-ID alignment and online validation
+remain required before performance claims.
 
 ## GPU Validation
 

@@ -16,9 +16,11 @@ from myvllm.sampling_parameters import SamplingParams
 from myvllm.spec_decode import (
     MockProposer,
     NGramProposer,
+    Proposer,
     SpecDecodeCoordinator,
     SpeculativeConfig,
 )
+from myvllm.spec_decode.types import Proposal
 from transformers import AutoTokenizer
 
 
@@ -35,6 +37,21 @@ def worker_process(config, rank, event):
 
     model_runner = ModelRunner(config, rank, event)
     model_runner.loop()
+
+
+class RunnerDFlash2Proposer(Proposer):
+    supports_parallel = True
+
+    def __init__(self, model_runner):
+        self.model_runner = model_runner
+
+    def propose(self, sequence: Sequence, max_tokens: int) -> Proposal:
+        return self.propose_batch([sequence], [max_tokens])[0]
+
+    def propose_batch(
+        self, sequences: list[Sequence], max_tokens: list[int]
+    ) -> list[Proposal]:
+        return self.model_runner.call("propose_dflash2", sequences, max_tokens)
 
 
 class LLMEngine:
@@ -84,6 +101,8 @@ class LLMEngine:
                     self.speculative_config.ngram_min_size,
                     self.speculative_config.ngram_max_size,
                 )
+            elif self.speculative_config.proposer == "dflash2":
+                proposer = RunnerDFlash2Proposer(self.model_runner)
             else:
                 proposer = MockProposer()
             self.spec_decode_coordinator = SpecDecodeCoordinator(
