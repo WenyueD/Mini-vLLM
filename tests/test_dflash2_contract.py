@@ -71,6 +71,30 @@ def test_compare_fixture_infers_legacy_oracle_schema_v2():
     assert normalized["anchor_position"] == 1
 
 
+def test_compare_fixture_rejects_legacy_oracle_prompt_final_anchor():
+    legacy = {
+        "source": "oracle-vllm",
+        "prompt": "Hello",
+        "prompt_token_ids": [9419],
+        "anchor_token_id": 9419,
+        "anchor_token_mode": "minivllm",
+        "minivllm_anchor_token_id": 9419,
+        "anchor_position": 0,
+        "anchor_position_mode": "minivllm",
+        "minivllm_anchor_position": 0,
+        "target_layer_ids": [5, 19, 33, 47, 61],
+        "proposal_token_ids": [478, 0, 198],
+        "output_token_ids": [9419, 9419],
+    }
+
+    with pytest.raises(SystemExit, match="legacy_oracle_fixture_not_target_bonus"):
+        normalize_fixture_schema(
+            legacy,
+            label="oracle",
+            path="oracle.json",
+        )
+
+
 def test_dflash2_config_reads_real_nested_dflash_config():
     config = DFlash2Config.from_mapping(
         {

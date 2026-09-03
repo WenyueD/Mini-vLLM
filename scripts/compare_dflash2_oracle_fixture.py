@@ -54,6 +54,28 @@ def normalize_fixture_schema(
         and normalized.get("anchor_position_mode") == "minivllm"
     )
     if has_v2_shape and uses_minivllm_anchor:
+        prompt_token_ids = normalized.get("prompt_token_ids") or []
+        prompt_final_anchor = prompt_token_ids[-1] if prompt_token_ids else None
+        legacy_minivllm_anchor = normalized.get("minivllm_anchor_token_id")
+        if (
+            label == "oracle"
+            and legacy_minivllm_anchor is not None
+            and prompt_final_anchor is not None
+            and legacy_minivllm_anchor == prompt_final_anchor
+        ):
+            output_token_ids = normalized.get("output_token_ids")
+            raise SystemExit(
+                "dflash2_oracle_alignment=FAIL "
+                "legacy_oracle_fixture_not_target_bonus\n"
+                f"oracle_path={path}\n"
+                f"prompt_final_token_id={prompt_final_anchor}\n"
+                f"oracle_minivllm_anchor_token_id={legacy_minivllm_anchor}\n"
+                f"oracle_output_token_ids={output_token_ids}\n"
+                "Delete this Oracle fixture and regenerate it with the latest "
+                "export_oracle_dflash2_fixture.py. The latest exporter should "
+                "write fixture_schema_version=2 and should refuse to write a "
+                "fixture if Oracle DFlash is not target-lossless."
+            )
         if "minivllm_anchor_token_id" in normalized:
             previous = normalized.get("anchor_token_id")
             normalized["anchor_token_id"] = normalized["minivllm_anchor_token_id"]
