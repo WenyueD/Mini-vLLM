@@ -28,6 +28,42 @@ def load_json(path: str) -> dict[str, Any]:
     return value
 
 
+def normalize_fixture_schema(
+    fixture: dict[str, Any],
+    *,
+    label: str,
+    path: str,
+) -> dict[str, Any]:
+    normalized = dict(fixture)
+    if "fixture_schema_version" in normalized and "anchor_semantics" in normalized:
+        return normalized
+
+    has_v2_shape = all(
+        key in normalized
+        for key in (
+            "prompt",
+            "prompt_token_ids",
+            "anchor_token_id",
+            "anchor_position",
+            "target_layer_ids",
+            "proposal_token_ids",
+        )
+    )
+    uses_minivllm_anchor = (
+        normalized.get("anchor_token_mode") == "minivllm"
+        and normalized.get("anchor_position_mode") == "minivllm"
+    )
+    if has_v2_shape and uses_minivllm_anchor:
+        normalized.setdefault("fixture_schema_version", 2)
+        normalized.setdefault("anchor_semantics", "target_bonus_token")
+        print(
+            f"legacy_fixture_schema_inferred={label} path={path} "
+            "fixture_schema_version=2 anchor_semantics=target_bonus_token",
+            flush=True,
+        )
+    return normalized
+
+
 def get_required(fixture: dict[str, Any], key: str, *, label: str, path: str) -> Any:
     if key not in fixture:
         keys = ", ".join(sorted(fixture))
@@ -53,8 +89,16 @@ def optional_checksum_delta(
 
 def main() -> None:
     args = parse_args()
-    minivllm = load_json(args.minivllm)
-    oracle = load_json(args.oracle)
+    minivllm = normalize_fixture_schema(
+        load_json(args.minivllm),
+        label="minivllm",
+        path=args.minivllm,
+    )
+    oracle = normalize_fixture_schema(
+        load_json(args.oracle),
+        label="oracle",
+        path=args.oracle,
+    )
 
     required_equal_keys = [
         "fixture_schema_version",

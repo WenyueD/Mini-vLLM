@@ -19,6 +19,7 @@ from myvllm.spec_decode.dflash2 import (
     grouped_dynamic_conv,
     select_topk_candidates,
 )
+from scripts.compare_dflash2_oracle_fixture import normalize_fixture_schema
 
 
 def test_dflash2_config_contract_uses_zero_based_target_taps():
@@ -39,6 +40,29 @@ def test_dflash2_config_contract_uses_zero_based_target_taps():
     config.validate_contract()
     assert config.num_speculative_tokens == 7
     assert config.target_layer_ids == DRAFT_TARGET_TAP_LAYERS
+
+
+def test_compare_fixture_infers_legacy_oracle_schema_v2():
+    legacy = {
+        "source": "oracle-vllm",
+        "prompt": "Hello",
+        "prompt_token_ids": [9419],
+        "anchor_token_id": 11,
+        "anchor_token_mode": "minivllm",
+        "anchor_position": 1,
+        "anchor_position_mode": "minivllm",
+        "target_layer_ids": [5, 19, 33, 47, 61],
+        "proposal_token_ids": [478, 0, 198],
+    }
+
+    normalized = normalize_fixture_schema(
+        legacy,
+        label="oracle",
+        path="oracle.json",
+    )
+
+    assert normalized["fixture_schema_version"] == 2
+    assert normalized["anchor_semantics"] == "target_bonus_token"
 
 
 def test_dflash2_config_reads_real_nested_dflash_config():
