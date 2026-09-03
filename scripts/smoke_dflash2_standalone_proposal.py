@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -52,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
     parser.add_argument("--safe-open-device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--prompt", default="Hello")
+    parser.add_argument(
+        "--json-output",
+        default=None,
+        help="Optional path to write a proposal fixture for Oracle alignment.",
+    )
     return parser.parse_args()
 
 
@@ -183,12 +189,35 @@ def main() -> None:
 
     valid_length = int(proposal_batch.valid_lengths[0].item())
     proposed = proposal_batch.token_ids[0, :valid_length].tolist()
+    debug_json = {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in debug.items()
+    }
+    fixture = {
+        "source": "minivllm",
+        "prompt": args.prompt,
+        "prompt_token_ids": token_ids,
+        "anchor_token_id": int(token_ids[-1]),
+        "anchor_position": len(token_ids) - 1,
+        "target_layer_ids": list(draft.config.target_layer_ids),
+        "proposal_valid_length": valid_length,
+        "proposal_token_ids": proposed,
+        **debug_json,
+    }
     print(f"prompt_token_ids={token_ids}", flush=True)
     print(f"hidden_tap_keys={sorted(hidden_taps)}", flush=True)
     print(f"proposal_valid_lengths={proposal_batch.valid_lengths.tolist()}", flush=True)
     print(f"proposal_token_ids={proposed}", flush=True)
     for key, value in debug.items():
         print(f"{key}={value}", flush=True)
+    if args.json_output:
+        output_path = Path(args.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(fixture, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"json_output={output_path}", flush=True)
     print_cuda_memory("after_proposal", device)
     print("dflash2_standalone_proposal=PASS", flush=True)
     print("dflash2_oracle_alignment=PENDING", flush=True)

@@ -207,6 +207,63 @@ The pass marker is `dflash2_online_b1=PASS`.  Keep
 `dflash2_oracle_alignment=PENDING` until proposal IDs are compared against the
 Oracle path.
 
+## DFlash2 Oracle Proposal Alignment
+
+Run this after `dflash2_online_b1=PASS`.  First export the Mini-vLLM fixture
+from the exact same prompt and checkpoints:
+
+```bash
+mkdir -p results/qwen38_target/oracle_alignment
+
+python scripts/smoke_dflash2_standalone_proposal.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --json-output results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
+```
+
+Export the Oracle implementation's proposal for the same prompt into:
+
+```text
+results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json
+```
+
+The Oracle JSON must include these keys:
+
+```json
+{
+  "prompt": "Hello",
+  "prompt_token_ids": [],
+  "anchor_token_id": 0,
+  "anchor_position": 0,
+  "target_layer_ids": [5, 19, 33, 47, 61],
+  "proposal_token_ids": [],
+  "context_checksum": 0.0,
+  "proposal_hidden_checksum": 0.0
+}
+```
+
+`context_checksum` and `proposal_hidden_checksum` are optional but useful.  If
+they are present in both files, the comparator checks them with a small bf16
+tolerance; otherwise it compares only the exact structural fields and proposal
+token IDs.
+
+Then compare:
+
+```bash
+python scripts/compare_dflash2_oracle_fixture.py \
+  --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --checksum-atol 0.5 \
+  | tee results/qwen38_target/oracle_alignment/dflash2_oracle_alignment_hello.txt
+```
+
+The pass marker is `dflash2_oracle_alignment=PASS`.
+
 ## Test Commands
 
 ```bash

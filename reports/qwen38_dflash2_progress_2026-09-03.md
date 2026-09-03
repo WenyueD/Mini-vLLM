@@ -18,7 +18,7 @@ The user also reported:
 - `dflash2_load_only=PASS`
 - `dflash2_standalone_proposal=PASS`
 - `qwen38_dflash2_engine_b1=PASS`
-- `dflash2_online_b1=PENDING`
+- `dflash2_online_b1=PASS`
 - `dflash2_oracle_alignment=PENDING`
 
 ## DFlash2 Checkpoint Audit Input
@@ -61,6 +61,7 @@ The real DFlash2 checkpoint audit shows:
   - `scripts/smoke_dflash2_standalone_proposal.py`
   - `scripts/smoke_qwen38_dflash2_engine_b1.py`
   - `scripts/smoke_qwen38_dflash2_online_b1.py`
+  - `scripts/compare_dflash2_oracle_fixture.py`
 - Added tests for nested config, expected shapes, header-only audit, selector
   top-k, and guarded block-parallel proposer behavior.
 
@@ -101,9 +102,9 @@ Result: PASS.
 | P2 cache transaction | PASS local | Hybrid transaction/coordinator/Qwen cached verifier tests. |
 | P3 hidden taps | PASS local | Zero-based taps and logits-invariance tests. |
 | P4 DFlash2 standalone | PASS/PENDING align | Real config + 81-key checkpoint audit/load-only PASS; remote standalone proposal PASS; Oracle proposal-ID alignment still PENDING. |
-| P5 B=1 end-to-end | PARTIAL | Offline engine B=1 PASS remote/user-reported; online B=1 smoke script added locally and remains PENDING. |
+| P5 B=1 end-to-end | PASS B=1 | Offline engine B=1 and online B=1 PASS remote/user-reported. |
 | P6 batch | PENDING | Real DFlash2 batch not implemented. |
-| P7 performance | PENDING | Correctness stage not complete. |
+| P7 performance | PENDING | Oracle alignment and batch validation are not complete. |
 
 ## Next Remote Commands
 
@@ -216,4 +217,28 @@ python scripts/smoke_dflash2_load_only.py \
   --dtype bfloat16 \
   --safe-open-device cpu \
   | tee results/qwen38_target/dflash2_load_only_cpu_staging.txt
+```
+
+After online B=1 passes, export a Mini-vLLM proposal fixture and compare it with
+an Oracle fixture containing the same prompt, anchor, tap IDs, and proposal
+token IDs:
+
+```bash
+mkdir -p results/qwen38_target/oracle_alignment
+
+python scripts/smoke_dflash2_standalone_proposal.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --prompt "Hello" \
+  --json-output results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
+
+python scripts/compare_dflash2_oracle_fixture.py \
+  --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --checksum-atol 0.5 \
+  | tee results/qwen38_target/oracle_alignment/dflash2_oracle_alignment_hello.txt
 ```
