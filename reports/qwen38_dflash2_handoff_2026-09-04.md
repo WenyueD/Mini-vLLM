@@ -22,7 +22,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
-| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. Do not force top-level anchor fields to make the comparator pass. |
+| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported an Oracle exporter failure where DFlash output repeated prompt token `9419` and capture anchors were all `0`; this indicates output/capture mapping trouble. Do not force top-level anchor fields to make the comparator pass. |
 | Mini vs Oracle one-step proposal alignment | PENDING | Needs same prompt/tokenized input, same target bonus anchor token and position, same hidden taps, same checkpoint, and tie-aware proposal comparison. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
@@ -40,6 +40,11 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 - Wrapped `DFlash2StandaloneProposer` and `ModelRunner.propose_dflash2()` so proposal failures roll back draft-cache state.
 - Updated `ModelRunner.commit_verified_cache()` to clear the DFlash2 proposal snapshot after accepted target-hidden history is stored.
 - Updated `ModelRunner.rollback_verified_cache()` to roll back active DFlash2 proposal snapshots while staying compatible with `ModelRunner.__new__` tests that do not initialize DFlash2 fields.
+- Hardened `scripts/export_oracle_dflash2_fixture.py` after an Oracle diagnostic failure:
+  - binds `DFlashSpeculator.propose()` arguments by inspected signature before falling back to positional indices;
+  - captures active request-state indices from the vLLM input batch when available;
+  - uses the single-prompt row for this exporter instead of trusting an anomalous inferred `num_reqs=7`;
+  - writes input-batch mapping diagnostics into the capture.
 
 ## Commands Run Locally
 
@@ -52,6 +57,7 @@ rg -n "DFlash2|dflash|draft|proposal|hidden_tap|spec" src tests scripts reports 
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .\.pytest-tmp tests\test_dflash2_contract.py tests\test_spec_coordinator.py tests\test_engine_spec_integration.py tests\test_hybrid_cache_transactions.py
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .\.pytest-tmp
 .\.venv\Scripts\python.exe -m compileall -q src scripts tests
+.\.venv\Scripts\python.exe -m compileall -q scripts\export_oracle_dflash2_fixture.py
 ```
 
 Results:
@@ -61,6 +67,7 @@ Results:
 - Related spec/cache/engine tests: `37 passed`.
 - Full local regression: `101 passed, 2 skipped`.
 - Compileall: PASS.
+- Exporter compile check after Oracle diagnostic hardening: PASS.
 
 ## Remote User-Reported Results
 
@@ -104,6 +111,24 @@ Interpretation:
 - Offline and online B=1 both report the same proposed/accepted counts for this 32-token run.
 - Oracle proposal alignment remains pending.
 
+Reported by the user after the first Oracle exporter attempt:
+
+```text
+dflash2_standalone_proposal=PASS
+dflash2_oracle_alignment=PENDING
+Oracle DFlash generation is not target-lossless for this prompt:
+target_first=11 dflash_first=9419 target_tokens=[11]
+dflash_tokens=[9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419]
+capture anchor_token_id=0 for all displayed captures
+first displayed capture inferred multiple rows from a single-prompt run
+```
+
+Interpretation:
+
+- `9419` is the `"Hello"` prompt token in this setup, so the Oracle fixture output path is still producing or reading prompt-token repetition.
+- `anchor_token_id=0` across captures is not credible target-bonus-token state and points to capture mapping trouble.
+- The exporter has been hardened after this report; rerun it before drawing any Mini/Oracle proposal conclusion.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
@@ -134,7 +159,7 @@ python scripts/smoke_dflash2_standalone_proposal.py \
   | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Then run the Oracle exporter in the official vLLM/Oracle environment:
+Then run the Oracle exporter in the official vLLM/Oracle environment. Keep `--dump-speculator-debug` for this rerun so the capture mapping can be audited:
 
 ```bash
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
@@ -157,7 +182,33 @@ python scripts/export_oracle_dflash2_fixture.py \
   --anchor-position-mode minivllm \
   --trust-remote-code \
   --enforce-eager \
+  --dump-speculator-debug \
   | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
+```
+
+If it still reports non-lossless output, save a diagnostic fixture rather than comparing it:
+
+```bash
+python scripts/export_oracle_dflash2_fixture.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.json \
+  --prompt "Hello" \
+  --max-tokens 16 \
+  --num-speculative-tokens 7 \
+  --method dflash \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 256 \
+  --expected-target-first-token-id 11 \
+  --skip-target-preflight \
+  --anchor-token-mode minivllm \
+  --anchor-position-mode minivllm \
+  --trust-remote-code \
+  --enforce-eager \
+  --dump-speculator-debug \
+  --allow-non-lossless-fixture \
+  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.txt
 ```
 
 Compare fixtures:

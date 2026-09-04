@@ -208,7 +208,101 @@ def as_int(value: Any) -> int:
     return int(value)
 
 
-def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
+def bound_propose_arguments(signature, owner, args, kwargs) -> dict[str, Any]:
+    try:
+        return dict(signature.bind_partial(owner, *args, **kwargs).arguments)
+    except TypeError:
+        return {}
+
+
+def argument_value(
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    name: str,
+    fallback_index: int,
+) -> Any:
+    if name in bound:
+        return bound[name]
+    if name in kwargs:
+        return kwargs[name]
+    if len(args) > fallback_index:
+        return args[fallback_index]
+    return None
+
+
+def safe_len(value: Any) -> int | None:
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def tensor_rows_to_list(
+    value: Any,
+    rows: int,
+    *,
+    indices: Any | None = None,
+) -> Any:
+    if value is None:
+        return None
+    try:
+        if indices is not None:
+            return tensor_to_list(value[indices[:rows]])
+    except Exception:
+        pass
+    try:
+        return tensor_to_list(value[:rows])
+    except Exception:
+        return tensor_to_list(value)
+
+
+def input_batch_active_indices(input_batch: Any, rows: int) -> Any | None:
+    for name in (
+        "req_indices",
+        "request_indices",
+        "req_state_indices",
+        "request_state_indices",
+        "idx_mapping",
+    ):
+        value = getattr(input_batch, name, None)
+        if value is None:
+            continue
+        try:
+            return value[:rows]
+        except Exception:
+            return value
+    return None
+
+
+def summarize_input_batch(input_batch: Any, rows: int) -> dict[str, Any]:
+    if input_batch is None:
+        return {}
+    summary: dict[str, Any] = {}
+    for name in (
+        "num_reqs",
+        "req_ids",
+        "req_indices",
+        "request_indices",
+        "req_state_indices",
+        "request_state_indices",
+        "idx_mapping",
+        "num_tokens",
+    ):
+        if hasattr(input_batch, name):
+            value = getattr(input_batch, name)
+            if hasattr(value, "detach") or hasattr(value, "__getitem__"):
+                summary[name] = tensor_rows_to_list(value, rows)
+            else:
+                summary[name] = summarize_value(value)
+    return summary
+
+
+def install_dflash_capture_hook(
+    *,
+    dump_speculator_debug: bool = False,
+    expected_num_prompts: int = 1,
+) -> None:
     try:
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
@@ -220,6 +314,7 @@ def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
         ) from exc
 
     original_propose = DFlashSpeculator.propose
+    propose_signature = inspect.signature(original_propose)
     if dump_speculator_debug:
         print(
             f"oracle_speculator_class={DFlashSpeculator.__module__}."
@@ -231,33 +326,50 @@ def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
             flush=True,
         )
         print(
-            f"oracle_speculator_propose_signature={inspect.signature(original_propose)}",
+            f"oracle_speculator_propose_signature={propose_signature}",
             flush=True,
         )
 
     def wrapped_propose(self, *args, **kwargs):
         global SPECULATOR_DEBUG_PRINTED
+        bound = bound_propose_arguments(propose_signature, self, args, kwargs)
         result = original_propose(self, *args, **kwargs)
-        dummy_run = bool(kwargs.get("dummy_run", False))
-        if len(args) >= 12:
-            dummy_run = bool(args[11])
+        dummy_run = bool(argument_value(bound, args, kwargs, "dummy_run", 11))
         if dummy_run:
             return result
 
-        input_batch = args[0] if len(args) > 0 else kwargs.get("input_batch")
-        num_sampled = args[5] if len(args) > 5 else kwargs.get("num_sampled")
-        num_rejected = args[6] if len(args) > 6 else kwargs.get("num_rejected")
-        last_sampled = args[7] if len(args) > 7 else kwargs.get("last_sampled")
-        next_prefill_tokens = (
-            args[8] if len(args) > 8 else kwargs.get("next_prefill_tokens")
+        input_batch = argument_value(bound, args, kwargs, "input_batch", 0)
+        num_sampled = argument_value(bound, args, kwargs, "num_sampled", 5)
+        num_rejected = argument_value(bound, args, kwargs, "num_rejected", 6)
+        last_sampled = argument_value(bound, args, kwargs, "last_sampled", 7)
+        next_prefill_tokens = argument_value(
+            bound,
+            args,
+            kwargs,
+            "next_prefill_tokens",
+            8,
         )
 
-        num_reqs = int(getattr(input_batch, "num_reqs", 1) or 1)
-        proposal_rows = tensor_to_list(result[:num_reqs])
-        num_sampled_rows = tensor_to_list(num_sampled[:num_reqs])
-        num_rejected_rows = tensor_to_list(num_rejected[:num_reqs])
-        last_sampled_rows = tensor_to_list(last_sampled[:num_reqs])
-        next_prefill_rows = tensor_to_list(next_prefill_tokens[:num_reqs])
+        inferred_num_reqs = int(getattr(input_batch, "num_reqs", 1) or 1)
+        rows = min(expected_num_prompts, inferred_num_reqs)
+        result_len = safe_len(result)
+        if result_len is not None:
+            rows = min(rows, result_len)
+        rows = max(rows, 1)
+        active_indices = input_batch_active_indices(input_batch, rows)
+        proposal_rows = tensor_rows_to_list(result, rows)
+        num_sampled_rows = tensor_rows_to_list(num_sampled, rows)
+        num_rejected_rows = tensor_rows_to_list(num_rejected, rows)
+        last_sampled_rows = tensor_rows_to_list(
+            last_sampled,
+            rows,
+            indices=active_indices,
+        )
+        next_prefill_rows = tensor_rows_to_list(
+            next_prefill_tokens,
+            rows,
+            indices=active_indices,
+        )
         sample_pos = tensor_to_list(getattr(self, "sample_pos", [])[: self.num_speculative_steps])
         sample_indices = tensor_to_list(
             getattr(self, "sample_indices", [])[: self.num_speculative_steps]
@@ -272,7 +384,12 @@ def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
         CAPTURES.append(
             {
                 "proposal_rows": proposal_rows,
-                "num_reqs": num_reqs,
+                "num_reqs": rows,
+                "inferred_num_reqs": inferred_num_reqs,
+                "active_request_indices": tensor_to_list(active_indices)
+                if active_indices is not None
+                else None,
+                "input_batch_summary": summarize_input_batch(input_batch, rows),
                 "num_sampled": num_sampled_rows,
                 "num_rejected": num_rejected_rows,
                 "last_sampled": last_sampled_rows,
@@ -286,22 +403,22 @@ def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
                 "candidate_token_ids": tensor_attr_to_list(
                     self,
                     "_cached_candidate_ids",
-                    num_reqs,
+                    rows,
                 ),
                 "selector_selected_indices": tensor_attr_to_list(
                     self,
                     "_cached_sample_indices",
-                    num_reqs,
+                    rows,
                 ),
                 "selector_realized_scores": tensor_attr_to_list(
                     self,
                     "_selector_scores",
-                    num_reqs,
+                    rows,
                 ),
                 "draft_token_ids": tensor_attr_to_list(
                     self,
                     "draft_tokens",
-                    num_reqs,
+                    rows,
                 ),
             }
         )
