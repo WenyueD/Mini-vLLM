@@ -376,9 +376,15 @@ def install_dflash_capture_hook(
             if sampled_count > 0
             else as_int(next_prefill_rows)
         )
+        proposal_first_token_id = None
+        try:
+            proposal_first_token_id = int(proposal_rows[0][0])
+        except Exception:
+            pass
         CAPTURES.append(
             {
                 "proposal_rows": proposal_rows,
+                "proposal_first_token_id": proposal_first_token_id,
                 "num_reqs": rows,
                 "inferred_num_reqs": inferred_num_reqs,
                 "active_request_indices": tensor_to_list(active_indices)
@@ -442,6 +448,48 @@ def first_output_token_ids(output: Any) -> list[int]:
     if token_ids is not None:
         return [int(value) for value in token_ids]
     return []
+
+
+def summarize_generation_output(output: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "type": type(output).__name__,
+        "repr": repr(output)[:2000],
+    }
+    for name in (
+        "prompt",
+        "prompt_token_ids",
+        "encoder_prompt",
+        "encoder_prompt_token_ids",
+        "request_id",
+        "finished",
+        "metrics",
+    ):
+        if hasattr(output, name):
+            summary[name] = summarize_value(getattr(output, name))
+    completions = getattr(output, "outputs", None)
+    if completions is not None:
+        summary["outputs_type"] = type(completions).__name__
+        summary["outputs_len"] = safe_len(completions)
+        items = []
+        for completion in list(completions)[:2]:
+            item: dict[str, Any] = {"type": type(completion).__name__}
+            for name in (
+                "index",
+                "text",
+                "token_ids",
+                "cumulative_logprob",
+                "logprobs",
+                "finish_reason",
+                "stop_reason",
+            ):
+                if hasattr(completion, name):
+                    item[name] = summarize_value(getattr(completion, name))
+            items.append(item)
+        summary["outputs_items"] = items
+    for name in ("token_ids", "text", "tokens"):
+        if hasattr(output, name):
+            summary[name] = summarize_value(getattr(output, name))
+    return summary
 
 
 def completion_token_ids(raw_token_ids: list[int], prompt_token_ids: list[int]) -> list[int]:
@@ -560,6 +608,9 @@ def main() -> None:
     proposal_token_ids = [int(value) for value in proposal_rows[0]]
     raw_output_token_ids = first_output_token_ids(outputs[0]) if outputs else []
     output_token_ids = completion_token_ids(raw_output_token_ids, prompt_token_ids)
+    dflash_output_summary = (
+        summarize_generation_output(outputs[0]) if outputs else {}
+    )
     if not output_token_ids:
         raise SystemExit("Oracle generation produced no output tokens")
     oracle_target_lossless = not target_only_token_ids or (
@@ -571,7 +622,12 @@ def main() -> None:
                 "index": index,
                 "num_sampled": candidate.get("num_sampled"),
                 "anchor_token_id": candidate.get("anchor_token_id"),
+                "last_sampled": candidate.get("last_sampled"),
+                "next_prefill_tokens": candidate.get("next_prefill_tokens"),
                 "proposal_rows": candidate.get("proposal_rows"),
+                "proposal_first_token_id": candidate.get("proposal_first_token_id"),
+                "active_request_indices": candidate.get("active_request_indices"),
+                "input_batch_summary": candidate.get("input_batch_summary"),
                 "candidate_token_ids_present": candidate.get("candidate_token_ids")
                 is not None,
                 "selector_selected_indices_present": candidate.get(
@@ -587,6 +643,7 @@ def main() -> None:
             f"dflash_first={output_token_ids[0]} "
             f"target_tokens={target_only_token_ids} "
             f"dflash_tokens={output_token_ids} "
+            f"dflash_output_summary={dflash_output_summary} "
             f"captures={summary}. "
             "Retry with --method dflash2 if supported, or align a prompt/config "
             "where Oracle target-only and Oracle DFlash outputs match first. "
@@ -639,6 +696,7 @@ def main() -> None:
         "oracle_target_only_token_ids": target_only_token_ids,
         "raw_output_token_ids": raw_output_token_ids,
         "output_token_ids": output_token_ids,
+        "dflash_output_summary": dflash_output_summary,
         "capture": capture,
     }
     if capture.get("candidate_token_ids") is not None:
@@ -662,6 +720,11 @@ def main() -> None:
     print(f"capture_num_sampled={capture['num_sampled']}", flush=True)
     print(f"raw_output_token_ids={raw_output_token_ids}", flush=True)
     print(f"output_token_ids={output_token_ids}", flush=True)
+    print(
+        "dflash_output_summary="
+        + json.dumps(dflash_output_summary, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
     print(f"anchor_token_id={fixture['anchor_token_id']}", flush=True)
     print(f"oracle_capture_anchor_token_id={oracle_anchor_token_id}", flush=True)
     print(f"anchor_position={fixture['anchor_position']}", flush=True)
