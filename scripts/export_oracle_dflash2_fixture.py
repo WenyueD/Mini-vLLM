@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 
 CAPTURES: list[dict[str, Any]] = []
+SPECULATOR_DEBUG_PRINTED = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +74,14 @@ def parse_args() -> argparse.Namespace:
             "Write the diagnostic fixture even when Oracle speculative generation "
             "does not start with the expected target token. Such a fixture is for "
             "debug only and must not be treated as a passing Oracle alignment."
+        ),
+    )
+    parser.add_argument(
+        "--dump-speculator-debug",
+        action="store_true",
+        help=(
+            "Print a compact DFlashSpeculator runtime attribute summary so "
+            "version-specific Oracle capture fields can be mapped."
         ),
     )
     parser.add_argument(
@@ -141,6 +151,55 @@ def tensor_attr_to_list(owner: Any, name: str, rows: int | None = None) -> Any:
     return tensor_to_list(value)
 
 
+def summarize_value(value: Any) -> Any:
+    if hasattr(value, "detach"):
+        tensor = value.detach()
+        summary: dict[str, Any] = {
+            "type": type(value).__name__,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+        }
+        if tensor.numel() <= 32:
+            summary["value"] = tensor.cpu().tolist()
+        return summary
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "items": [summarize_value(item) for item in list(value)[:4]],
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "len": len(value),
+            "keys": [str(key) for key in list(value)[:16]],
+        }
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    return {"type": type(value).__name__}
+
+
+def summarize_speculator_attrs(owner: Any) -> dict[str, Any]:
+    interesting = (
+        "candidate",
+        "draft",
+        "hidden",
+        "index",
+        "indices",
+        "logit",
+        "proposal",
+        "sample",
+        "score",
+        "token",
+    )
+    summary: dict[str, Any] = {}
+    for name, value in sorted(vars(owner).items()):
+        if any(part in name.lower() for part in interesting):
+            summary[name] = summarize_value(value)
+    return summary
+
+
 def as_int(value: Any) -> int:
     if isinstance(value, list):
         if not value:
@@ -149,7 +208,7 @@ def as_int(value: Any) -> int:
     return int(value)
 
 
-def install_dflash_capture_hook() -> None:
+def install_dflash_capture_hook(*, dump_speculator_debug: bool = False) -> None:
     try:
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
@@ -161,8 +220,23 @@ def install_dflash_capture_hook() -> None:
         ) from exc
 
     original_propose = DFlashSpeculator.propose
+    if dump_speculator_debug:
+        print(
+            f"oracle_speculator_class={DFlashSpeculator.__module__}."
+            f"{DFlashSpeculator.__name__}",
+            flush=True,
+        )
+        print(
+            f"oracle_speculator_file={inspect.getsourcefile(DFlashSpeculator)}",
+            flush=True,
+        )
+        print(
+            f"oracle_speculator_propose_signature={inspect.signature(original_propose)}",
+            flush=True,
+        )
 
     def wrapped_propose(self, *args, **kwargs):
+        global SPECULATOR_DEBUG_PRINTED
         result = original_propose(self, *args, **kwargs)
         dummy_run = bool(kwargs.get("dummy_run", False))
         if len(args) >= 12:
@@ -231,6 +305,15 @@ def install_dflash_capture_hook() -> None:
                 ),
             }
         )
+        if dump_speculator_debug and not SPECULATOR_DEBUG_PRINTED:
+            SPECULATOR_DEBUG_PRINTED = True
+            attr_summary = summarize_speculator_attrs(self)
+            CAPTURES[-1]["speculator_attr_summary"] = attr_summary
+            print(
+                "oracle_speculator_attr_summary="
+                + json.dumps(attr_summary, ensure_ascii=False, sort_keys=True),
+                flush=True,
+            )
         return result
 
     DFlashSpeculator.propose = wrapped_propose
@@ -321,7 +404,7 @@ def main() -> None:
         print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
         release_llm(target_llm)
 
-    install_dflash_capture_hook()
+    install_dflash_capture_hook(dump_speculator_debug=args.dump_speculator_debug)
 
     llm = LLM(**build_llm_kwargs(args, speculative=True))
     outputs = llm.generate([args.prompt], sampling_params)
