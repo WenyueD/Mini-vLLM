@@ -843,31 +843,37 @@ class ModelRunner:
                 "DFlash2 target hidden context is missing for this sequence"
             )
         device = next(self.dflash2_draft_model.parameters()).device
-        proposal_batch, debug = self.dflash2_draft_model.forward_block(
-            anchor_token_ids=torch.tensor(
-                [context["anchor_token_id"]],
-                dtype=torch.long,
-                device=device,
-            ),
-            anchor_positions=torch.tensor(
-                [context["anchor_position"]],
-                dtype=torch.long,
-                device=device,
-            ),
-            hidden_taps=context["hidden_taps"],
-            token_embedding=self.model.model.embed_tokens,
-            lm_head=self.model.lm_head,
-            return_debug=bool(self.config.get("dflash2_debug_metadata", False)),
-        )
-        valid_length = min(int(proposal_batch.valid_lengths[0].item()), budget)
-        token_ids = tuple(
-            int(value) for value in proposal_batch.token_ids[0, :valid_length].tolist()
-        )
-        metadata = {"kind": "dflash2", "block_parallel": True}
-        if self.config.get("dflash2_debug_metadata", False):
-            metadata.update(debug)
-        self.dflash2_draft_cache.advance(seq.request_id, valid_length)
-        return [Proposal(seq.seq_id, token_ids, metadata)]
+        self.dflash2_draft_cache.begin_proposal(seq.request_id)
+        try:
+            proposal_batch, debug = self.dflash2_draft_model.forward_block(
+                anchor_token_ids=torch.tensor(
+                    [context["anchor_token_id"]],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                anchor_positions=torch.tensor(
+                    [context["anchor_position"]],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                hidden_taps=context["hidden_taps"],
+                token_embedding=self.model.model.embed_tokens,
+                lm_head=self.model.lm_head,
+                return_debug=bool(self.config.get("dflash2_debug_metadata", False)),
+            )
+            valid_length = min(int(proposal_batch.valid_lengths[0].item()), budget)
+            token_ids = tuple(
+                int(value)
+                for value in proposal_batch.token_ids[0, :valid_length].tolist()
+            )
+            metadata = {"kind": "dflash2", "block_parallel": True}
+            if self.config.get("dflash2_debug_metadata", False):
+                metadata.update(debug)
+            self.dflash2_draft_cache.advance(seq.request_id, valid_length)
+            return [Proposal(seq.seq_id, token_ids, metadata)]
+        except Exception:
+            self.dflash2_draft_cache.rollback_proposal(seq.request_id)
+            raise
 
     def verify(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
         """Greedy K+1 target decisions for each speculative request."""
@@ -1003,6 +1009,7 @@ class ModelRunner:
                             int(target_token_ids[decision_index]),
                             start_position + decision_index + 1,
                         )
+                        self.dflash2_draft_cache.commit_proposal(request_id)
             else:
                 transaction, request_id = entry
             self.hybrid_cache_manager.commit(
@@ -1017,10 +1024,17 @@ class ModelRunner:
         for sequence_id in sequence_ids:
             entry = pending.pop(sequence_id, None)
             if entry is None:
+                context = getattr(self, "_dflash2_contexts", {}).get(sequence_id)
+                draft_cache = getattr(self, "dflash2_draft_cache", None)
+                if context is not None and draft_cache is not None:
+                    draft_cache.rollback_proposal(context["request_id"])
                 continue
             transaction = entry[0]
             if transaction.state.name == "ACTIVE":
                 self.hybrid_cache_manager.rollback(transaction)
+            draft_cache = getattr(self, "dflash2_draft_cache", None)
+            if draft_cache is not None:
+                draft_cache.rollback_proposal(entry[1])
 
     def release_hybrid_requests(self, request_ids: list[str]) -> None:
         if self.hybrid_cache_manager is None:

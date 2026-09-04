@@ -1042,11 +1042,21 @@ def select_topk_candidates(scores: torch.Tensor, top_k: int) -> CandidateSelecti
 class DFlash2DraftCache:
     sliding_window: int
     lengths_by_request: dict[str, int] = field(default_factory=dict)
+    _proposal_length_snapshots_by_request: dict[str, int | None] = field(
+        default_factory=dict
+    )
     hidden_taps_by_request: dict[str, dict[int, torch.Tensor]] = field(
         default_factory=dict
     )
     anchor_token_ids_by_request: dict[str, int] = field(default_factory=dict)
     anchor_positions_by_request: dict[str, int] = field(default_factory=dict)
+
+    def begin_proposal(self, request_id: str) -> None:
+        if request_id in self._proposal_length_snapshots_by_request:
+            raise RuntimeError(f"DFlash2 proposal already active: {request_id}")
+        self._proposal_length_snapshots_by_request[request_id] = (
+            self.lengths_by_request.get(request_id)
+        )
 
     def advance(self, request_id: str, tokens: int) -> None:
         if tokens < 0:
@@ -1064,20 +1074,41 @@ class DFlash2DraftCache:
         anchor_token_id: int,
         anchor_position: int,
     ) -> None:
+        if not hidden_taps:
+            raise ValueError("DFlash2 target context must include hidden taps")
+        context_lengths = {int(value.shape[1]) for value in hidden_taps.values()}
+        if len(context_lengths) != 1:
+            raise ValueError("DFlash2 hidden taps must share context length")
+        context_length = min(next(iter(context_lengths)), self.sliding_window)
         self.hidden_taps_by_request[request_id] = {
             layer_id: value[:, -min(value.shape[1], self.sliding_window) :, :].detach()
             for layer_id, value in hidden_taps.items()
         }
+        self.lengths_by_request[request_id] = context_length
         self.anchor_token_ids_by_request[request_id] = int(anchor_token_id)
         self.anchor_positions_by_request[request_id] = int(anchor_position)
+
+    def commit_proposal(self, request_id: str) -> None:
+        self._proposal_length_snapshots_by_request.pop(request_id, None)
+
+    def rollback_proposal(self, request_id: str) -> None:
+        if request_id not in self._proposal_length_snapshots_by_request:
+            return
+        snapshot = self._proposal_length_snapshots_by_request.pop(request_id)
+        if snapshot is None:
+            self.lengths_by_request.pop(request_id, None)
+        else:
+            self.lengths_by_request[request_id] = snapshot
 
     def rollback(self, request_id: str, length: int) -> None:
         if length < 0:
             raise ValueError("draft cache length cannot be negative")
+        self._proposal_length_snapshots_by_request.pop(request_id, None)
         self.lengths_by_request[request_id] = min(length, self.sliding_window)
 
     def release(self, request_id: str) -> None:
         self.lengths_by_request.pop(request_id, None)
+        self._proposal_length_snapshots_by_request.pop(request_id, None)
         self.hidden_taps_by_request.pop(request_id, None)
         self.anchor_token_ids_by_request.pop(request_id, None)
         self.anchor_positions_by_request.pop(request_id, None)
@@ -1143,21 +1174,35 @@ class DFlash2StandaloneProposer(Proposer):
             for value in max_tokens
         ]
         if self.target_context_provider is None:
-            batch = self.draft_model.propose_block(
-                sequences,
-                bounded,
-                self.draft_cache,
-            )
+            try:
+                for seq in sequences:
+                    self.draft_cache.begin_proposal(seq.request_id)
+                batch = self.draft_model.propose_block(
+                    sequences,
+                    bounded,
+                    self.draft_cache,
+                )
+            except Exception:
+                for seq in sequences:
+                    self.draft_cache.rollback_proposal(seq.request_id)
+                raise
         else:
-            context = self.target_context_provider(sequences)
-            batch, debug = self.draft_model.forward_block(
-                context.anchor_token_ids,
-                context.anchor_positions,
-                context.hidden_taps,
-                context.token_embedding,
-                context.lm_head,
-                return_debug=self.include_debug_metadata,
-            )
+            try:
+                for seq in sequences:
+                    self.draft_cache.begin_proposal(seq.request_id)
+                context = self.target_context_provider(sequences)
+                batch, debug = self.draft_model.forward_block(
+                    context.anchor_token_ids,
+                    context.anchor_positions,
+                    context.hidden_taps,
+                    context.token_embedding,
+                    context.lm_head,
+                    return_debug=self.include_debug_metadata,
+                )
+            except Exception:
+                for seq in sequences:
+                    self.draft_cache.rollback_proposal(seq.request_id)
+                raise
             if self.include_debug_metadata:
                 batch.metadata.update(debug)
         if batch.token_ids.shape[0] != len(sequences):
@@ -1175,4 +1220,5 @@ class DFlash2StandaloneProposer(Proposer):
             metadata["block_parallel"] = True
             proposals.append(Proposal(seq.seq_id, tokens, metadata))
             self.draft_cache.advance(seq.request_id, valid_length)
+            self.draft_cache.commit_proposal(seq.request_id)
         return proposals

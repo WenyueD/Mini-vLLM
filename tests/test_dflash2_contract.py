@@ -262,7 +262,33 @@ def test_dflash2_dynamic_conv_base_kernel_axis_selects_prepare_and_finish():
     assert finished.tolist() == (hidden * 2.0).tolist()
 
 
-def test_dflash2_candidate_selector_is_greedy_self_conditioned():
+def reference_dflash2_selector_walk(selector, unary_logits, hidden_states, anchor_token_ids):
+    candidate_ids = unary_logits.topk(selector.top_k, dim=-1).indices
+    unary_scores = unary_logits.gather(-1, candidate_ids)
+    edge_scores = selector.score_candidate_edges(
+        candidate_ids,
+        unary_scores,
+        hidden_states,
+        anchor_token_ids,
+    )
+    batch_size, num_steps, _ = candidate_ids.shape
+    selected_indices = torch.zeros(batch_size, dtype=torch.long)
+    selected_tokens = []
+    batch_indices = torch.arange(batch_size)
+    for step in range(num_steps):
+        selected_indices = edge_scores[
+            batch_indices,
+            step,
+            selected_indices,
+            :,
+        ].argmax(dim=-1)
+        selected_tokens.append(
+            candidate_ids[:, step, :].gather(1, selected_indices[:, None]).squeeze(1)
+        )
+    return torch.stack(selected_tokens, dim=1)
+
+
+def test_dflash2_candidate_selector_matches_official_edge_walk_reference():
     config = DFlash2Config(
         block_size=3,
         target_layer_ids=(0,),
@@ -288,7 +314,48 @@ def test_dflash2_candidate_selector_is_greedy_self_conditioned():
         anchor_token_ids=torch.tensor([0]),
     )
 
+    expected = reference_dflash2_selector_walk(
+        selector,
+        unary_logits,
+        hidden_states,
+        torch.tensor([0]),
+    )
     assert proposal.token_ids.tolist() == [[2, 3]]
+    assert proposal.token_ids.tolist() == expected.tolist()
+
+
+def test_dflash2_candidate_selector_scores_all_previous_candidate_edges():
+    config = DFlash2Config(
+        block_size=3,
+        target_layer_ids=(0,),
+        selector_top_k=2,
+        selector_rank=1,
+        vocab_size=5,
+        hidden_size=1,
+    )
+    selector = DFlash2CandidateSelector(config)
+    with torch.no_grad():
+        selector.hidden_projection.weight.fill_(1.0)
+        selector.predecessor_codebook.zero_()
+        selector.successor_codebook.zero_()
+        selector.predecessor_codebook[1, 0] = 1.0
+        selector.predecessor_codebook[2, 0] = 9.0
+        selector.successor_codebook[3, 0] = 2.0
+
+    candidate_ids = torch.tensor([[[1, 2], [3, 4]]])
+    unary_scores = torch.tensor([[[0.0, 0.0], [0.0, 100.0]]])
+    hidden_states = torch.ones(1, 2, 1)
+
+    edge_scores = selector.score_candidate_edges(
+        candidate_ids,
+        unary_scores,
+        hidden_states,
+        anchor_token_ids=torch.tensor([0]),
+    )
+
+    assert edge_scores[0, 1, 0, 0].item() == pytest.approx(2.0)
+    assert edge_scores[0, 1, 1, 0].item() == pytest.approx(18.0)
+    assert edge_scores[0, 1, 0, 1].item() == pytest.approx(100.0)
 
 
 def test_dflash2_candidate_selector_scores_previous_candidate_rows():
@@ -336,6 +403,7 @@ def test_dflash2_draft_cache_stores_sliding_target_context():
 
     assert cache.anchor_token_ids_by_request == {"req": 11}
     assert cache.anchor_positions_by_request == {"req": 7}
+    assert cache.lengths_by_request == {"req": 2}
     assert cache.hidden_taps_by_request["req"][5].shape == (1, 2, 4)
     assert cache.hidden_taps_by_request["req"][5].tolist() == hidden_taps[5][:, 1:, :].tolist()
 
@@ -344,6 +412,62 @@ def test_dflash2_draft_cache_stores_sliding_target_context():
     assert "req" not in cache.hidden_taps_by_request
     assert "req" not in cache.anchor_token_ids_by_request
     assert "req" not in cache.anchor_positions_by_request
+    assert "req" not in cache.lengths_by_request
+
+
+def test_dflash2_draft_cache_rolls_back_provisional_proposal_length():
+    cache = DFlash2DraftCache(sliding_window=4)
+    hidden_taps = {5: torch.zeros(1, 3, 2)}
+    cache.update_target_context(
+        "req",
+        hidden_taps,
+        anchor_token_id=10,
+        anchor_position=3,
+    )
+
+    cache.begin_proposal("req")
+    cache.advance("req", 3)
+    assert cache.lengths_by_request["req"] == 4
+
+    cache.rollback_proposal("req")
+
+    assert cache.lengths_by_request["req"] == 3
+    assert cache.anchor_token_ids_by_request["req"] == 10
+    assert cache.anchor_positions_by_request["req"] == 3
+
+
+def test_dflash2_draft_cache_rolls_back_new_request_without_length_pollution():
+    cache = DFlash2DraftCache(sliding_window=4)
+
+    cache.begin_proposal("new")
+    cache.advance("new", 2)
+    cache.rollback_proposal("new")
+
+    assert "new" not in cache.lengths_by_request
+
+
+def test_dflash2_draft_cache_commit_reconciles_to_accepted_context_length():
+    cache = DFlash2DraftCache(sliding_window=4)
+    cache.update_target_context(
+        "req",
+        {5: torch.zeros(1, 3, 2)},
+        anchor_token_id=10,
+        anchor_position=3,
+    )
+    cache.begin_proposal("req")
+    cache.advance("req", 3)
+
+    cache.update_target_context(
+        "req",
+        {5: torch.zeros(1, 2, 2)},
+        anchor_token_id=11,
+        anchor_position=5,
+    )
+    cache.commit_proposal("req")
+
+    assert cache.lengths_by_request["req"] == 2
+    assert cache.anchor_token_ids_by_request["req"] == 11
+    assert cache.anchor_positions_by_request["req"] == 5
 
 
 def test_grouped_dynamic_conv_resets_at_block_boundaries():
@@ -469,6 +593,34 @@ def test_dflash2_proposer_calls_model_once_for_the_block_and_tracks_cache():
     assert [proposal.token_ids for proposal in proposals] == [(101, 102), (201,)]
     assert proposals[0].metadata["selector_top_k"] == 16
     assert cache.lengths_by_request == {"a": 2, "b": 1}
+
+
+def test_dflash2_proposer_rolls_back_cache_when_block_forward_fails():
+    class BrokenDraft:
+        supports_block_parallel = True
+
+        def propose_block(self, sequences, max_tokens, draft_cache):
+            draft_cache.advance(sequences[0].request_id, 3)
+            raise RuntimeError("boom")
+
+    seq = Sequence([1, 2], 4, SamplingParams(temperature=0), request_id="boom")
+    cache = DFlash2DraftCache(sliding_window=2048)
+    cache.update_target_context(
+        "boom",
+        {5: torch.zeros(1, 2, 1)},
+        anchor_token_id=2,
+        anchor_position=2,
+    )
+    proposer = DFlash2StandaloneProposer(
+        DFlash2Config(),
+        BrokenDraft(),
+        draft_cache=cache,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        proposer.propose_batch([seq], [3])
+
+    assert cache.lengths_by_request == {"boom": 2}
 
 
 def test_dflash2_proposer_uses_target_context_provider_for_standalone_model():
