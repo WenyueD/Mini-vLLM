@@ -9,8 +9,10 @@ from myvllm.spec_decode.dflash2 import (
     DRAFT_TARGET_TAP_LAYERS,
     DFlash2CandidateSelector,
     DFlash2Config,
+    DFlash2DynamicConv,
     DFlash2DraftCache,
     DFlash2DraftModel,
+    DFlash2RMSNorm,
     DFlash2StandaloneProposer,
     DFlash2TargetContext,
     ProposalBatch,
@@ -226,7 +228,41 @@ def test_dflash2_candidate_selector_returns_topk_path():
     assert selected.scores.tolist() == [[[4.0, 3.0], [8.0, 7.0]]]
 
 
-def test_dflash2_candidate_selector_uses_lattice_path_scores():
+def test_dflash2_rms_norm_uses_direct_weight():
+    norm = DFlash2RMSNorm(2, eps=0.0)
+    with torch.no_grad():
+        norm.weight.fill_(2.0)
+
+    output = norm(torch.tensor([[3.0, 4.0]]))
+
+    scale = torch.rsqrt(torch.tensor([(3.0**2 + 4.0**2) / 2.0]))
+    assert torch.allclose(output, torch.tensor([[3.0, 4.0]]) * scale * 2.0)
+
+
+def test_dflash2_dynamic_conv_base_kernel_axis_selects_prepare_and_finish():
+    config = DFlash2Config(
+        block_size=4,
+        target_layer_ids=(0,),
+        conv_kernel_size=2,
+        conv_group_size=2,
+        hidden_size=4,
+    )
+    conv = DFlash2DynamicConv(config)
+    hidden = torch.arange(1, 9, dtype=torch.float32).view(1, 2, 4)
+    with torch.no_grad():
+        conv.kernel_projection.weight.zero_()
+        conv.base_kernel.zero_()
+        conv.base_kernel[0, 0, :].fill_(1.0)
+        conv.base_kernel[1, 0, :].fill_(2.0)
+
+    prepared, delta_kernel = conv.prepare(hidden)
+    finished = conv.finish(hidden, delta_kernel)
+
+    assert prepared.tolist() == hidden.tolist()
+    assert finished.tolist() == (hidden * 2.0).tolist()
+
+
+def test_dflash2_candidate_selector_is_greedy_self_conditioned():
     config = DFlash2Config(
         block_size=3,
         target_layer_ids=(0,),
@@ -243,7 +279,7 @@ def test_dflash2_candidate_selector_uses_lattice_path_scores():
         selector.predecessor_codebook[2, 0] = 10.0
         selector.successor_codebook[3, 0] = 1.0
 
-    unary_logits = torch.tensor([[[0.0, 10.0, 9.0, -1.0], [0.0, -1.0, -2.0, 0.0]]])
+    unary_logits = torch.tensor([[[0.0, 4.0, 5.0, -1.0], [0.0, 4.0, 3.0, 3.5]]])
     hidden_states = torch.ones(1, 2, 1)
 
     proposal = selector.select_path(

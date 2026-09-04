@@ -13,13 +13,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from myvllm.engine.sequence import Sequence
-from myvllm.models.qwen3_8 import Qwen35RMSNorm, rotate_half
+from myvllm.models.qwen3_8 import rotate_half
 from myvllm.spec_decode.proposer import Proposer
 from myvllm.spec_decode.types import Proposal
 
 
 DRAFT_MODEL_ID = "incoai/Qwen3.8-27B-DFlash2"
 DRAFT_TARGET_TAP_LAYERS = (5, 19, 33, 47, 61)
+
+
+class DFlash2RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        hidden_states = hidden_states * torch.rsqrt(
+            hidden_states.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        )
+        return (hidden_states * self.weight.float()).to(dtype)
 
 
 @dataclass(frozen=True)
@@ -232,7 +247,6 @@ class DFlash2CandidateSelector(nn.Module):
         if hidden_states.shape[:2] != (batch_size, num_steps):
             raise ValueError("selector hidden states must match unary logits")
         candidates = unary_logits.topk(self.top_k, dim=-1).indices
-        unary_scores = unary_logits.gather(-1, candidates)
         if num_steps == 0:
             token_ids = torch.empty(
                 batch_size,
@@ -241,36 +255,22 @@ class DFlash2CandidateSelector(nn.Module):
                 device=unary_logits.device,
             )
         else:
-            initial_edges = self.score_edges(
-                hidden_states[:, 0, :],
-                anchor_token_ids.reshape(batch_size, 1),
-                candidates[:, 0, :],
-            )[:, 0, :]
-            path_scores = unary_scores[:, 0, :] + initial_edges.to(unary_scores.dtype)
-            backpointers = []
-            for step in range(1, num_steps):
-                edges = self.score_edges(
-                    hidden_states[:, step, :],
-                    candidates[:, step - 1, :],
-                    candidates[:, step, :],
-                ).to(unary_scores.dtype)
-                transition_scores = path_scores[:, :, None] + edges
-                best_scores, best_prev = transition_scores.max(dim=1)
-                path_scores = best_scores + unary_scores[:, step, :]
-                backpointers.append(best_prev)
-
-            best_last = path_scores.argmax(dim=-1)
-            chosen_by_step = [best_last]
-            for backpointer in reversed(backpointers):
-                chosen_by_step.append(
-                    backpointer.gather(1, chosen_by_step[-1][:, None]).squeeze(1)
-                )
-            chosen_by_step.reverse()
+            predecessor_ids = anchor_token_ids.reshape(batch_size, 1)
             selected_tokens = []
-            for step, chosen_index in enumerate(chosen_by_step):
-                selected_tokens.append(
-                    candidates[:, step, :].gather(1, chosen_index[:, None]).squeeze(1)
+            for step in range(num_steps):
+                scores = self.score_candidates(
+                    unary_logits[:, step : step + 1, :],
+                    hidden_states[:, step : step + 1, :],
+                    predecessor_ids,
+                    candidates[:, step : step + 1, :],
                 )
+                chosen_index = scores[:, 0, :].argmax(dim=-1)
+                selected = candidates[:, step, :].gather(
+                    1,
+                    chosen_index[:, None],
+                )
+                selected_tokens.append(selected.squeeze(1))
+                predecessor_ids = selected
             token_ids = torch.stack(selected_tokens, dim=1)
         return ProposalBatch(
             token_ids=token_ids,
@@ -334,7 +334,7 @@ class DFlash2DynamicConv(nn.Module):
         self.kernel_size = config.conv_kernel_size
         self.num_groups = config.hidden_size // config.conv_group_size
         self.base_kernel = nn.Parameter(
-            torch.empty(config.conv_kernel_size, 2, config.hidden_size)
+            torch.empty(2, config.conv_kernel_size, config.hidden_size)
         )
         self.kernel_projection = nn.Linear(
             config.hidden_size,
@@ -401,8 +401,8 @@ class DFlash2Attention(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.q_norm = Qwen35RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen35RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = DFlash2RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = DFlash2RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         inv_freq = 1.0 / (
             config.rope_theta
             ** (
@@ -526,13 +526,13 @@ class DFlash2DecoderLayer(nn.Module):
     def __init__(self, config: DFlash2Config):
         super().__init__()
         self.attention_conv = DFlash2DynamicConv(config)
-        self.input_layernorm = Qwen35RMSNorm(
+        self.input_layernorm = DFlash2RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
         self.mlp = DFlash2MLP(config)
         self.mlp_conv = DFlash2DynamicConv(config)
-        self.post_attention_layernorm = Qwen35RMSNorm(
+        self.post_attention_layernorm = DFlash2RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
@@ -582,12 +582,12 @@ class DFlash2DraftModel(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.hidden_norm = Qwen35RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = DFlash2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList(
             DFlash2DecoderLayer(config)
             for _ in range(config.num_sliding_attention_layers)
         )
-        self.norm = Qwen35RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DFlash2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def combine_hidden_taps(
         self,
@@ -707,8 +707,8 @@ def expected_dflash2_weight_shapes(config: DFlash2Config) -> dict[str, tuple[int
         shapes.update(
             {
                 f"{prefix}.attention_conv.base_kernel": (
-                    config.conv_kernel_size,
                     2,
+                    config.conv_kernel_size,
                     config.hidden_size,
                 ),
                 f"{prefix}.attention_conv.kernel_projection.weight": (
@@ -731,8 +731,8 @@ def expected_dflash2_weight_shapes(config: DFlash2Config) -> dict[str, tuple[int
                     config.hidden_size,
                 ),
                 f"{prefix}.mlp_conv.base_kernel": (
-                    config.conv_kernel_size,
                     2,
+                    config.conv_kernel_size,
                     config.hidden_size,
                 ),
                 f"{prefix}.mlp_conv.kernel_projection.weight": (
