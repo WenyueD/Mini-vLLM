@@ -11,6 +11,7 @@ from typing import Any
 
 CAPTURES: list[dict[str, Any]] = []
 SPECULATOR_DEBUG_PRINTED = False
+CAPTURE_ENABLED = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -246,11 +247,11 @@ def tensor_rows_to_list(
 ) -> Any:
     if value is None:
         return None
-    try:
-        if indices is not None:
-            return tensor_to_list(value[indices[:rows]])
-    except Exception:
-        pass
+    # Do not advanced-index vLLM's CUDA tensors here. Some builds expose
+    # request-state indices that are not valid for every propose argument during
+    # warmup or sparse-batch transitions, and a bad GPU index poisons the process
+    # with a device-side assert. Keep this exporter observational.
+    _ = indices
     try:
         return tensor_to_list(value[:rows])
     except Exception:
@@ -334,6 +335,8 @@ def install_dflash_capture_hook(
         global SPECULATOR_DEBUG_PRINTED
         bound = bound_propose_arguments(propose_signature, self, args, kwargs)
         result = original_propose(self, *args, **kwargs)
+        if not CAPTURE_ENABLED:
+            return result
         dummy_run = bool(argument_value(bound, args, kwargs, "dummy_run", 11))
         if dummy_run:
             return result
@@ -360,16 +363,8 @@ def install_dflash_capture_hook(
         proposal_rows = tensor_rows_to_list(result, rows)
         num_sampled_rows = tensor_rows_to_list(num_sampled, rows)
         num_rejected_rows = tensor_rows_to_list(num_rejected, rows)
-        last_sampled_rows = tensor_rows_to_list(
-            last_sampled,
-            rows,
-            indices=active_indices,
-        )
-        next_prefill_rows = tensor_rows_to_list(
-            next_prefill_tokens,
-            rows,
-            indices=active_indices,
-        )
+        last_sampled_rows = tensor_rows_to_list(last_sampled, rows)
+        next_prefill_rows = tensor_rows_to_list(next_prefill_tokens, rows)
         sample_pos = tensor_to_list(getattr(self, "sample_pos", [])[: self.num_speculative_steps])
         sample_indices = tensor_to_list(
             getattr(self, "sample_indices", [])[: self.num_speculative_steps]
@@ -523,8 +518,13 @@ def main() -> None:
 
     install_dflash_capture_hook(dump_speculator_debug=args.dump_speculator_debug)
 
+    global CAPTURE_ENABLED
     llm = LLM(**build_llm_kwargs(args, speculative=True))
-    outputs = llm.generate([args.prompt], sampling_params)
+    CAPTURE_ENABLED = True
+    try:
+        outputs = llm.generate([args.prompt], sampling_params)
+    finally:
+        CAPTURE_ENABLED = False
     if not CAPTURES:
         raise SystemExit(
             "No non-dummy DFlash proposal was captured. Increase --max-tokens "

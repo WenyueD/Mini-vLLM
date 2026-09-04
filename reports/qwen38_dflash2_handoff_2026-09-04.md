@@ -22,7 +22,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
-| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported an Oracle exporter failure where DFlash output repeated prompt token `9419` and capture anchors were all `0`; this indicates output/capture mapping trouble. Do not force top-level anchor fields to make the comparator pass. |
+| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported an Oracle exporter failure where DFlash output repeated prompt token `9419` and capture anchors were all `0`; this indicates output/capture mapping trouble. A later exporter hardening attempted active CUDA indexing and hit an `IndexKernel.cu` device-side assert during vLLM warmup; the exporter now disables capture during warmup and avoids CUDA advanced indexing. Do not force top-level anchor fields to make the comparator pass. |
 | Mini vs Oracle one-step proposal alignment | PENDING | Needs same prompt/tokenized input, same target bonus anchor token and position, same hidden taps, same checkpoint, and tie-aware proposal comparison. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
@@ -45,6 +45,10 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
   - captures active request-state indices from the vLLM input batch when available;
   - uses the single-prompt row for this exporter instead of trusting an anomalous inferred `num_reqs=7`;
   - writes input-batch mapping diagnostics into the capture.
+- Hardened the exporter again after a CUDA `IndexKernel.cu` assert:
+  - proposal capture is disabled during `LLM` construction/warmup and enabled only around the real `generate()` call;
+  - vLLM CUDA tensors are no longer advanced-indexed by active request-state indices inside the hook;
+  - active indices are recorded only as diagnostics.
 
 ## Commands Run Locally
 
@@ -129,6 +133,22 @@ Interpretation:
 - `anchor_token_id=0` across captures is not credible target-bonus-token state and points to capture mapping trouble.
 - The exporter has been hardened after this report; rerun it before drawing any Mini/Oracle proposal conclusion.
 
+Reported by the user after the first hardened exporter rerun:
+
+```text
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111:
+Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+torch.AcceleratorError: CUDA error: device-side assert triggered
+stack reached scripts/export_oracle_dflash2_fixture.py tensor_rows_to_list()
+during vLLM compile_or_warm_up_model() -> sample_tokens() -> speculator.propose()
+```
+
+Interpretation:
+
+- The exporter was still observing vLLM warmup-time speculator calls.
+- The attempted active-index remapping was too invasive for internal CUDA tensors and could trigger device-side asserts.
+- The exporter has been changed to avoid both behaviors.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
@@ -164,6 +184,7 @@ Then run the Oracle exporter in the official vLLM/Oracle environment. Keep `--du
 ```bash
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_WORKER_MULTIPROC_METHOD=fork
+export CUDA_LAUNCH_BLOCKING=1
 
 python scripts/export_oracle_dflash2_fixture.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
