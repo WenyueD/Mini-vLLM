@@ -22,8 +22,8 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
-| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported Oracle exporter failures where DFlash output repeated prompt token `9419` and capture anchors were all `0`; after warmup capture was disabled, capture row 0 became single-prompt and started with `[11, 353, ...]`, while the exporter still read generated output as repeated `9419`. This now points mainly at output extraction / Oracle LLM entrypoint behavior. Do not force top-level anchor fields to make the comparator pass. |
-| Mini vs Oracle one-step proposal alignment | PENDING | Needs same prompt/tokenized input, same target bonus anchor token and position, same hidden taps, same checkpoint, and tie-aware proposal comparison. |
+| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported Oracle exporter failures where DFlash output repeated prompt token `9419` and capture anchors were all `0`; after warmup capture was disabled, capture row 0 became single-prompt and started with `[11, 353, ...]`, while vLLM `CompletionOutput` itself still contained repeated `9419`. This now points mainly at Oracle LLM entrypoint/output behavior. Do not force formal alignment PASS from this fixture. |
+| Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. A diagnostic-only proposal compare is now supported for the current non-lossless Oracle fixture and prints `dflash2_oracle_proposal_diagnostic=PASS` instead of formal alignment PASS. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
 | B>1 continuous batching and performance | PENDING | Do not start until Oracle proposal alignment is resolved and B=1 traces are archived. |
@@ -50,6 +50,9 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
   - vLLM CUDA tensors are no longer advanced-indexed by active request-state indices inside the hook;
   - active indices are recorded only as diagnostics.
 - Added DFlash output-object summaries and `proposal_first_token_id` diagnostics so future non-lossless Oracle reports show exactly which vLLM output field yielded repeated prompt tokens.
+- Added diagnostic-only proposal comparison:
+  - `export_oracle_dflash2_fixture.py` can set the diagnostic Mini-compatible anchor from `--expected-target-first-token-id` when `--allow-non-lossless-fixture` is used and Oracle output is known bad;
+  - `compare_dflash2_oracle_fixture.py --allow-oracle-non-lossless` compares prompt/anchor/taps/proposal fields but prints `dflash2_oracle_proposal_diagnostic=PASS`, never formal `dflash2_oracle_alignment=PASS`.
 
 ## Commands Run Locally
 
@@ -63,6 +66,8 @@ rg -n "DFlash2|dflash|draft|proposal|hidden_tap|spec" src tests scripts reports 
 .\.venv\Scripts\python.exe -m pytest -q --basetemp .\.pytest-tmp
 .\.venv\Scripts\python.exe -m compileall -q src scripts tests
 .\.venv\Scripts\python.exe -m compileall -q scripts\export_oracle_dflash2_fixture.py
+.\.venv\Scripts\python.exe -m compileall -q scripts\export_oracle_dflash2_fixture.py scripts\compare_dflash2_oracle_fixture.py
+.\.venv\Scripts\python.exe scripts\compare_dflash2_oracle_fixture.py --minivllm .\.tmp-oracle-check\mini.json --oracle .\.tmp-oracle-check\oracle.json --allow-oracle-non-lossless
 ```
 
 Results:
@@ -73,6 +78,7 @@ Results:
 - Full local regression: `101 passed, 2 skipped`.
 - Compileall: PASS.
 - Exporter compile check after Oracle diagnostic hardening: PASS.
+- Diagnostic-only comparator smoke: `dflash2_oracle_alignment=SKIP ... proposal_diagnostic_only=true`, then `dflash2_oracle_proposal_diagnostic=PASS`.
 
 ## Remote User-Reported Results
 
@@ -168,6 +174,32 @@ Interpretation:
 - `captures[0].proposal_rows[0][0] == 11` matches the target first token, which is useful evidence that the speculator return may be closer to the desired point than the exported `output_token_ids` indicate.
 - `anchor_token_id=0` remains suspicious and needs `last_sampled`/output-object diagnostics from the next run.
 
+Reported by the user after output diagnostics:
+
+```text
+selected_capture_index=0
+capture_num_sampled=[1]
+raw_output_token_ids=[9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419]
+output_token_ids=[9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419, 9419]
+dflash_output_summary CompletionOutput text="HelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHello"
+anchor_token_id=9419
+oracle_capture_anchor_token_id=0
+anchor_position=1
+proposal_token_ids=[11, 353, 1076, 198, 9419, 11, 24]
+oracle_target_lossless=False
+capture.proposal_first_token_id=11
+capture.active_request_indices=[1022]
+capture.input_batch_summary.idx_mapping=[1022]
+capture.last_sampled=[0]
+capture.next_prefill_tokens length=1024
+```
+
+Interpretation:
+
+- The repeated `9419` is present inside vLLM's `CompletionOutput`, so the exporter is no longer merely slicing prompt tokens incorrectly.
+- The captured speculator proposal starts with the expected target token `11`, but formal Oracle alignment remains blocked because the Oracle generation output is not target-lossless through this `LLM.generate` path.
+- Use diagnostic-only comparison to see whether Mini's proposal IDs match the captured Oracle speculator return, while keeping formal alignment PENDING.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
@@ -198,7 +230,7 @@ python scripts/smoke_dflash2_standalone_proposal.py \
   | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Then run a diagnostic Oracle exporter pass in the official vLLM/Oracle environment. Use `--allow-non-lossless-fixture` for this pass so the JSON is saved and the output-object summary can be inspected:
+Then run a diagnostic Oracle exporter pass in the official vLLM/Oracle environment. Use `--allow-non-lossless-fixture` for this pass so the JSON is saved:
 
 ```bash
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
@@ -236,6 +268,19 @@ Do not compare this diagnostic fixture unless it prints `oracle_dflash2_fixture=
 - `capture.input_batch_summary`
 - `raw_output_token_ids`
 - `output_token_ids`
+
+For proposal-only diagnostics against the currently non-lossless Oracle fixture, run:
+
+```bash
+python scripts/compare_dflash2_oracle_fixture.py \
+  --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.json \
+  --checksum-atol 0.5 \
+  --allow-oracle-non-lossless \
+  | tee results/qwen38_target/oracle_alignment/dflash2_oracle_proposal_diagnostic_hello.txt
+```
+
+This diagnostic compare may print `dflash2_oracle_proposal_diagnostic=PASS`; that is useful, but it does not satisfy formal `dflash2_oracle_alignment=PASS`.
 
 Compare fixtures:
 

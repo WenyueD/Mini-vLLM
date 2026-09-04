@@ -18,6 +18,15 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Absolute tolerance for optional debug checksum comparisons.",
     )
+    parser.add_argument(
+        "--allow-oracle-non-lossless",
+        action="store_true",
+        help=(
+            "Compare proposal fields even when the Oracle fixture is marked "
+            "non-lossless. This is diagnostic-only and will not print the "
+            "formal dflash2_oracle_alignment=PASS marker."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -132,6 +141,7 @@ def print_mismatch_context(fixture: dict[str, Any], *, label: str) -> None:
         "anchor_token_id",
         "anchor_token_mode",
         "minivllm_anchor_token_id",
+        "minivllm_anchor_token_source",
         "oracle_capture_anchor_token_id",
         "prompt_final_anchor_token_id",
         "anchor_position",
@@ -182,10 +192,16 @@ def main() -> None:
     if oracle.get("oracle_target_lossless") is False:
         print_mismatch_context(oracle, label="oracle")
         print_candidate_diagnostics(oracle, label="oracle")
-        raise SystemExit(
-            "dflash2_oracle_alignment=FAIL oracle_target_lossless=false "
-            "fixture=oracle "
-            f"path={args.oracle}"
+        if not args.allow_oracle_non_lossless:
+            raise SystemExit(
+                "dflash2_oracle_alignment=FAIL oracle_target_lossless=false "
+                "fixture=oracle "
+                f"path={args.oracle}"
+            )
+        print(
+            "dflash2_oracle_alignment=SKIP oracle_target_lossless=false "
+            "proposal_diagnostic_only=true",
+            flush=True,
         )
 
     required_equal_keys = [
@@ -208,7 +224,12 @@ def main() -> None:
             if key == "proposal_token_ids":
                 print_candidate_diagnostics(minivllm, label="minivllm")
                 print_candidate_diagnostics(oracle, label="oracle")
-            raise SystemExit(f"dflash2_oracle_alignment=FAIL key={key}")
+            prefix = (
+                "dflash2_oracle_proposal_diagnostic"
+                if args.allow_oracle_non_lossless
+                else "dflash2_oracle_alignment"
+            )
+            raise SystemExit(f"{prefix}=FAIL key={key}")
 
     for key in ("context_checksum", "proposal_hidden_checksum"):
         delta = optional_checksum_delta(minivllm, oracle, key)
@@ -217,11 +238,19 @@ def main() -> None:
             continue
         print(f"{key}_delta={delta}", flush=True)
         if delta > args.checksum_atol:
+            prefix = (
+                "dflash2_oracle_proposal_diagnostic"
+                if args.allow_oracle_non_lossless
+                else "dflash2_oracle_alignment"
+            )
             raise SystemExit(
-                f"dflash2_oracle_alignment=FAIL key={key} delta={delta}"
+                f"{prefix}=FAIL key={key} delta={delta}"
             )
 
-    print("dflash2_oracle_alignment=PASS", flush=True)
+    if args.allow_oracle_non_lossless:
+        print("dflash2_oracle_proposal_diagnostic=PASS", flush=True)
+    else:
+        print("dflash2_oracle_alignment=PASS", flush=True)
 
 
 if __name__ == "__main__":

@@ -663,7 +663,17 @@ def main() -> None:
     output_anchor_index = max(0, sampled_count - 1)
     if output_anchor_index >= len(output_token_ids):
         output_anchor_index = 0
-    minivllm_anchor_token_id = int(output_token_ids[output_anchor_index])
+    minivllm_anchor_token_source = "output_token_ids"
+    if (
+        not oracle_target_lossless
+        and args.allow_non_lossless_fixture
+        and args.expected_target_first_token_id is not None
+        and output_anchor_index == 0
+    ):
+        minivllm_anchor_token_id = int(args.expected_target_first_token_id)
+        minivllm_anchor_token_source = "expected_target_first_token_id"
+    else:
+        minivllm_anchor_token_id = int(output_token_ids[output_anchor_index])
     prompt_final_anchor_token_id = int(prompt_token_ids[-1])
     if args.anchor_token_mode == "oracle":
         anchor_token_id = oracle_anchor_token_id
@@ -683,6 +693,7 @@ def main() -> None:
         "selected_capture_index": int(selected_index),
         "oracle_capture_anchor_token_id": int(oracle_anchor_token_id),
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
+        "minivllm_anchor_token_source": minivllm_anchor_token_source,
         "prompt_final_anchor_token_id": int(prompt_final_anchor_token_id),
         "anchor_position": int(anchor_position),
         "anchor_position_mode": args.anchor_position_mode,
