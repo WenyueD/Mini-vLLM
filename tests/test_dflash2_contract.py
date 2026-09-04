@@ -291,6 +291,40 @@ def test_dflash2_candidate_selector_is_greedy_self_conditioned():
     assert proposal.token_ids.tolist() == [[2, 3]]
 
 
+def test_dflash2_candidate_selector_scores_previous_candidate_rows():
+    config = DFlash2Config(
+        block_size=3,
+        target_layer_ids=(0,),
+        selector_top_k=2,
+        selector_rank=1,
+        vocab_size=4,
+        hidden_size=1,
+    )
+    selector = DFlash2CandidateSelector(config)
+    with torch.no_grad():
+        selector.hidden_projection.weight.fill_(1.0)
+        selector.predecessor_codebook.zero_()
+        selector.successor_codebook.zero_()
+        selector.predecessor_codebook[2, 0] = 5.0
+        selector.successor_codebook[3, 0] = 2.0
+
+    candidate_ids = torch.tensor([[[1, 2], [0, 3]]])
+    unary_scores = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    hidden_states = torch.ones(1, 2, 1)
+
+    scores = selector.score_candidate_edges(
+        candidate_ids,
+        unary_scores,
+        hidden_states,
+        anchor_token_ids=torch.tensor([0]),
+    )
+
+    assert scores.shape == (1, 2, 2, 2)
+    assert scores[0, 0].tolist() == [[1.0, 2.0], [1.0, 2.0]]
+    assert scores[0, 1, 0].tolist() == [3.0, 4.0]
+    assert scores[0, 1, 1].tolist() == [3.0, 14.0]
+
+
 def test_dflash2_draft_cache_stores_sliding_target_context():
     cache = DFlash2DraftCache(sliding_window=2)
     hidden_taps = {
@@ -387,6 +421,10 @@ def test_dflash2_draft_model_forward_block_proposes_in_one_parallel_call():
         "unary_logits_shape",
         "context_checksum",
         "proposal_hidden_checksum",
+        "candidate_token_ids",
+        "candidate_unary_scores",
+        "selector_selected_indices",
+        "selector_realized_scores",
     }
 
 

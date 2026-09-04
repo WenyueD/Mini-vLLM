@@ -118,6 +118,20 @@ def tensor_to_list(value: Any) -> Any:
     return value
 
 
+def tensor_attr_to_list(owner: Any, name: str, rows: int | None = None) -> Any:
+    if not hasattr(owner, name):
+        return None
+    value = getattr(owner, name)
+    if value is None:
+        return None
+    if rows is not None:
+        try:
+            value = value[:rows]
+        except Exception:
+            pass
+    return tensor_to_list(value)
+
+
 def as_int(value: Any) -> int:
     if isinstance(value, list):
         if not value:
@@ -186,6 +200,26 @@ def install_dflash_capture_hook() -> None:
                 "sample_pos": sample_pos,
                 "sample_indices": sample_indices,
                 "sample_from_anchor": bool(getattr(self, "sample_from_anchor", False)),
+                "candidate_token_ids": tensor_attr_to_list(
+                    self,
+                    "_cached_candidate_ids",
+                    num_reqs,
+                ),
+                "selector_selected_indices": tensor_attr_to_list(
+                    self,
+                    "_cached_sample_indices",
+                    num_reqs,
+                ),
+                "selector_realized_scores": tensor_attr_to_list(
+                    self,
+                    "_selector_scores",
+                    num_reqs,
+                ),
+                "draft_token_ids": tensor_attr_to_list(
+                    self,
+                    "draft_tokens",
+                    num_reqs,
+                ),
             }
         )
         return result
@@ -377,6 +411,14 @@ def main() -> None:
         "output_token_ids": output_token_ids,
         "capture": capture,
     }
+    if capture.get("candidate_token_ids") is not None:
+        fixture["candidate_token_ids"] = capture["candidate_token_ids"]
+    if capture.get("selector_selected_indices") is not None:
+        fixture["selector_selected_indices"] = capture["selector_selected_indices"]
+    if capture.get("selector_realized_scores") is not None:
+        fixture["selector_realized_scores"] = capture["selector_realized_scores"]
+    if capture.get("draft_token_ids") is not None:
+        fixture["draft_token_ids"] = capture["draft_token_ids"]
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

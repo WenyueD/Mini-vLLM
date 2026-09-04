@@ -56,6 +56,9 @@ class DFlash2Config:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000000.0
     mask_token_id: int = 248070
+    input_embedding_scale: float = 1.0
+    output_multiplier: float = 1.0
+    final_logit_softcapping: float = 0.0
 
     @property
     def num_speculative_tokens(self) -> int:
@@ -107,6 +110,19 @@ class DFlash2Config:
                 rope_parameters.get("rope_theta", raw.get("rope_theta", cls.rope_theta))
             ),
             mask_token_id=int(dflash.get("mask_token_id", cls.mask_token_id)),
+            input_embedding_scale=float(
+                dflash.get("input_embedding_scale", cls.input_embedding_scale)
+            ),
+            output_multiplier=float(
+                dflash.get("output_multiplier", cls.output_multiplier)
+            ),
+            final_logit_softcapping=float(
+                dflash.get(
+                    "final_logit_softcapping",
+                    cls.final_logit_softcapping,
+                )
+                or 0.0
+            ),
         )
 
     @classmethod
@@ -219,6 +235,37 @@ class DFlash2CandidateSelector(nn.Module):
         context = predecessors * projected_hidden[:, None, :].to(predecessors.dtype)
         return torch.einsum("bpr,bsr->bps", context, successors)
 
+    def score_candidate_edges(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_scores: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if candidate_ids.dim() != 3:
+            raise ValueError("candidate IDs must have shape [batch, K, top_k]")
+        if unary_scores.shape != candidate_ids.shape:
+            raise ValueError("unary scores must match candidate IDs")
+        if hidden_states.shape[:2] != candidate_ids.shape[:2]:
+            raise ValueError("selector hidden states must match candidates")
+        batch_size, _, top_k = candidate_ids.shape
+        predecessor_ids = torch.cat(
+            (
+                anchor_token_ids.reshape(batch_size, 1, 1).expand(-1, 1, top_k),
+                candidate_ids[:, :-1, :],
+            ),
+            dim=1,
+        )
+        projected_hidden = self.hidden_projection(hidden_states)
+        predecessors = self.predecessor_codebook[predecessor_ids.long()]
+        successors = self.successor_codebook[candidate_ids.long()]
+        transition = torch.einsum(
+            "blpr,blcr->blpc",
+            predecessors * projected_hidden[:, :, None, :].to(predecessors.dtype),
+            successors,
+        )
+        return unary_scores[:, :, None, :] + transition.to(unary_scores.dtype)
+
     def select(
         self,
         unary_logits: torch.Tensor,
@@ -247,6 +294,13 @@ class DFlash2CandidateSelector(nn.Module):
         if hidden_states.shape[:2] != (batch_size, num_steps):
             raise ValueError("selector hidden states must match unary logits")
         candidates = unary_logits.topk(self.top_k, dim=-1).indices
+        unary_scores = unary_logits.gather(-1, candidates)
+        edge_scores = self.score_candidate_edges(
+            candidates,
+            unary_scores,
+            hidden_states,
+            anchor_token_ids,
+        )
         if num_steps == 0:
             token_ids = torch.empty(
                 batch_size,
@@ -255,22 +309,22 @@ class DFlash2CandidateSelector(nn.Module):
                 device=unary_logits.device,
             )
         else:
-            predecessor_ids = anchor_token_ids.reshape(batch_size, 1)
+            batch_indices = torch.arange(batch_size, device=unary_logits.device)
+            previous_indices = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=unary_logits.device,
+            )
             selected_tokens = []
             for step in range(num_steps):
-                scores = self.score_candidates(
-                    unary_logits[:, step : step + 1, :],
-                    hidden_states[:, step : step + 1, :],
-                    predecessor_ids,
-                    candidates[:, step : step + 1, :],
-                )
-                chosen_index = scores[:, 0, :].argmax(dim=-1)
+                scores = edge_scores[batch_indices, step, previous_indices, :]
+                chosen_index = scores.argmax(dim=-1)
                 selected = candidates[:, step, :].gather(
                     1,
                     chosen_index[:, None],
                 )
                 selected_tokens.append(selected.squeeze(1))
-                predecessor_ids = selected
+                previous_indices = chosen_index
             token_ids = torch.stack(selected_tokens, dim=1)
         return ProposalBatch(
             token_ids=token_ids,
@@ -621,7 +675,16 @@ class DFlash2DraftModel(nn.Module):
             device=anchor_token_ids.device,
         )
         input_ids = torch.cat([anchor_token_ids.reshape(-1, 1), mask], dim=1)
-        return token_embedding(input_ids)
+        return token_embedding(input_ids) * self.config.input_embedding_scale
+
+    def compute_unary_logits(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
+        logits = lm_head(hidden_states)
+        if self.config.output_multiplier != 1.0:
+            logits = logits * self.config.output_multiplier
+        if self.config.final_logit_softcapping > 0.0:
+            cap = self.config.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+        return logits
 
     def forward_block(
         self,
@@ -659,7 +722,7 @@ class DFlash2DraftModel(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
         proposal_hidden = hidden_states[:, 1:, :]
-        unary_logits = lm_head(proposal_hidden)
+        unary_logits = self.compute_unary_logits(proposal_hidden, lm_head)
         proposal_batch = self.candidate_selector.select_path(
             unary_logits,
             proposal_hidden,
@@ -677,6 +740,55 @@ class DFlash2DraftModel(nn.Module):
                     proposal_hidden.float().sum().item()
                 ),
             }
+            candidate_ids = unary_logits.topk(
+                self.candidate_selector.top_k,
+                dim=-1,
+            ).indices
+            unary_scores = unary_logits.gather(-1, candidate_ids)
+            edge_scores = self.candidate_selector.score_candidate_edges(
+                candidate_ids,
+                unary_scores,
+                proposal_hidden,
+                anchor_token_ids,
+            )
+            batch_indices = torch.arange(candidate_ids.shape[0], device=candidate_ids.device)
+            previous_indices = torch.zeros(
+                candidate_ids.shape[0],
+                dtype=torch.long,
+                device=candidate_ids.device,
+            )
+            selected_indices = []
+            selected_scores = []
+            for step in range(candidate_ids.shape[1]):
+                step_scores = edge_scores[batch_indices, step, previous_indices, :]
+                chosen_index = step_scores.argmax(dim=-1)
+                selected_indices.append(chosen_index)
+                selected_scores.append(step_scores)
+                previous_indices = chosen_index
+            debug.update(
+                {
+                    "candidate_token_ids": candidate_ids.detach().cpu().tolist(),
+                    "candidate_unary_scores": unary_scores.float()
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "selector_selected_indices": torch.stack(
+                        selected_indices,
+                        dim=1,
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "selector_realized_scores": torch.stack(
+                        selected_scores,
+                        dim=1,
+                    )
+                    .float()
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                }
+            )
         return proposal_batch, debug
 
 

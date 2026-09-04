@@ -149,6 +149,24 @@ def print_mismatch_context(fixture: dict[str, Any], *, label: str) -> None:
             print(f"{label}_{debug_key}={fixture[debug_key]}", flush=True)
 
 
+def print_candidate_diagnostics(fixture: dict[str, Any], *, label: str) -> None:
+    for key in (
+        "candidate_token_ids",
+        "candidate_unary_scores",
+        "selector_selected_indices",
+        "selector_realized_scores",
+        "draft_token_ids",
+    ):
+        if key not in fixture:
+            continue
+        value = fixture[key]
+        if isinstance(value, list) and value and isinstance(value[0], list):
+            first = value[0]
+        else:
+            first = value
+        print(f"{label}_{key}={first}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     minivllm = normalize_fixture_schema(
@@ -179,6 +197,9 @@ def main() -> None:
         if left != right:
             print_mismatch_context(minivllm, label="minivllm")
             print_mismatch_context(oracle, label="oracle")
+            if key == "proposal_token_ids":
+                print_candidate_diagnostics(minivllm, label="minivllm")
+                print_candidate_diagnostics(oracle, label="oracle")
             raise SystemExit(f"dflash2_oracle_alignment=FAIL key={key}")
 
     for key in ("context_checksum", "proposal_hidden_checksum"):
