@@ -25,8 +25,8 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. Do not force top-level anchor fields to make the comparator pass. |
 | Mini vs Oracle one-step proposal alignment | PENDING | Needs same prompt/tokenized input, same target bonus anchor token and position, same hidden taps, same checkpoint, and tie-aware proposal comparison. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
-| Real GPU B=1 online drafted > 0 and accepted > 0 | PENDING | User reported `dflash2_online_b1=PENDING`; run online smoke next. |
-| B>1 continuous batching and performance | PENDING | Do not start until selector/cache/oracle alignment and B=1 real acceptance are proven. |
+| Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
+| B>1 continuous batching and performance | PENDING | Do not start until Oracle proposal alignment is resolved and B=1 traces are archived. |
 
 ## Local Changes
 
@@ -83,7 +83,26 @@ Interpretation:
 
 - This is the first useful B=1 offline DFlash2 evidence after the cache transaction fix because it has both `proposed_tokens > 0` and `accepted_tokens > 0`.
 - The reported target-only and DFlash2 token IDs are exactly equal for the displayed 32-token output.
-- Online B=1 and Oracle proposal alignment remain pending.
+- Online B=1 and Oracle proposal alignment remained pending at this checkpoint.
+
+Reported by the user after running online B=1:
+
+```text
+dflash2_text=", I'm a 20-year-old male, and I've been experiencing a persistent cough for the past 2 weeks. I've been taking over-the"
+target_only_chunk_sizes=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+dflash2_chunk_sizes=[1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 1, 2, 2, 1, 1, 1, 1, 1, 2, 3, 2, 1, 1]
+dflash2_proposed_tokens=143
+dflash2_accepted_tokens=8
+dflash2_acceptance_rate=0.055944055944055944
+dflash2_online_b1=PASS
+dflash2_oracle_alignment=PENDING
+```
+
+Interpretation:
+
+- Online B=1 now has real acceptance and emits multi-token chunks (`2` and `3`) where target-only streamed one token per chunk.
+- Offline and online B=1 both report the same proposed/accepted counts for this 32-token run.
+- Oracle proposal alignment remains pending.
 
 ## Proposal Semantics Spec
 
@@ -99,34 +118,65 @@ Current Mini-vLLM implementation is expected to match this minimal DFlash2 propo
 
 ## Next AutoDL Validation
 
-Standalone proposal and offline B=1 have now been reported as passed by the user. Run online B=1 next:
+Standalone proposal, offline B=1, and online B=1 have now been reported as passed by the user. Run Oracle proposal alignment next:
 
 ```bash
-mkdir -p results/qwen38_target/dflash2_2026_09_04
+mkdir -p results/qwen38_target/oracle_alignment
 
-python scripts/smoke_qwen38_dflash2_online_b1.py \
+python scripts/smoke_dflash2_standalone_proposal.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
   --draft-model "$MINIVLLM_DFLASH2_PATH" \
   --device cuda:0 \
   --dtype bfloat16 \
   --safe-open-device cuda \
-  --dflash2-safe-open-device cuda \
   --prompt "Hello" \
-  --max-new-tokens 32 \
-  | tee results/qwen38_target/dflash2_2026_09_04/dflash2_online_b1_hello_32.txt
+  --json-output results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Required evidence for B=1 to count as real DFlash2 progress:
+Then run the Oracle exporter in the official vLLM/Oracle environment:
 
-- `drafted_tokens > 0` or equivalent proposed-token counter.
-- `accepted_tokens > 0`.
-- Per-step proposal token IDs.
-- Target verifier greedy IDs/probabilities or logits around the proposal IDs.
-- Accepted prefix length per step.
-- Cache context length and rollback/commit trace.
-- Final generated IDs equal target-only IDs, with explicit tie-aware treatment for exact argmax ties.
+```bash
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_WORKER_MULTIPROC_METHOD=fork
 
-If CUDA staging is tight, rerun the same commands with `--safe-open-device cpu` and `--dflash2-safe-open-device cpu`; do not change dtype or quantize for alignment unless the goal is explicitly diagnostic.
+python scripts/export_oracle_dflash2_fixture.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --prompt "Hello" \
+  --max-tokens 16 \
+  --num-speculative-tokens 7 \
+  --method dflash \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 256 \
+  --expected-target-first-token-id 11 \
+  --skip-target-preflight \
+  --anchor-token-mode minivllm \
+  --anchor-position-mode minivllm \
+  --trust-remote-code \
+  --enforce-eager \
+  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
+```
+
+Compare fixtures:
+
+```bash
+python scripts/compare_dflash2_oracle_fixture.py \
+  --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
+  --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
+  --checksum-atol 0.5 \
+  | tee results/qwen38_target/oracle_alignment/dflash2_oracle_alignment_hello.txt
+```
+
+Required evidence for Oracle alignment:
+
+- Oracle fixture has `fixture_schema_version=2` and `anchor_semantics=target_bonus_token`.
+- Oracle generation remains target-lossless for the compared prompt.
+- Mini and Oracle agree on prompt token IDs, anchor token ID, anchor position, target tap IDs, and proposal token IDs, or any mismatch is explained with concrete candidate/selector diagnostics.
+
+If CUDA staging is tight for the Mini fixture, rerun it with `--safe-open-device cpu`. For the Oracle exporter, prefer reducing `--gpu-memory-utilization` or using CPU offload via supported vLLM kwargs rather than changing dtype or quantizing, because either can change the proposal surface.
 
 ## Remaining Work
 
