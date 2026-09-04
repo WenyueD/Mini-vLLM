@@ -17,13 +17,13 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Mini DFlash2 target-hidden fallback cache | PASS local | `DFlash2DraftCache.update_target_context()` now records the actual clipped target-hidden context length and stores sliding-window hidden taps. This remains a correctness fallback, not the final high-performance official per-layer draft KV cache. |
 | Proposal rollback/commit semantics | PASS local | `DFlash2DraftCache.begin_proposal()`, `commit_proposal()`, and `rollback_proposal()` now snapshot provisional proposal length. Standalone proposer failures roll back, runner proposal exceptions roll back, and verified commit reconciles to accepted target context length. |
 | Local DFlash2 contract tests | PASS local | `24 passed` after this change. |
-| Local regression | PASS local | `101 passed, 2 skipped`; `compileall` passed. |
+| Local regression | PASS local | `104 passed, 2 skipped`; `compileall` passed. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
 | Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported Oracle exporter failures where DFlash output repeated prompt token `9419` and capture anchors were all `0`; after warmup capture was disabled, capture row 0 became single-prompt and started with `[11, 353, ...]`, while vLLM `CompletionOutput` itself still contained repeated `9419`. This now points mainly at Oracle LLM entrypoint/output behavior. Do not force formal alignment PASS from this fixture. |
-| Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. A diagnostic-only proposal compare is now supported for the current non-lossless Oracle fixture and prints `dflash2_oracle_proposal_diagnostic=PASS` instead of formal alignment PASS. |
+| Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. The first diagnostic-only compare reported `FAIL key=proposal_token_ids`, but the Oracle candidate cache was read from empty slot 0 while the active request occupied slot 1022, so that fixture is inconclusive and must be regenerated. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
 | B>1 continuous batching and performance | PENDING | Do not start until Oracle proposal alignment is resolved and B=1 traces are archived. |
@@ -53,6 +53,11 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 - Added diagnostic-only proposal comparison:
   - `export_oracle_dflash2_fixture.py` can set the diagnostic Mini-compatible anchor from `--expected-target-first-token-id` when `--allow-non-lossless-fixture` is used and Oracle output is known bad;
   - `compare_dflash2_oracle_fixture.py --allow-oracle-non-lossless` compares prompt/anchor/taps/proposal fields but prints `dflash2_oracle_proposal_diagnostic=PASS`, never formal `dflash2_oracle_alignment=PASS`.
+- Fixed sparse Oracle request-slot capture after the first diagnostic compare:
+  - the reported active request occupied slot `1022`, while cached candidate/selector fields were incorrectly sliced from slot `0` and contained only zeros;
+  - request-state and speculator buffers are now copied to CPU before selecting the active slot, avoiding unsafe CUDA advanced indexing;
+  - compact per-step tensors fall back to their first request row when the sparse slot does not apply;
+  - the normal successful exporter path now releases the vLLM engine explicitly.
 
 ## Commands Run Locally
 
@@ -200,6 +205,21 @@ Interpretation:
 - The captured speculator proposal starts with the expected target token `11`, but formal Oracle alignment remains blocked because the Oracle generation output is not target-lossless through this `LLM.generate` path.
 - Use diagnostic-only comparison to see whether Mini's proposal IDs match the captured Oracle speculator return, while keeping formal alignment PENDING.
 
+The user-reported first diagnostic comparison then produced:
+
+```text
+minivllm_proposal_token_ids=[220, 17, 11, 353, 3515, 220, 17]
+oracle_proposal_token_ids=[11, 353, 1076, 198, 9419, 11, 24]
+oracle_candidate_token_ids=[[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], ...]
+dflash2_oracle_alignment=SKIP oracle_target_lossless=false proposal_diagnostic_only=true
+dflash2_oracle_proposal_diagnostic=FAIL key=proposal_token_ids
+```
+
+This comparison is not yet evidence of a model-level proposal mismatch. The
+fixture recorded `active_request_indices=[1022]` but sliced internal candidate,
+selector, and request-state buffers from row 0. Regenerate the Oracle fixture
+with the active-slot CPU-selection fix before interpreting proposal differences.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
@@ -302,7 +322,7 @@ If CUDA staging is tight for the Mini fixture, rerun it with `--safe-open-device
 
 ## Remaining Work
 
-- Regenerate Oracle fixture from the official DFlashSpeculator return point and verify the output-token extraction path. Do not compare against old prompt-repeat/anchor-0 fixtures.
+- Regenerate the Oracle fixture with active-slot CPU selection, then verify the official `DFlashSpeculator` return and output-token extraction paths. Do not compare against old slot-0/prompt-repeat fixtures.
 - Align one Mini proposal block with Oracle under identical anchor token, anchor position, hidden taps, and checkpoint.
 - If proposals still have zero acceptance after this cache fix, inspect target hidden tap values and selector candidate lattice before changing anchor fields.
 - Implement official-style per-layer draft context/KV cache for performance after correctness fallback alignment is proven.

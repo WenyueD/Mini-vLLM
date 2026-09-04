@@ -138,18 +138,21 @@ def tensor_to_list(value: Any) -> Any:
     return value
 
 
-def tensor_attr_to_list(owner: Any, name: str, rows: int | None = None) -> Any:
+def tensor_attr_to_list(
+    owner: Any,
+    name: str,
+    rows: int | None = None,
+    *,
+    indices: Any | None = None,
+) -> Any:
     if not hasattr(owner, name):
         return None
     value = getattr(owner, name)
     if value is None:
         return None
-    if rows is not None:
-        try:
-            value = value[:rows]
-        except Exception:
-            pass
-    return tensor_to_list(value)
+    if rows is None:
+        return tensor_to_list(value)
+    return tensor_rows_to_list(value, rows, indices=indices)
 
 
 def summarize_value(value: Any) -> Any:
@@ -247,15 +250,22 @@ def tensor_rows_to_list(
 ) -> Any:
     if value is None:
         return None
-    # Do not advanced-index vLLM's CUDA tensors here. Some builds expose
-    # request-state indices that are not valid for every propose argument during
-    # warmup or sparse-batch transitions, and a bad GPU index poisons the process
-    # with a device-side assert. Keep this exporter observational.
-    _ = indices
+    # Copy before selecting sparse request slots. Advanced-indexing vLLM's CUDA
+    # buffers here can poison the process with a device-side assert when a slot is
+    # stale or the source is a compact per-step tensor.
+    copied = tensor_to_list(value)
+    if indices is not None:
+        copied_indices = tensor_to_list(indices)
+        try:
+            selected = [copied[as_int(index)] for index in copied_indices[:rows]]
+        except (IndexError, TypeError, ValueError):
+            selected = []
+        if len(selected) == rows:
+            return selected
     try:
-        return tensor_to_list(value[:rows])
+        return copied[:rows]
     except Exception:
-        return tensor_to_list(value)
+        return copied
 
 
 def input_batch_active_indices(input_batch: Any, rows: int) -> Any | None:
@@ -361,10 +371,18 @@ def install_dflash_capture_hook(
         rows = max(rows, 1)
         active_indices = input_batch_active_indices(input_batch, rows)
         proposal_rows = tensor_rows_to_list(result, rows)
-        num_sampled_rows = tensor_rows_to_list(num_sampled, rows)
-        num_rejected_rows = tensor_rows_to_list(num_rejected, rows)
-        last_sampled_rows = tensor_rows_to_list(last_sampled, rows)
-        next_prefill_rows = tensor_rows_to_list(next_prefill_tokens, rows)
+        num_sampled_rows = tensor_rows_to_list(
+            num_sampled, rows, indices=active_indices
+        )
+        num_rejected_rows = tensor_rows_to_list(
+            num_rejected, rows, indices=active_indices
+        )
+        last_sampled_rows = tensor_rows_to_list(
+            last_sampled, rows, indices=active_indices
+        )
+        next_prefill_rows = tensor_rows_to_list(
+            next_prefill_tokens, rows, indices=active_indices
+        )
         sample_pos = tensor_to_list(getattr(self, "sample_pos", [])[: self.num_speculative_steps])
         sample_indices = tensor_to_list(
             getattr(self, "sample_indices", [])[: self.num_speculative_steps]
@@ -405,21 +423,25 @@ def install_dflash_capture_hook(
                     self,
                     "_cached_candidate_ids",
                     rows,
+                    indices=active_indices,
                 ),
                 "selector_selected_indices": tensor_attr_to_list(
                     self,
                     "_cached_sample_indices",
                     rows,
+                    indices=active_indices,
                 ),
                 "selector_realized_scores": tensor_attr_to_list(
                     self,
                     "_selector_scores",
                     rows,
+                    indices=active_indices,
                 ),
                 "draft_token_ids": tensor_attr_to_list(
                     self,
                     "draft_tokens",
                     rows,
+                    indices=active_indices,
                 ),
             }
         )
@@ -718,6 +740,8 @@ def main() -> None:
         fixture["selector_realized_scores"] = capture["selector_realized_scores"]
     if capture.get("draft_token_ids") is not None:
         fixture["draft_token_ids"] = capture["draft_token_ids"]
+
+    release_llm(llm)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
