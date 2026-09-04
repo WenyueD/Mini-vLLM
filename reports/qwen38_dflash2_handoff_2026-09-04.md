@@ -20,10 +20,12 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Local regression | PASS local | `101 passed, 2 skipped`; `compileall` passed. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
+| Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
 | Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. Do not force top-level anchor fields to make the comparator pass. |
 | Mini vs Oracle one-step proposal alignment | PENDING | Needs same prompt/tokenized input, same target bonus anchor token and position, same hidden taps, same checkpoint, and tie-aware proposal comparison. |
-| Real GPU B=1 drafted > 0 and accepted > 0 | PENDING | Must rerun offline and online with per-step proposal/verifier/accepted-prefix/cache trace. |
+| Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
+| Real GPU B=1 online drafted > 0 and accepted > 0 | PENDING | User reported `dflash2_online_b1=PENDING`; run online smoke next. |
 | B>1 continuous batching and performance | PENDING | Do not start until selector/cache/oracle alignment and B=1 real acceptance are proven. |
 
 ## Local Changes
@@ -60,6 +62,29 @@ Results:
 - Full local regression: `101 passed, 2 skipped`.
 - Compileall: PASS.
 
+## Remote User-Reported Results
+
+Reported by the user after pulling commit `89fd865` on AutoDL:
+
+```text
+dflash2_standalone_proposal=PASS
+dflash2_after_generate: allocated=53.69 GiB reserved=55.43 GiB max_allocated=70.10 GiB free=23.31 GiB total=79.25 GiB
+target_only_token_ids=[11, 353, 2688, 264, 220, 17, 15, 4514, 6086, 8330, 11, 321, 353, 2908, 978, 23330, 264, 24207, 38288, 364, 279, 3162, 220, 17, 5381, 13, 353, 2908, 978, 4483, 888, 10288]
+dflash2_token_ids=[11, 353, 2688, 264, 220, 17, 15, 4514, 6086, 8330, 11, 321, 353, 2908, 978, 23330, 264, 24207, 38288, 364, 279, 3162, 220, 17, 5381, 13, 353, 2908, 978, 4483, 888, 10288]
+dflash2_proposed_tokens=143
+dflash2_accepted_tokens=8
+dflash2_acceptance_rate=0.055944055944055944
+qwen38_dflash2_engine_b1=PASS
+dflash2_online_b1=PENDING
+dflash2_oracle_alignment=PENDING
+```
+
+Interpretation:
+
+- This is the first useful B=1 offline DFlash2 evidence after the cache transaction fix because it has both `proposed_tokens > 0` and `accepted_tokens > 0`.
+- The reported target-only and DFlash2 token IDs are exactly equal for the displayed 32-token output.
+- Online B=1 and Oracle proposal alignment remain pending.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
@@ -74,31 +99,10 @@ Current Mini-vLLM implementation is expected to match this minimal DFlash2 propo
 
 ## Next AutoDL Validation
 
-Run this only after pulling the commit containing this report.
+Standalone proposal and offline B=1 have now been reported as passed by the user. Run online B=1 next:
 
 ```bash
 mkdir -p results/qwen38_target/dflash2_2026_09_04
-
-python scripts/smoke_dflash2_standalone_proposal.py \
-  --target-model "$MINIVLLM_QWEN38_PATH" \
-  --draft-model "$MINIVLLM_DFLASH2_PATH" \
-  --device cuda:0 \
-  --dtype bfloat16 \
-  --safe-open-device cuda \
-  --prompt "Hello" \
-  --json-output results/qwen38_target/dflash2_2026_09_04/minivllm_dflash2_hello.json \
-  | tee results/qwen38_target/dflash2_2026_09_04/minivllm_dflash2_hello.txt
-
-python scripts/smoke_qwen38_dflash2_engine_b1.py \
-  --target-model "$MINIVLLM_QWEN38_PATH" \
-  --draft-model "$MINIVLLM_DFLASH2_PATH" \
-  --device cuda:0 \
-  --dtype bfloat16 \
-  --safe-open-device cuda \
-  --dflash2-safe-open-device cuda \
-  --prompt "Hello" \
-  --max-new-tokens 32 \
-  | tee results/qwen38_target/dflash2_2026_09_04/dflash2_engine_b1_hello_32.txt
 
 python scripts/smoke_qwen38_dflash2_online_b1.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
