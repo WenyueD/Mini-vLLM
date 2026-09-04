@@ -22,9 +22,9 @@ def parse_args() -> argparse.Namespace:
         "--allow-oracle-non-lossless",
         action="store_true",
         help=(
-            "Compare proposal fields even when the Oracle fixture is marked "
-            "non-lossless. This is diagnostic-only and will not print the "
-            "formal dflash2_oracle_alignment=PASS marker."
+            "Compare proposal fields when a non-lossless Oracle fixture still "
+            "used the same effective anchor. This is diagnostic-only and will "
+            "not print the formal dflash2_oracle_alignment=PASS marker."
         ),
     )
     return parser.parse_args()
@@ -143,6 +143,7 @@ def print_mismatch_context(fixture: dict[str, Any], *, label: str) -> None:
         "minivllm_anchor_token_id",
         "minivllm_anchor_token_source",
         "oracle_capture_anchor_token_id",
+        "oracle_effective_anchor_matches_fixture",
         "prompt_final_anchor_token_id",
         "anchor_position",
         "anchor_position_mode",
@@ -177,6 +178,16 @@ def print_candidate_diagnostics(fixture: dict[str, Any], *, label: str) -> None:
         print(f"{label}_{key}={first}", flush=True)
 
 
+def oracle_effective_anchor_mismatch(fixture: dict[str, Any]) -> bool:
+    fixture_anchor = fixture.get("anchor_token_id")
+    effective_anchor = fixture.get("oracle_capture_anchor_token_id")
+    return (
+        fixture_anchor is not None
+        and effective_anchor is not None
+        and int(fixture_anchor) != int(effective_anchor)
+    )
+
+
 def main() -> None:
     args = parse_args()
     minivllm = normalize_fixture_schema(
@@ -203,6 +214,16 @@ def main() -> None:
             "proposal_diagnostic_only=true",
             flush=True,
         )
+        if oracle_effective_anchor_mismatch(oracle):
+            print(
+                "dflash2_oracle_proposal_diagnostic=SKIP "
+                "reason=oracle_effective_anchor_mismatch "
+                f"fixture_anchor_token_id={oracle['anchor_token_id']} "
+                "oracle_capture_anchor_token_id="
+                f"{oracle['oracle_capture_anchor_token_id']}",
+                flush=True,
+            )
+            return
 
     required_equal_keys = [
         "fixture_schema_version",

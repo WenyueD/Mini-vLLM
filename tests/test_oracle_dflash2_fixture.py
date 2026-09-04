@@ -1,3 +1,4 @@
+from scripts.compare_dflash2_oracle_fixture import oracle_effective_anchor_mismatch
 from scripts.export_oracle_dflash2_fixture import tensor_attr_to_list, tensor_rows_to_list
 
 
@@ -39,3 +40,12 @@ def test_tensor_attr_selects_sparse_active_slots():
     owner = type("Owner", (), {"cached": [[0], [11], [22]]})()
 
     assert tensor_attr_to_list(owner, "cached", 1, indices=[1]) == [[11]]
+
+
+def test_oracle_effective_anchor_mismatch_detects_overridden_fixture_anchor():
+    assert oracle_effective_anchor_mismatch(
+        {"anchor_token_id": 11, "oracle_capture_anchor_token_id": 9419}
+    )
+    assert not oracle_effective_anchor_mismatch(
+        {"anchor_token_id": 11, "oracle_capture_anchor_token_id": 11}
+    )

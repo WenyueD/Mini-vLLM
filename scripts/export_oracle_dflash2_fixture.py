@@ -423,25 +423,21 @@ def install_dflash_capture_hook(
                     self,
                     "_cached_candidate_ids",
                     rows,
-                    indices=active_indices,
                 ),
                 "selector_selected_indices": tensor_attr_to_list(
                     self,
                     "_cached_sample_indices",
                     rows,
-                    indices=active_indices,
                 ),
                 "selector_realized_scores": tensor_attr_to_list(
                     self,
                     "_selector_scores",
                     rows,
-                    indices=active_indices,
                 ),
                 "draft_token_ids": tensor_attr_to_list(
                     self,
                     "draft_tokens",
                     rows,
-                    indices=active_indices,
                 ),
             }
         )
@@ -714,6 +710,9 @@ def main() -> None:
         "anchor_token_mode": args.anchor_token_mode,
         "selected_capture_index": int(selected_index),
         "oracle_capture_anchor_token_id": int(oracle_anchor_token_id),
+        "oracle_effective_anchor_matches_fixture": (
+            int(oracle_anchor_token_id) == int(anchor_token_id)
+        ),
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
         "minivllm_anchor_token_source": minivllm_anchor_token_source,
         "prompt_final_anchor_token_id": int(prompt_final_anchor_token_id),
