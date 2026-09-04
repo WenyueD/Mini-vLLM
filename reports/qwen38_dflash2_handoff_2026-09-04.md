@@ -239,6 +239,16 @@ The comparator now stops with an effective-anchor SKIP before checking proposal
 IDs. Formal alignment remains pending until Oracle target-only and DFlash use the
 same bonus anchor and produce target-lossless output.
 
+This behavior is consistent with open upstream vLLM correctness reports for
+Qwen3.8/DFlash2 and repetitive DFlash output:
+
+- https://github.com/vllm-project/vllm/issues/54928
+- https://github.com/vllm-project/vllm/issues/50837
+
+Keep the Oracle result classified as an upstream/environment blocker until a
+target-lossless vLLM commit/config is identified; it is not evidence against the
+user-reported Mini-vLLM B=1 target-token equality.
+
 ## Proposal Semantics Spec
 
 Current Mini-vLLM implementation is expected to match this minimal DFlash2 proposal contract:
