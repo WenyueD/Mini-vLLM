@@ -179,6 +179,14 @@ def main() -> None:
         label="oracle",
         path=args.oracle,
     )
+    if oracle.get("oracle_target_lossless") is False:
+        print_mismatch_context(oracle, label="oracle")
+        print_candidate_diagnostics(oracle, label="oracle")
+        raise SystemExit(
+            "dflash2_oracle_alignment=FAIL oracle_target_lossless=false "
+            "fixture=oracle "
+            f"path={args.oracle}"
+        )
 
     required_equal_keys = [
         "fixture_schema_version",

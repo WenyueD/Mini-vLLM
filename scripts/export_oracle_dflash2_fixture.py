@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--allow-non-lossless-fixture",
+        action="store_true",
+        help=(
+            "Write the diagnostic fixture even when Oracle speculative generation "
+            "does not start with the expected target token. Such a fixture is for "
+            "debug only and must not be treated as a passing Oracle alignment."
+        ),
+    )
+    parser.add_argument(
         "--anchor-position-mode",
         choices=("oracle", "minivllm", "prompt-final"),
         default="minivllm",
@@ -353,15 +362,35 @@ def main() -> None:
     output_token_ids = completion_token_ids(raw_output_token_ids, prompt_token_ids)
     if not output_token_ids:
         raise SystemExit("Oracle generation produced no output tokens")
-    if target_only_token_ids and output_token_ids[0] != target_only_token_ids[0]:
+    oracle_target_lossless = not target_only_token_ids or (
+        output_token_ids[0] == target_only_token_ids[0]
+    )
+    if target_only_token_ids and not oracle_target_lossless and not args.allow_non_lossless_fixture:
+        summary = [
+            {
+                "index": index,
+                "num_sampled": candidate.get("num_sampled"),
+                "anchor_token_id": candidate.get("anchor_token_id"),
+                "proposal_rows": candidate.get("proposal_rows"),
+                "candidate_token_ids_present": candidate.get("candidate_token_ids")
+                is not None,
+                "selector_selected_indices_present": candidate.get(
+                    "selector_selected_indices"
+                )
+                is not None,
+            }
+            for index, candidate in enumerate(CAPTURES)
+        ]
         raise SystemExit(
             "Oracle DFlash generation is not target-lossless for this prompt: "
             f"target_first={target_only_token_ids[0]} "
             f"dflash_first={output_token_ids[0]} "
             f"target_tokens={target_only_token_ids} "
-            f"dflash_tokens={output_token_ids}. "
+            f"dflash_tokens={output_token_ids} "
+            f"captures={summary}. "
             "Retry with --method dflash2 if supported, or align a prompt/config "
-            "where Oracle target-only and Oracle DFlash outputs match first."
+            "where Oracle target-only and Oracle DFlash outputs match first. "
+            "For diagnostics only, rerun with --allow-non-lossless-fixture."
         )
     sampled_count = as_int(capture["num_sampled"])
     oracle_anchor_position = len(prompt_token_ids) + max(0, sampled_count - 1)
@@ -406,6 +435,7 @@ def main() -> None:
         "target_layer_ids": [5, 19, 33, 47, 61],
         "proposal_valid_length": len(proposal_token_ids),
         "proposal_token_ids": proposal_token_ids,
+        "oracle_target_lossless": oracle_target_lossless,
         "oracle_target_only_token_ids": target_only_token_ids,
         "raw_output_token_ids": raw_output_token_ids,
         "output_token_ids": output_token_ids,
@@ -437,8 +467,12 @@ def main() -> None:
     print(f"anchor_position={fixture['anchor_position']}", flush=True)
     print(f"oracle_anchor_position={oracle_anchor_position}", flush=True)
     print(f"proposal_token_ids={proposal_token_ids}", flush=True)
+    print(f"oracle_target_lossless={oracle_target_lossless}", flush=True)
     print(f"json_output={output_path}", flush=True)
-    print("oracle_dflash2_fixture=PASS", flush=True)
+    if oracle_target_lossless:
+        print("oracle_dflash2_fixture=PASS", flush=True)
+    else:
+        print("oracle_dflash2_fixture=DEBUG_NON_LOSSLESS", flush=True)
 
 
 if __name__ == "__main__":
