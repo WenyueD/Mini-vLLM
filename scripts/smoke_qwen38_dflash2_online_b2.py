@@ -323,6 +323,7 @@ def main() -> None:
     target_evidence = batch_evidence(target_stats, target_ids)
     dflash_evidence = batch_evidence(dflash_stats, dflash_ids)
     speculative = dflash_stats["speculative"]
+    verification = dflash_stats.get("qwen35_verification", {})
     if target_evidence["max_active_batch_size"] < 2:
         raise SystemExit("Target-only requests never shared a B=2 decode batch")
     if dflash_evidence["max_active_batch_size"] < 2:
@@ -333,6 +334,10 @@ def main() -> None:
         raise SystemExit("A B=2 speculative step did not propose for both requests")
     if speculative["proposed_tokens"] <= 0:
         raise SystemExit("DFlash2 B=2 run produced no speculative proposals")
+    if verification.get("max_batch_size", 0) < 2:
+        raise SystemExit("Qwen3.8 verification never executed a tensor batch of 2")
+    if verification.get("tensor_batched_token_steps", 0) <= 0:
+        raise SystemExit("Qwen3.8 verification recorded no tensor-batched token step")
     if any(value <= 0 for value in dflash_evidence["accepted_by_request"].values()):
         raise SystemExit(
             "DFlash2 B=2 did not record an accepted draft token for each request: "
@@ -341,6 +346,7 @@ def main() -> None:
 
     print(f"target_only_b2_evidence={target_evidence}", flush=True)
     print(f"dflash2_b2_evidence={dflash_evidence}", flush=True)
+    print(f"qwen35_verification_evidence={verification}", flush=True)
     print(f"dflash2_proposed_tokens={speculative['proposed_tokens']}", flush=True)
     print(f"dflash2_accepted_tokens={speculative['accepted_tokens']}", flush=True)
     print(f"dflash2_acceptance_rate={speculative['acceptance_rate']}", flush=True)

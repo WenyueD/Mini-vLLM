@@ -273,6 +273,9 @@ The default submits two identical `Hello` prompts. The pass marker is
 `dflash2_online_b2=PASS`; the script also requires exact per-request target-only
 equality, `active_batch_size >= 2`, `speculative_batch_size >= 2`, proposals for
 both requests in a shared step, and at least one accepted draft token per request.
+After the tensor-batched verifier change, the script additionally requires
+`qwen35_verification.max_batch_size >= 2` and at least one
+`tensor_batched_token_step`.
 
 AutoDL A800 validation on 2026-09-05 passed both same-prompt and heterogeneous
 B=2 runs. The same-prompt run recorded `286 proposed / 16 accepted`; the

@@ -41,6 +41,15 @@ class FakeRunner:
         raise AssertionError(method)
 
 
+class FakeQwenRunner(FakeRunner):
+    is_qwen35_target = True
+
+    def call(self, method, *args):
+        if method == "get_qwen35_verification_stats":
+            return {"max_batch_size": 2, "tensor_batched_token_steps": 7}
+        return super().call(method, *args)
+
+
 class OracleProposer(Proposer):
     def propose(self, sequence, max_tokens):
         history = list(sequence.token_ids)
@@ -187,3 +196,15 @@ def test_batch_step_metrics_are_atomic_and_weighted():
         step["accepted_tokens"] for step in stats["recent_decode_steps"]
     )
     assert stats["acceptance_rate"] == 1.0
+
+
+def test_qwen_verification_batch_stats_are_exposed_by_engine():
+    engine = make_engine()
+    engine.model_runner = FakeQwenRunner()
+
+    stats = engine.get_stats()
+
+    assert stats["qwen35_verification"] == {
+        "max_batch_size": 2,
+        "tensor_batched_token_steps": 7,
+    }

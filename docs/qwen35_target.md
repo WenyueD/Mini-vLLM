@@ -9,11 +9,11 @@ whose language model lives under nested `text_config`.
 - Supported: text-only target execution, greedy correctness scaffolding,
   request-isolated eager cached target steps, Qwen3.5/Qwen3.8 config parsing,
   weight mapping validation, hidden taps, hybrid cache transaction semantics,
-  and DFlash2 draft execution behind the speculative verifier. Multiple requests
-  can share one scheduler batch while target, proposal, and verification model
-  calls execute per request against isolated cache state.
-- Not claimed: multimodal inputs, tensor-batched Qwen3.5/Qwen3.8 cached model
-  execution, production dynamic batching, CUDA Graph optimization for
+  and DFlash2 draft execution behind the speculative verifier. Cached target
+  verification tensor-batches active requests at each K+1 token position while
+  preserving request-isolated state and ragged query lengths.
+- Not claimed: multimodal inputs, tensor-batched ordinary target decode or
+  DFlash2 proposal, production dynamic batching, CUDA Graph optimization for
   verification, Oracle proposal-ID alignment, or performance numbers.
 - Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
   `video_grid_thw` are rejected explicitly.
@@ -112,10 +112,11 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
 
 This path is still not a production DFlash2 integration. The draft checkpoint
 can be audited and loaded, standalone block proposal can be run, and multiple
-requests can share an engine scheduler batch with request-isolated serial model
-calls. Tensor-batched cached target/proposal/verification execution, Oracle
-proposal-ID alignment, and performance runs remain required before broader
-claims.
+requests can share an engine scheduler batch. Cached target verification now
+forms a real request-dimension tensor batch at each active query-token position;
+ordinary target decode and DFlash2 proposal remain request-serial. Oracle
+proposal-ID alignment and fresh GPU performance runs remain required before
+broader claims.
 
 ## GPU Validation
 

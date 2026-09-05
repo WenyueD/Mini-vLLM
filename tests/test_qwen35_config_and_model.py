@@ -257,6 +257,65 @@ def test_qwen35_cache_transaction_rollback_and_partial_commit_replay_equivalence
     )
 
 
+def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    serial_cache = HybridCacheManager()
+    batch_cache = HybridCacheManager()
+    prefixes = {
+        "req0": [1, 2, 3],
+        "req1": [10, 11, 12, 13, 14],
+    }
+    queries = {
+        "req0": [4, 5, 6],
+        "req1": [15, 16],
+    }
+    for request_id, prefix in prefixes.items():
+        model.forward_with_cache(torch.tensor(prefix), serial_cache, request_id)
+        model.forward_with_cache(torch.tensor(prefix), batch_cache, request_id)
+
+    serial_outputs = [
+        model.forward_with_cache(
+            torch.tensor(queries[request_id]), serial_cache, request_id
+        )
+        for request_id in prefixes
+    ]
+    padded_queries = torch.tensor([[4, 5, 6], [15, 16, 0]])
+    batch_sizes = []
+    original_batch_step = model.model.forward_cached_batch_step
+
+    def tracked_batch_step(input_ids, request_states, hidden_tap_layers=None):
+        batch_sizes.append(len(request_states))
+        return original_batch_step(
+            input_ids,
+            request_states,
+            hidden_tap_layers=hidden_tap_layers,
+        )
+
+    model.model.forward_cached_batch_step = tracked_batch_step
+    batch_outputs = model.forward_with_cache_batch(
+        padded_queries,
+        [3, 2],
+        batch_cache,
+        list(prefixes),
+    )
+
+    assert batch_sizes == [2, 2, 1]
+    for request_id, serial_output, batch_output in zip(
+        prefixes, serial_outputs, batch_outputs
+    ):
+        assert torch.allclose(
+            batch_output.logits,
+            serial_output.logits,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert_cache_state_equal(
+            batch_cache.get_request_state(request_id),
+            serial_cache.get_request_state(request_id),
+        )
+
+
 def test_qwen35_spec_verifier_records_transaction_and_commits_accepted_prefix():
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
@@ -318,6 +377,10 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
     }
     for request_id, prefix in prefixes.items():
         model.forward_with_cache(torch.tensor(prefix), cache, request_id)
+    before = {
+        request_id: cache.get_request_state(request_id).clone()
+        for request_id in prefixes
+    }
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.model = model
@@ -353,11 +416,28 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
 
     assert [result.sequence_id for result in results] == [seq0.seq_id, seq1.seq_id]
     assert [result.metadata["verified_tokens"] for result in results] == [3, 2]
+    assert all(result.metadata["tensor_batched"] for result in results)
+    assert all(result.metadata["verification_batch_size"] == 2 for result in results)
+    assert runner.get_qwen35_verification_stats() == {
+        "calls": 1,
+        "max_batch_size": 2,
+        "tensor_batched_token_steps": 2,
+        "total_token_steps": 3,
+        "last_active_batch_sizes": (2, 2, 1),
+    }
     assert set(runner._pending_verified_cache_transactions) == {
         seq0.seq_id,
         seq1.seq_id,
     }
 
+    runner.rollback_verified_cache([seq0.seq_id, seq1.seq_id])
+    for request_id in prefixes:
+        assert_cache_state_equal(
+            cache.get_request_state(request_id), before[request_id]
+        )
+
+    results = runner.verify(batch)
+    assert runner.get_qwen35_verification_stats()["calls"] == 2
     runner.commit_verified_cache({seq0.seq_id: 2, seq1.seq_id: 1})
     expected_prefixes = {
         "req0": [1, 2, 3, 4, 5],

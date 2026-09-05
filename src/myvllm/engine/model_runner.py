@@ -69,6 +69,13 @@ class ModelRunner:
         self.is_qwen35_target = False
         self.hybrid_cache_manager = None
         self._pending_verified_cache_transactions = {}
+        self._qwen35_verification_stats = {
+            "calls": 0,
+            "max_batch_size": 0,
+            "tensor_batched_token_steps": 0,
+            "total_token_steps": 0,
+            "last_active_batch_sizes": (),
+        }
         self.dflash2_draft_model = None
         self.dflash2_draft_cache = None
         self._dflash2_contexts = {}
@@ -925,41 +932,52 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _verify_qwen35_cached(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
-        """Verify each Qwen3.5/Qwen3.8 request against its isolated cache."""
+        """Tensor-batch Qwen3.5/Qwen3.8 verification across request caches."""
         if self.hybrid_cache_manager is None:
             raise RuntimeError("Qwen3.5/Qwen3.8 verifier requires HybridCacheManager")
+        if not batch.sequences:
+            return []
         sequence_ids = [seq.seq_id for seq in batch.sequences]
         self.rollback_verified_cache(sequence_ids)
+        query_tokens_by_request = []
+        for seq, proposal in zip(batch.sequences, batch.proposals):
+            if seq.num_tokens - seq.num_computed_tokens != 1:
+                raise RuntimeError("verification requires exactly one pending token")
+            if tuple(seq.provisional_token_ids) != proposal.token_ids:
+                raise RuntimeError("sequence/proposal provisional state mismatch")
+            query_tokens = (seq.last_token, *proposal.token_ids)
+            query_tokens_by_request.append(query_tokens)
+        transactions = {}
         try:
-            return [
-                self._verify_qwen35_cached_one(seq, proposal)
-                for seq, proposal in zip(batch.sequences, batch.proposals)
-            ]
-        except Exception:
-            self.rollback_verified_cache(sequence_ids)
-            raise
-
-    def _verify_qwen35_cached_one(
-        self, seq: Sequence, proposal: Proposal
-    ) -> VerificationResult:
-        if seq.num_tokens - seq.num_computed_tokens != 1:
-            raise RuntimeError("verification requires exactly one pending token")
-        if tuple(seq.provisional_token_ids) != proposal.token_ids:
-            raise RuntimeError("sequence/proposal provisional state mismatch")
-
-        query_tokens = (seq.last_token, *proposal.token_ids)
-        transaction = self.hybrid_cache_manager.begin_transaction(
-            [seq.request_id],
-            {seq.request_id: len(query_tokens)},
-        )
-        try:
+            for seq, query_tokens in zip(batch.sequences, query_tokens_by_request):
+                transactions[seq.request_id] = (
+                    self.hybrid_cache_manager.begin_transaction(
+                        [seq.request_id],
+                        {seq.request_id: len(query_tokens)},
+                    )
+                )
             device = next(self.model.parameters()).device
-            input_ids = torch.tensor(query_tokens, dtype=torch.long, device=device)
-            output = self.model.forward_with_cache(
+            query_lengths = [
+                len(query_tokens) for query_tokens in query_tokens_by_request
+            ]
+            input_ids = torch.zeros(
+                len(query_lengths),
+                max(query_lengths),
+                dtype=torch.long,
+                device=device,
+            )
+            for row, query_tokens in enumerate(query_tokens_by_request):
+                input_ids[row, : len(query_tokens)] = torch.tensor(
+                    query_tokens,
+                    dtype=torch.long,
+                    device=device,
+                )
+            outputs = self.model.forward_with_cache_batch(
                 input_ids,
+                query_lengths,
                 self.hybrid_cache_manager,
-                seq.request_id,
-                transaction=transaction,
+                [seq.request_id for seq in batch.sequences],
+                transactions=transactions,
                 capture_hidden_taps=bool(
                     self.config.get("capture_verification_hidden_taps", False)
                     or self.dflash2_draft_model is not None
@@ -967,34 +985,100 @@ class ModelRunner:
             )
             if self.rank != 0:
                 raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")
-            flat_logits = output.logits.reshape(-1, output.logits.shape[-1])
+            if len(outputs) != len(batch.sequences):
+                raise RuntimeError(
+                    "batched cached target returned the wrong output count"
+                )
+            flat_logits = torch.cat(
+                [
+                    output.logits.reshape(-1, output.logits.shape[-1])
+                    for output in outputs
+                ],
+                dim=0,
+            )
             temperatures = torch.zeros(
                 flat_logits.shape[0],
                 dtype=torch.float32,
                 device=flat_logits.device,
             )
-            token_ids = self.sampler(flat_logits, temperatures).detach().cpu().tolist()
-            self._pending_verified_cache_transactions[seq.seq_id] = (
-                transaction,
-                seq.request_id,
-                output,
-                tuple(token_ids),
-                int(transaction.original_states[seq.request_id].logical_length),
+            flat_token_ids = (
+                self.sampler(flat_logits, temperatures).detach().cpu().tolist()
             )
-            return VerificationResult(
-                sequence_id=seq.seq_id,
-                target_token_ids=tuple(token_ids),
-                metadata={
-                    "hybrid_cache_transaction_id": transaction.transaction_id,
-                    "hybrid_cache_request_id": seq.request_id,
-                    "verified_tokens": len(query_tokens),
-                    "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
-                },
-            )
+            results = []
+            offset = 0
+            for seq, query_tokens, output in zip(
+                batch.sequences, query_tokens_by_request, outputs
+            ):
+                transaction = transactions[seq.request_id]
+                token_ids = tuple(flat_token_ids[offset : offset + len(query_tokens)])
+                offset += len(query_tokens)
+                self._pending_verified_cache_transactions[seq.seq_id] = (
+                    transaction,
+                    seq.request_id,
+                    output,
+                    token_ids,
+                    int(transaction.original_states[seq.request_id].logical_length),
+                )
+                results.append(
+                    VerificationResult(
+                        sequence_id=seq.seq_id,
+                        target_token_ids=token_ids,
+                        metadata={
+                            "hybrid_cache_transaction_id": transaction.transaction_id,
+                            "hybrid_cache_request_id": seq.request_id,
+                            "verified_tokens": len(query_tokens),
+                            "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
+                            "tensor_batched": True,
+                            "verification_batch_size": len(batch.sequences),
+                        },
+                    )
+                )
+            self._record_qwen35_verification_batch(query_lengths)
+            return results
         except Exception:
-            if transaction.state.name == "ACTIVE":
-                self.hybrid_cache_manager.rollback(transaction)
+            for transaction in transactions.values():
+                if transaction.state.name == "ACTIVE":
+                    self.hybrid_cache_manager.rollback(transaction)
+            self.rollback_verified_cache(sequence_ids)
             raise
+
+    def _record_qwen35_verification_batch(self, query_lengths: list[int]) -> None:
+        stats = getattr(self, "_qwen35_verification_stats", None)
+        if stats is None:
+            stats = {
+                "calls": 0,
+                "max_batch_size": 0,
+                "tensor_batched_token_steps": 0,
+                "total_token_steps": 0,
+                "last_active_batch_sizes": (),
+            }
+            self._qwen35_verification_stats = stats
+        active_batch_sizes = tuple(
+            sum(query_length > token_index for query_length in query_lengths)
+            for token_index in range(max(query_lengths))
+        )
+        stats["calls"] += 1
+        stats["max_batch_size"] = max(
+            stats["max_batch_size"],
+            max(active_batch_sizes, default=0),
+        )
+        stats["tensor_batched_token_steps"] += sum(
+            batch_size > 1 for batch_size in active_batch_sizes
+        )
+        stats["total_token_steps"] += len(active_batch_sizes)
+        stats["last_active_batch_sizes"] = active_batch_sizes
+
+    def get_qwen35_verification_stats(self) -> dict:
+        stats = getattr(self, "_qwen35_verification_stats", None)
+        if stats is None:
+            return {
+                "calls": 0,
+                "max_batch_size": 0,
+                "tensor_batched_token_steps": 0,
+                "total_token_steps": 0,
+                "last_active_batch_sizes": (),
+            }
+        return dict(stats)
 
     def commit_verified_cache(self, accepted_lengths_by_sequence: dict[int, int]) -> None:
         if self.hybrid_cache_manager is None:

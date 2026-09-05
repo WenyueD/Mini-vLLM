@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from myvllm.engine.hybrid_cache import (
     HybridCacheManager,
+    HybridCacheTransaction,
     HybridRequestState,
     LinearLayerState,
 )
@@ -222,32 +223,86 @@ class Qwen35Attention(nn.Module):
             raise NotImplementedError(
                 "cached Qwen3.5 full attention currently supports B=1 step decode"
             )
+        return self.forward_with_cache_batch(
+            hidden_states,
+            position_embeddings,
+            [request_state],
+        )
+
+    def forward_with_cache_batch(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        request_states: list[HybridRequestState],
+    ) -> torch.Tensor:
+        batch_size, query_length, _ = hidden_states.shape
+        if query_length != 1:
+            raise ValueError(
+                "cached Qwen3.5 attention batch expects one token per request"
+            )
+        if len(request_states) != batch_size:
+            raise ValueError("cached attention state count must match batch size")
         query_states, key_states, value_states, gate = self._project(
             hidden_states, position_embeddings
         )
-        previous = request_state.full_attention_layers.get(self.layer_idx)
-        if previous is None:
-            cached_key = key_states
-            cached_value = value_states
-        else:
-            cached_key = torch.cat([previous[0], key_states], dim=1)
-            cached_value = torch.cat([previous[1], value_states], dim=1)
-        request_state.full_attention_layers[self.layer_idx] = (
-            cached_key.detach().clone(),
-            cached_value.detach().clone(),
+        cached_rows = []
+        context_lengths = []
+        for row, request_state in enumerate(request_states):
+            previous = request_state.full_attention_layers.get(self.layer_idx)
+            row_key = key_states[row : row + 1]
+            row_value = value_states[row : row + 1]
+            if previous is not None:
+                row_key = torch.cat([previous[0], row_key], dim=1)
+                row_value = torch.cat([previous[1], row_value], dim=1)
+            request_state.full_attention_layers[self.layer_idx] = (
+                row_key.detach().clone(),
+                row_value.detach().clone(),
+            )
+            cached_rows.append((row_key, row_value))
+            context_lengths.append(row_key.shape[1])
+
+        max_context_length = max(context_lengths)
+        padded_key = key_states.new_zeros(
+            batch_size,
+            max_context_length,
+            self.num_kv_heads,
+            self.head_dim,
         )
+        padded_value = value_states.new_zeros(
+            batch_size,
+            max_context_length,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        valid_positions = torch.zeros(
+            batch_size,
+            max_context_length,
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        for row, ((row_key, row_value), context_length) in enumerate(
+            zip(cached_rows, context_lengths)
+        ):
+            padded_key[row, :context_length] = row_key[0]
+            padded_value[row, :context_length] = row_value[0]
+            valid_positions[row, :context_length] = True
+
         query_states = query_states.transpose(1, 2)
-        cached_key = cached_key.transpose(1, 2)
-        cached_value = cached_value.transpose(1, 2)
+        padded_key = padded_key.transpose(1, 2)
+        padded_value = padded_value.transpose(1, 2)
         if self.num_key_value_groups > 1:
-            cached_key = cached_key.repeat_interleave(self.num_key_value_groups, dim=1)
-            cached_value = cached_value.repeat_interleave(
+            padded_key = padded_key.repeat_interleave(self.num_key_value_groups, dim=1)
+            padded_value = padded_value.repeat_interleave(
                 self.num_key_value_groups, dim=1
             )
-        scores = torch.matmul(query_states, cached_key.transpose(2, 3)) * self.scaling
+        scores = torch.matmul(query_states, padded_key.transpose(2, 3)) * self.scaling
+        scores = scores.masked_fill(
+            ~valid_positions[:, None, None, :],
+            -torch.inf,
+        )
         probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(probs, cached_value).transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(1, 1, -1)
+        attn_output = torch.matmul(probs, padded_value).transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, 1, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
 
@@ -478,9 +533,24 @@ class Qwen35TextModel(nn.Module):
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         if input_id.numel() != 1:
             raise ValueError("cached Qwen3.5 target step expects exactly one token")
-        input_ids = input_id.reshape(1, 1)
+        return self.forward_cached_batch_step(
+            input_id.reshape(1),
+            [request_state],
+            hidden_tap_layers=hidden_tap_layers,
+        )
+
+    def forward_cached_batch_step(
+        self,
+        input_ids: torch.Tensor,
+        request_states: list[HybridRequestState],
+        hidden_tap_layers: tuple[int, ...] | None = None,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        input_ids = input_ids.reshape(-1, 1)
+        batch_size = input_ids.shape[0]
+        if not request_states or len(request_states) != batch_size:
+            raise ValueError("cached target state count must match non-empty batch")
         position_ids = torch.tensor(
-            [[request_state.logical_length]],
+            [[request_state.logical_length] for request_state in request_states],
             dtype=torch.long,
             device=input_ids.device,
         )
@@ -492,24 +562,33 @@ class Qwen35TextModel(nn.Module):
             residual = hidden_states
             normed = layer.input_layernorm(hidden_states)
             if layer.block_type == "linear_attention":
-                previous = request_state.linear_layers.get(layer_idx)
-                if previous is None:
-                    attn_out, recurrent, conv = layer.linear_attn(
-                        normed, return_final_state=True
-                    )
-                else:
-                    attn_out, recurrent, conv = layer.linear_attn(
-                        normed,
-                        recurrent_state=previous.recurrent_state,
-                        conv_state=previous.conv_state,
-                        return_final_state=True,
-                    )
-                request_state.linear_layers[layer_idx] = LinearLayerState(
-                    recurrent, conv
+                recurrent_rows = []
+                conv_rows = []
+                for request_state in request_states:
+                    previous = request_state.linear_layers.get(layer_idx)
+                    if previous is None:
+                        recurrent, conv = layer.linear_attn.initial_state(
+                            1, normed.device, normed.dtype
+                        )
+                    else:
+                        recurrent = previous.recurrent_state
+                        conv = previous.conv_state
+                    recurrent_rows.append(recurrent)
+                    conv_rows.append(conv)
+                attn_out, recurrent, conv = layer.linear_attn(
+                    normed,
+                    recurrent_state=torch.cat(recurrent_rows, dim=0),
+                    conv_state=torch.cat(conv_rows, dim=0),
+                    return_final_state=True,
                 )
+                for row, request_state in enumerate(request_states):
+                    request_state.linear_layers[layer_idx] = LinearLayerState(
+                        recurrent[row : row + 1].detach().clone(),
+                        conv[row : row + 1].detach().clone(),
+                    )
             else:
-                attn_out = layer.self_attn.forward_with_cache(
-                    normed, position_embeddings, request_state
+                attn_out = layer.self_attn.forward_with_cache_batch(
+                    normed, position_embeddings, request_states
                 )
             hidden_states = residual + attn_out
             residual = hidden_states
@@ -517,7 +596,8 @@ class Qwen35TextModel(nn.Module):
             hidden_states = residual + layer.mlp(hidden_states)
             if layer_idx in taps:
                 hidden_taps[layer_idx] = hidden_states.detach().clone()
-        request_state.logical_length += 1
+        for request_state in request_states:
+            request_state.logical_length += 1
         return self.norm(hidden_states), hidden_taps
 
 
@@ -630,3 +710,95 @@ class Qwen35ForCausalLM(nn.Module):
                 None if transaction is None else transaction.transaction_id
             ),
         )
+
+    def forward_with_cache_batch(
+        self,
+        input_ids: torch.Tensor,
+        query_lengths: list[int] | tuple[int, ...],
+        cache_manager: HybridCacheManager,
+        request_ids: list[str] | tuple[str, ...],
+        *,
+        transactions: Mapping[str, HybridCacheTransaction] | None = None,
+        capture_hidden_taps: bool = False,
+        hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
+    ) -> list[Qwen35ForwardOutput]:
+        """Run ragged request queries with a tensor batch at each token position."""
+        reject_qwen35_multimodal_inputs()
+        if input_ids.dim() != 2:
+            raise ValueError(
+                "batched cached target input_ids must have shape [batch, max_query]"
+            )
+        batch_size, max_query_length = input_ids.shape
+        if len(request_ids) != batch_size or len(query_lengths) != batch_size:
+            raise ValueError("batched cached target metadata must match batch size")
+        if any(length <= 0 or length > max_query_length for length in query_lengths):
+            raise ValueError("query lengths must be within the padded input width")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("batched cached target request IDs must be unique")
+        if transactions is not None and any(
+            request_id not in transactions for request_id in request_ids
+        ):
+            raise ValueError("batched cached target is missing a request transaction")
+
+        request_states = [cache_manager.ensure_request(rid) for rid in request_ids]
+        taps = hidden_tap_layers if capture_hidden_taps else ()
+        logits_by_request: list[list[torch.Tensor]] = [[] for _ in request_ids]
+        hidden_by_request: list[list[torch.Tensor]] = [[] for _ in request_ids]
+        taps_by_request: list[dict[int, list[torch.Tensor]]] = [
+            {layer_id: [] for layer_id in taps} for _ in request_ids
+        ]
+        for token_index in range(max(query_lengths)):
+            active_rows = [
+                row
+                for row, query_length in enumerate(query_lengths)
+                if token_index < query_length
+            ]
+            active_indices = torch.tensor(
+                active_rows,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            hidden, hidden_taps = self.model.forward_cached_batch_step(
+                input_ids.index_select(0, active_indices)[:, token_index],
+                [request_states[row] for row in active_rows],
+                hidden_tap_layers=taps,
+            )
+            step_logits = self.compute_logits(hidden)
+            for active_row, request_row in enumerate(active_rows):
+                hidden_by_request[request_row].append(
+                    hidden[active_row : active_row + 1]
+                )
+                logits_by_request[request_row].append(
+                    step_logits[active_row : active_row + 1]
+                )
+                for layer_id, value in hidden_taps.items():
+                    taps_by_request[request_row][layer_id].append(
+                        value[active_row : active_row + 1]
+                    )
+                if transactions is not None:
+                    transaction = transactions[request_ids[request_row]]
+                    cache_manager.record_snapshot(
+                        transaction,
+                        request_ids[request_row],
+                        tokens_executed=token_index + 1,
+                        state=request_states[request_row],
+                    )
+
+        outputs = []
+        for row, request_id in enumerate(request_ids):
+            transaction = None if transactions is None else transactions[request_id]
+            outputs.append(
+                Qwen35ForwardOutput(
+                    logits=torch.cat(logits_by_request[row], dim=1),
+                    hidden_states=torch.cat(hidden_by_request[row], dim=1),
+                    hidden_taps={
+                        layer_id: torch.cat(values, dim=1)
+                        for layer_id, values in taps_by_request[row].items()
+                        if values
+                    },
+                    cache_transaction_id=(
+                        None if transaction is None else transaction.transaction_id
+                    ),
+                )
+            )
+        return outputs

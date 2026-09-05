@@ -27,7 +27,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_offline_b1_20260905.log` has exact target-only/DFlash2 equality for 32 tokens, `proposed=143`, `accepted=8`, acceptance `0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`; verified over SSH. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
-| B>1 performance | PENDING | Heterogeneous B=2 correctness passed, but the current request-isolated serial model path took 20.89s versus 6.70s target-only. DFlash2 stage timing attributes 19.43s to target verification and 0.65s to proposal, so tensor-batched cached target verification is the next optimization target. |
+| B>1 performance | PENDING GPU rerun | The pre-optimization heterogeneous B=2 run took 20.89s versus 6.70s target-only, with 19.43s in verification and 0.65s in proposal. Request-dimension tensor-batched cached verification is implemented and locally equivalent to serial logits/cache state; rerun the GPU smoke to measure it. |
 
 ## Local Changes
 
