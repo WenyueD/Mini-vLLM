@@ -5,7 +5,6 @@ import gc
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -206,18 +205,12 @@ def run_online(
             max_model_length=config["max_model_length"],
         )
         request_ids = [f"{label}-online-b2-{index}" for index in range(2)]
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [
-                pool.submit(
-                    online.submit,
-                    prompt,
-                    params,
-                    request_id,
-                    args.timeout,
-                )
-                for prompt, request_id in zip(prompts, request_ids)
-            ]
-            handles = [future.result(timeout=args.timeout) for future in futures]
+        handles = online.submit_batch(
+            prompts,
+            params,
+            request_ids=request_ids,
+            timeout=args.timeout,
+        )
 
         started = time.time()
         results = [

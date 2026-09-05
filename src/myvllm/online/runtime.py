@@ -129,6 +129,43 @@ class OnlineEngine:
         )
         return future.result(timeout=timeout)
 
+    def submit_batch(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        request_ids: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> list[OnlineRequest]:
+        """Atomically admit a batch before the engine advances a scheduler step."""
+        self._require_running()
+        if not prompts:
+            raise ValueError("submit_batch requires at least one prompt")
+        if request_ids is None:
+            request_ids = [f"online-{uuid.uuid4().hex}" for _ in prompts]
+        if len(request_ids) != len(prompts):
+            raise ValueError("request_ids must match the number of prompts")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("request_ids must be unique within a batch")
+
+        future = Future()
+        self._commands.put(
+            _Command(
+                "add_batch",
+                {
+                    "requests": [
+                        {
+                            "prompt": prompt,
+                            "sampling_params": sampling_params,
+                            "request_id": request_id,
+                        }
+                        for prompt, request_id in zip(prompts, request_ids)
+                    ]
+                },
+                future,
+            )
+        )
+        return future.result(timeout=timeout)
+
     def abort(self, request_id: str, timeout: float | None = None) -> bool:
         self._require_running()
         future = Future()
@@ -205,13 +242,20 @@ class OnlineEngine:
     def _handle_command(self, command: _Command) -> bool:
         try:
             if command.kind == "add":
-                request_id = self.engine.add_request(**command.payload)
-                output_queue: queue.Queue[RequestOutput] = queue.Queue()
-                self._channels[request_id] = output_queue
+                handle = self._admit_request(command.payload)
                 self._submitted_requests += 1
-                handle = OnlineRequest(self, request_id, output_queue)
-                self._update_status(request_id)
                 command.future.set_result(handle)
+                return False
+            if command.kind == "add_batch":
+                handles: list[OnlineRequest] = []
+                try:
+                    for payload in command.payload["requests"]:
+                        handles.append(self._admit_request(payload))
+                except BaseException:
+                    self._rollback_admission(handles)
+                    raise
+                self._submitted_requests += len(handles)
+                command.future.set_result(handles)
                 return False
             if command.kind == "abort":
                 request_id = command.payload["request_id"]
@@ -278,6 +322,22 @@ class OnlineEngine:
             return False
         finally:
             self._refresh_snapshots()
+
+    def _admit_request(self, payload: dict[str, Any]) -> OnlineRequest:
+        request_id = self.engine.add_request(**payload)
+        output_queue: queue.Queue[RequestOutput] = queue.Queue()
+        self._channels[request_id] = output_queue
+        self._update_status(request_id)
+        return OnlineRequest(self, request_id, output_queue)
+
+    def _rollback_admission(self, handles: list[OnlineRequest]) -> None:
+        for handle in handles:
+            request_id = handle.request_id
+            self.engine.abort_request(request_id)
+            self.engine.forget_request(request_id)
+            self._channels.pop(request_id, None)
+            with self._snapshot_lock:
+                self._statuses.pop(request_id, None)
 
     def _publish_step(self, outputs: tuple[RequestOutput, ...]) -> None:
         for output in outputs:

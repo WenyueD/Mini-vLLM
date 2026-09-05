@@ -74,6 +74,42 @@ def test_online_runtime_streams_committed_tokens_and_matches_final_state(specula
         online.close()
 
 
+def test_submit_batch_admits_all_requests_before_first_engine_step():
+    engine = make_engine(speculative=False)
+    online = OnlineEngine(engine, close_engine=False)
+    online.start()
+    try:
+        handles = online.submit_batch(
+            ["1,2,3", "4,5"],
+            SamplingParams(temperature=0, max_tokens=4, ignore_eos=True),
+            request_ids=["batch-a", "batch-b"],
+        )
+        outputs = [consume(handle) for handle in handles]
+
+        assert all(items[-1].finished for items in outputs)
+        assert any(
+            step["active_batch_size"] == 2
+            for step in online.stats()["recent_decode_steps"]
+        )
+    finally:
+        online.close()
+
+
+def test_submit_batch_rejects_invalid_request_ids_before_admission():
+    engine = make_engine(speculative=False)
+    online = OnlineEngine(engine, close_engine=False)
+    online.start()
+    try:
+        params = SamplingParams(temperature=0, max_tokens=1)
+        with pytest.raises(ValueError, match="match the number"):
+            online.submit_batch(["1", "2"], params, request_ids=["only-one"])
+        with pytest.raises(ValueError, match="unique"):
+            online.submit_batch(["1", "2"], params, request_ids=["same", "same"])
+        assert not engine.requests
+    finally:
+        online.close()
+
+
 def test_consumed_terminal_requests_have_bounded_retention_and_no_kv_leak():
     engine = make_engine(speculative=False)
     online = OnlineEngine(engine, close_engine=False, max_terminal_history=17)
