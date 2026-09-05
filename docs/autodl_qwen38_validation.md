@@ -285,6 +285,15 @@ Both runs matched target-only token IDs exactly and reached shared target and
 speculative batch size 2. The heterogeneous log is
 `logs/dflash2_online_b2_heterogeneous_20260905.log`.
 
+The tensor-batched verifier rerun is recorded in
+`logs/dflash2_online_b2_tensor_batched_clean_20260905.log`. It passed exact
+target-only equality again and reported `max_batch_size=2`, 108
+`tensor_batched_token_steps`, `236 proposed / 24 accepted`, and a peak allocation
+of 71.99 GiB. Cached verification improved from 19.43s to 12.95s (33.3%), while
+total DFlash2 generation improved from 20.89s to 14.43s (30.9%). The latest
+target-only generation took 7.19s. No exception or residual GPU process was
+observed after shutdown.
+
 ## DFlash2 Oracle Proposal Alignment
 
 Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query
@@ -382,12 +391,12 @@ pytest -q --basetemp ./.pytest-tmp \
   tests/test_dflash2_contract.py
 ```
 
-The current unit-test pass is not a real Qwen/Qwen3.8-27B target-only GPU
-acceptance result.  Mark 27B load, 32-token greedy decode, official target token
-alignment, and cache-vs-recompute logits as pending until a dedicated smoke run
-records those artifacts under `results/qwen38_target/`.
+The heterogeneous B=2 GPU run above is the acceptance result for tensor-batched
+cached verification. It does not resolve Oracle proposal alignment, which stays
+pending until the Oracle target-only and DFlash outputs are target-lossless for
+the same prompt and configuration.
 
 The local Windows audit on 2026-09-02 used the repository `.venv` and
 `--basetemp ./.pytest-tmp` because the default user temp directory denied pytest
-access. The latest local regression at that point was `80 passed, 2 skipped`;
-GPU-only tests were skipped locally.
+access. The latest local regression is `111 passed, 2 skipped`; focused AutoDL
+tests report `20 passed`.

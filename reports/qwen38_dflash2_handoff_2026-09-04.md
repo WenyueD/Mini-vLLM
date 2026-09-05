@@ -4,7 +4,9 @@
 
 This handoff starts from clean HEAD `584391f` (`Dump Oracle DFlash speculator runtime debug`) in `D:\LLM项目\MinivLLM`.
 
-This local turn did not run AutoDL/GPU validation. It audited the current Mini-vLLM DFlash2 code path, pinned deterministic selector/cache semantics, and fixed draft-cache proposal transaction handling so rejected or failed proposals cannot leave provisional length state behind.
+This work audited the Mini-vLLM DFlash2 code path, pinned deterministic
+selector/cache semantics, fixed draft-cache transaction handling, and completed
+AutoDL GPU validation of request-dimension tensor-batched target verification.
 
 ## Evidence Matrix
 
@@ -17,7 +19,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Mini DFlash2 target-hidden fallback cache | PASS local | `DFlash2DraftCache.update_target_context()` now records the actual clipped target-hidden context length and stores sliding-window hidden taps. This remains a correctness fallback, not the final high-performance official per-layer draft KV cache. |
 | Proposal rollback/commit semantics | PASS local | `DFlash2DraftCache.begin_proposal()`, `commit_proposal()`, and `rollback_proposal()` now snapshot provisional proposal length. Standalone proposer failures roll back, runner proposal exceptions roll back, and verified commit reconciles to accepted target context length. |
 | Local DFlash2 contract tests | PASS local | `24 passed` after this change. |
-| Local regression | PASS local | `106 passed, 2 skipped`; `compileall` passed. |
+| Local regression | PASS local | `111 passed, 2 skipped`; `compileall` passed. Focused AutoDL tests report `20 passed`. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
@@ -27,7 +29,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_offline_b1_20260905.log` has exact target-only/DFlash2 equality for 32 tokens, `proposed=143`, `accepted=8`, acceptance `0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`; verified over SSH. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
-| B>1 performance | PENDING GPU rerun | The pre-optimization heterogeneous B=2 run took 20.89s versus 6.70s target-only, with 19.43s in verification and 0.65s in proposal. Request-dimension tensor-batched cached verification is implemented and locally equivalent to serial logits/cache state; rerun the GPU smoke to measure it. |
+| B>1 tensor-batched verification | PASS remote/log-verified | The clean heterogeneous B=2 run `logs/dflash2_online_b2_tensor_batched_clean_20260905.log` matched target-only IDs exactly. Verification recorded `max_batch_size=2` and 108 tensor-batched token steps. Verification fell from 19.43s to 12.95s (33.3%); total DFlash2 generation fell from 20.89s to 14.43s (30.9%). The latest target-only run took 7.19s and peak allocation was 71.99 GiB. |
 
 ## Local Changes
 

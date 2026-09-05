@@ -115,20 +115,28 @@ can be audited and loaded, standalone block proposal can be run, and multiple
 requests can share an engine scheduler batch. Cached target verification now
 forms a real request-dimension tensor batch at each active query-token position;
 ordinary target decode and DFlash2 proposal remain request-serial. Oracle
-proposal-ID alignment and fresh GPU performance runs remain required before
-broader claims.
+proposal-ID alignment remains required before broader claims.
 
 ## GPU Validation
 
-Real Qwen/Qwen3.8-27B validation remains pending in this local run. The minimum
-acceptance command should load the local checkpoint, force eager execution, run one
-short greedy prompt for prefill plus at least 32 decode tokens, and save:
+AutoDL A800 validation on 2026-09-05 passed a heterogeneous B=2 online run with
+the real Qwen/Qwen3.8-27B target. Both requests matched target-only token IDs for
+32 generated tokens. Verification reported `max_batch_size=2` and 108
+`tensor_batched_token_steps` out of 166 request-token steps. The clean run is in
+`logs/dflash2_online_b2_tensor_batched_clean_20260905.log`.
+
+Compared with the pre-optimization heterogeneous run, cached verification fell
+from 19.43s to 12.95s (33.3%) and total DFlash2 generation fell from 20.89s to
+14.43s (30.9%). The latest target-only run took 7.19s. Peak allocated memory was
+71.99 GiB. The validation records:
 
 - startup arguments and environment manifest;
 - GPU name, available memory, and peak allocated memory;
 - generated token IDs, with tie-aware argmax diagnostics;
-- cache decode versus no-cache/reference logits for the first few steps;
-- TTFT and preliminary TPOT.
+- `236 proposed / 24 accepted`, acceptance `0.1016949152542373`;
+- per-request accepted counts of 8 and 16;
+- shared target and speculative batch size 2;
+- no shutdown exception or residual GPU process.
 
-Do not mark batch or dynamic batching as passed until those paths are explicitly
-run on the target GPU.
+Oracle proposal alignment remains `PENDING` because the available Oracle fixture
+is not target-lossless.
