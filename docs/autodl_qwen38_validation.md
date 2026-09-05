@@ -274,6 +274,14 @@ The default submits two identical `Hello` prompts. The pass marker is
 equality, `active_batch_size >= 2`, `speculative_batch_size >= 2`, proposals for
 both requests in a shared step, and at least one accepted draft token per request.
 
+AutoDL A800 validation on 2026-09-05 passed both same-prompt and heterogeneous
+B=2 runs. The same-prompt run recorded `286 proposed / 16 accepted`; the
+heterogeneous `Hello` plus `The capital of France is` run recorded
+`236 proposed / 24 accepted`, with per-request accepted counts of 8 and 16.
+Both runs matched target-only token IDs exactly and reached shared target and
+speculative batch size 2. The heterogeneous log is
+`logs/dflash2_online_b2_heterogeneous_20260905.log`.
+
 ## DFlash2 Oracle Proposal Alignment
 
 Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query
