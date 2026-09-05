@@ -48,6 +48,14 @@ def parse_args() -> argparse.Namespace:
         help="Prompt to submit; pass exactly twice. Defaults to two identical Hello prompts.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        choices=range(1, 8),
+        default=7,
+        metavar="K",
+        help="Maximum DFlash2 proposal length (1-7).",
+    )
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--target-cache-memory-fraction", type=float, default=0.02)
@@ -115,7 +123,7 @@ def build_config(
             "speculative_config": {
                 "enabled": speculative,
                 "proposer": "dflash2" if speculative else "ngram",
-                "num_speculative_tokens": 7,
+                "num_speculative_tokens": args.num_speculative_tokens,
                 "draft_model_name_or_path": args.draft_model,
             },
         }
@@ -284,6 +292,7 @@ def main() -> None:
     print(f"prompts={prompts!r}", flush=True)
     print(f"prompt_token_ids={prompt_token_ids}", flush=True)
     print(f"max_new_tokens={args.max_new_tokens}", flush=True)
+    print(f"num_speculative_tokens={args.num_speculative_tokens}", flush=True)
     print(f"max_model_length={max_model_length}", flush=True)
     print_cuda_memory("before_runs", device)
 
@@ -350,6 +359,9 @@ def main() -> None:
     print(f"dflash2_proposed_tokens={speculative['proposed_tokens']}", flush=True)
     print(f"dflash2_accepted_tokens={speculative['accepted_tokens']}", flush=True)
     print(f"dflash2_acceptance_rate={speculative['acceptance_rate']}", flush=True)
+    print(
+        f"dflash2_num_speculative_tokens={args.num_speculative_tokens}", flush=True
+    )
     print("dflash2_online_b2=PASS", flush=True)
     print("dflash2_oracle_alignment=PENDING", flush=True)
 

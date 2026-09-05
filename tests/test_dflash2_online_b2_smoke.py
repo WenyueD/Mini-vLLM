@@ -1,4 +1,16 @@
-from scripts.smoke_qwen38_dflash2_online_b2 import batch_evidence
+import sys
+
+from scripts.smoke_qwen38_dflash2_online_b2 import batch_evidence, parse_args
+
+
+def test_smoke_accepts_configurable_speculative_length(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke_qwen38_dflash2_online_b2.py", "--num-speculative-tokens", "3"],
+    )
+
+    assert parse_args().num_speculative_tokens == 3
 
 
 def test_batch_evidence_aggregates_shared_batch_and_per_request_acceptance():
