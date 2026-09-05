@@ -1,5 +1,7 @@
-import torch
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from myvllm.models.qwen3_8 import (
     Qwen35ForCausalLM,
@@ -16,6 +18,7 @@ from myvllm.models.qwen3_8_config import (
 )
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.spec_decode.types import Proposal, SpecDecodeBatch
+from myvllm.spec_decode.dflash2 import DFlash2DraftCache, ProposalBatch
 from myvllm.engine.sequence import Sequence
 
 
@@ -303,3 +306,170 @@ def test_qwen35_spec_verifier_records_transaction_and_commits_accepted_prefix():
         replay_cache.get_request_state("req0"),
     )
     seq.rollback(tx)
+
+
+def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    cache = HybridCacheManager()
+    prefixes = {
+        "req0": [1, 2, 3],
+        "req1": [10, 11, 12],
+    }
+    for request_id, prefix in prefixes.items():
+        model.forward_with_cache(torch.tensor(prefix), cache, request_id)
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.hybrid_cache_manager = cache
+    runner.is_qwen35_target = True
+    runner.rank = 0
+    runner.config = {"capture_verification_hidden_taps": True}
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+    runner._pending_verified_cache_transactions = {}
+
+    seq0 = Sequence(
+        [1, 2, 3, 4],
+        4,
+        SamplingParams(temperature=0, max_tokens=16),
+        request_id="req0",
+    )
+    seq1 = Sequence(
+        [10, 11, 12, 13],
+        4,
+        SamplingParams(temperature=0, max_tokens=16),
+        request_id="req1",
+    )
+    for seq in (seq0, seq1):
+        seq.mark_computed(3)
+    tx0 = seq0.begin_speculation([5, 6])
+    tx1 = seq1.begin_speculation([14])
+    batch = SpecDecodeBatch(
+        [seq0, seq1],
+        [Proposal(seq0.seq_id, (5, 6)), Proposal(seq1.seq_id, (14,))],
+    )
+
+    results = runner.verify(batch)
+
+    assert [result.sequence_id for result in results] == [seq0.seq_id, seq1.seq_id]
+    assert [result.metadata["verified_tokens"] for result in results] == [3, 2]
+    assert set(runner._pending_verified_cache_transactions) == {
+        seq0.seq_id,
+        seq1.seq_id,
+    }
+
+    runner.commit_verified_cache({seq0.seq_id: 2, seq1.seq_id: 1})
+    expected_prefixes = {
+        "req0": [1, 2, 3, 4, 5],
+        "req1": [10, 11, 12, 13],
+    }
+    for request_id, expected_prefix in expected_prefixes.items():
+        replay_cache = HybridCacheManager()
+        model.forward_with_cache(
+            torch.tensor(expected_prefix), replay_cache, request_id
+        )
+        assert_cache_state_equal(
+            cache.get_request_state(request_id),
+            replay_cache.get_request_state(request_id),
+        )
+
+    seq0.rollback(tx0)
+    seq1.rollback(tx1)
+
+
+def test_qwen35_cached_runner_preserves_batched_request_order():
+    calls = []
+
+    class FakeModel:
+        def forward_with_cache(
+            self, input_ids, _cache_manager, request_id, capture_hidden_taps=False
+        ):
+            calls.append((request_id, input_ids.tolist(), capture_hidden_taps))
+            logits = torch.zeros(1, len(input_ids), 32)
+            logits[:, -1, 7 if request_id == "req0" else 9] = 1
+            return SimpleNamespace(logits=logits, hidden_taps={})
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = FakeModel()
+    runner.hybrid_cache_manager = HybridCacheManager()
+    runner.is_qwen35_target = True
+    runner.dflash2_draft_model = None
+    runner.rank = 0
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+    runner.prepare_prefill = lambda seqs: torch.tensor(seqs[0].token_ids)
+    runner.prepare_sample = lambda seqs: torch.zeros(len(seqs))
+
+    seqs = [
+        Sequence([1, 2], request_id="req0"),
+        Sequence([3, 4], request_id="req1"),
+    ]
+
+    token_ids = runner.run(seqs, is_prefill=True)
+
+    assert token_ids.tolist() == [7, 9]
+    assert calls == [
+        ("req0", [1, 2], False),
+        ("req1", [3, 4], False),
+    ]
+
+
+def test_runner_dflash2_b2_proposals_rollback_as_one_batch_on_failure():
+    class FakeDraft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(
+                num_speculative_tokens=7,
+                sliding_window=16,
+            )
+            self.calls = 0
+
+        def forward_block(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second request failed")
+            return (
+                ProposalBatch(
+                    token_ids=torch.tensor([[20, 21, 22]]),
+                    valid_lengths=torch.tensor([3]),
+                ),
+                {},
+            )
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.dflash2_draft_model = FakeDraft()
+    runner.dflash2_draft_cache = DFlash2DraftCache(sliding_window=16)
+    runner.config = {"dflash2_debug_metadata": False}
+    runner.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=object()),
+        lm_head=object(),
+    )
+    seqs = [
+        Sequence([1], request_id="req0"),
+        Sequence([2], request_id="req1"),
+    ]
+    runner._dflash2_contexts = {
+        seq.seq_id: {
+            "request_id": seq.request_id,
+            "anchor_token_id": seq.last_token,
+            "anchor_position": 1,
+            "hidden_taps": {5: torch.zeros(1, 1, 1)},
+        }
+        for seq in seqs
+    }
+    for seq in seqs:
+        runner.dflash2_draft_cache.update_target_context(
+            seq.request_id,
+            {5: torch.zeros(1, 1, 1)},
+            seq.last_token,
+            1,
+        )
+
+    with pytest.raises(RuntimeError, match="second request failed"):
+        runner.propose_dflash2(seqs, [2, 2])
+
+    assert runner.dflash2_draft_cache.lengths_by_request == {
+        "req0": 1,
+        "req1": 1,
+    }
+    assert runner.dflash2_draft_cache._proposal_length_snapshots_by_request == {}

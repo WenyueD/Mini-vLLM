@@ -6,14 +6,15 @@ whose language model lives under nested `text_config`.
 
 ## Current Boundary
 
-- Supported: text-only target execution, greedy correctness scaffolding, B=1
-  eager cached target steps, Qwen3.5/Qwen3.8 config parsing, weight mapping
-  validation, hidden taps, hybrid cache transaction semantics, and B=1 DFlash2
-  draft execution behind the speculative verifier.
-- Not claimed: multimodal inputs, production dynamic batching, CUDA Graph
-  optimization for verification, fresh B=1 validation after DFlash2
-  anchor/context/selector fixes, Oracle proposal-ID alignment, or performance
-  numbers.
+- Supported: text-only target execution, greedy correctness scaffolding,
+  request-isolated eager cached target steps, Qwen3.5/Qwen3.8 config parsing,
+  weight mapping validation, hidden taps, hybrid cache transaction semantics,
+  and DFlash2 draft execution behind the speculative verifier. Multiple requests
+  can share one scheduler batch while target, proposal, and verification model
+  calls execute per request against isolated cache state.
+- Not claimed: multimodal inputs, tensor-batched Qwen3.5/Qwen3.8 cached model
+  execution, production dynamic batching, CUDA Graph optimization for
+  verification, Oracle proposal-ID alignment, or performance numbers.
 - Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
   `video_grid_thw` are rejected explicitly.
 - Target cache sizing can be constrained with `target_cache_memory_fraction` or
@@ -42,7 +43,7 @@ whose language model lives under nested `text_config`.
 `HybridCacheManager` owns request-scoped state:
 
 - `full_attention_layers[layer_id]`: appended K/V tensors for full-attention
-  layers in the B=1 eager path.
+  layers in each request's eager path.
 - `linear_layers[layer_id]`: GDN recurrent state and causal convolution state.
 - `logical_length`: committed target prefix length for that request.
 
@@ -76,7 +77,7 @@ For the next DFlash2 stage, target verification should call the target with:
 - token IDs: the current mandatory target token plus up to K proposal tokens;
 - K currently expected up to 7 proposals;
 - `capture_hidden_taps=True` when DFlash2 hidden features are needed;
-- `hidden_taps[layer_id]` shaped `[1, query_tokens, hidden_size]` for B=1;
+- `hidden_taps[layer_id]` shaped `[1, query_tokens, hidden_size]` per request;
 - logits shaped `[1, query_tokens, vocab_size]`.
 
 The HTTP/online layer should continue to depend only on target logits and emitted
@@ -110,11 +111,11 @@ token IDs; DFlash2-specific metadata belongs below the runner/coordinator bounda
   standalone proposal, and verifier-commit context refresh.
 
 This path is still not a production DFlash2 integration. The draft checkpoint
-can be audited and loaded, and standalone block proposal can be run. Earlier
-offline/online B=1 smokes passed on AutoDL by user report, but they are stale
-after the DFlash2 anchor/context/selector fixes and must be rerun. Oracle
-proposal-ID alignment, batch execution, and performance runs remain required
-before broader claims.
+can be audited and loaded, standalone block proposal can be run, and multiple
+requests can share an engine scheduler batch with request-isolated serial model
+calls. Tensor-batched cached target/proposal/verification execution, Oracle
+proposal-ID alignment, and performance runs remain required before broader
+claims.
 
 ## GPU Validation
 

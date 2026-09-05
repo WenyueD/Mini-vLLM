@@ -247,7 +247,9 @@ class ModelRunner:
         if not self.is_qwen35_target:
             raise ValueError("DFlash2 proposer requires a Qwen3.5/Qwen3.8 target")
         if self.world_size != 1:
-            raise NotImplementedError("DFlash2 integration currently supports B=1/world_size=1")
+            raise NotImplementedError(
+                "DFlash2 integration currently supports world_size=1"
+            )
         draft_path = (
             spec_config.get("draft_model_name_or_path")
             or self.config.get("dflash2_model_name_or_path")
@@ -711,30 +713,37 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if getattr(self, "is_qwen35_target", False):
             try:
-                if len(seqs) != 1:
-                    raise NotImplementedError(
-                        "Qwen3.5/Qwen3.8 cached target runner currently supports B=1"
+                sampled_tokens = []
+                for seq in seqs:
+                    if is_prefill:
+                        input_ids = self.prepare_prefill([seq])
+                    else:
+                        input_ids = self.prepare_decode([seq])
+                    output = self.model.forward_with_cache(
+                        input_ids.reshape(-1),
+                        self.hybrid_cache_manager,
+                        seq.request_id,
+                        capture_hidden_taps=self.dflash2_draft_model is not None,
                     )
-                if is_prefill:
-                    input_ids = self.prepare_prefill(seqs)
-                else:
-                    input_ids = self.prepare_decode(seqs)
-                output = self.model.forward_with_cache(
-                    input_ids.reshape(-1),
-                    self.hybrid_cache_manager,
-                    seqs[0].request_id,
-                    capture_hidden_taps=self.dflash2_draft_model is not None,
-                )
-                logits = output.logits[:, -1, :]
-                token_ids = None
-                if self.rank == 0:
-                    token_ids = self.sampler(logits, self.prepare_sample(seqs))
+                    if self.rank != 0:
+                        continue
+                    logits = output.logits[:, -1, :]
+                    token_ids = self.sampler(logits, self.prepare_sample([seq]))
+                    token_ids = token_ids.reshape(-1)
+                    if token_ids.numel() != 1:
+                        raise RuntimeError(
+                            "Qwen3.5/Qwen3.8 per-request sampler returned "
+                            f"{token_ids.numel()} tokens"
+                        )
+                    sampled_tokens.append(token_ids)
                     self._store_dflash2_context_from_target_output(
-                        seqs[0],
+                        seq,
                         output,
                         int(token_ids.reshape(-1)[0].item()),
                     )
-                return token_ids
+                if self.rank != 0:
+                    return None
+                return torch.cat(sampled_tokens) if sampled_tokens else None
             finally:
                 reset_context()
         if is_prefill:
@@ -828,15 +837,25 @@ class ModelRunner:
     ) -> list[Proposal]:
         if self.dflash2_draft_model is None or self.dflash2_draft_cache is None:
             raise RuntimeError("DFlash2 draft model is not loaded")
-        if len(sequences) != 1:
-            raise NotImplementedError("DFlash2 proposer currently supports B=1")
-        seq = sequences[0]
+        if len(sequences) != len(max_tokens):
+            raise ValueError("sequence and proposer budget counts must match")
+        proposals = []
+        try:
+            for seq, max_token_count in zip(sequences, max_tokens):
+                proposals.append(self._propose_dflash2_one(seq, max_token_count))
+            return proposals
+        except Exception:
+            for seq in sequences:
+                self.dflash2_draft_cache.rollback_proposal(seq.request_id)
+            raise
+
+    def _propose_dflash2_one(self, seq: Sequence, max_tokens: int) -> Proposal:
         budget = min(
             self.dflash2_draft_model.config.num_speculative_tokens,
-            max(0, max_tokens[0]),
+            max(0, max_tokens),
         )
         if budget == 0:
-            return [Proposal(seq.seq_id, (), {"kind": "dflash2", "budget": 0})]
+            return Proposal(seq.seq_id, (), {"kind": "dflash2", "budget": 0})
         context = self._dflash2_contexts.get(seq.seq_id)
         if context is None or context["request_id"] != seq.request_id:
             raise RuntimeError(
@@ -870,7 +889,7 @@ class ModelRunner:
             if self.config.get("dflash2_debug_metadata", False):
                 metadata.update(debug)
             self.dflash2_draft_cache.advance(seq.request_id, valid_length)
-            return [Proposal(seq.seq_id, token_ids, metadata)]
+            return Proposal(seq.seq_id, token_ids, metadata)
         except Exception:
             self.dflash2_draft_cache.rollback_proposal(seq.request_id)
             raise
@@ -906,21 +925,28 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _verify_qwen35_cached(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
-        """Run Qwen3.5/Qwen3.8 B=1 verification through HybridCache snapshots."""
+        """Verify each Qwen3.5/Qwen3.8 request against its isolated cache."""
         if self.hybrid_cache_manager is None:
             raise RuntimeError("Qwen3.5/Qwen3.8 verifier requires HybridCacheManager")
-        if len(batch.sequences) != 1:
-            raise NotImplementedError(
-                "Qwen3.5/Qwen3.8 speculative verification currently supports B=1"
-            )
-        seq = batch.sequences[0]
-        proposal = batch.proposals[0]
+        sequence_ids = [seq.seq_id for seq in batch.sequences]
+        self.rollback_verified_cache(sequence_ids)
+        try:
+            return [
+                self._verify_qwen35_cached_one(seq, proposal)
+                for seq, proposal in zip(batch.sequences, batch.proposals)
+            ]
+        except Exception:
+            self.rollback_verified_cache(sequence_ids)
+            raise
+
+    def _verify_qwen35_cached_one(
+        self, seq: Sequence, proposal: Proposal
+    ) -> VerificationResult:
         if seq.num_tokens - seq.num_computed_tokens != 1:
             raise RuntimeError("verification requires exactly one pending token")
         if tuple(seq.provisional_token_ids) != proposal.token_ids:
             raise RuntimeError("sequence/proposal provisional state mismatch")
 
-        self.rollback_verified_cache([seq.seq_id])
         query_tokens = (seq.last_token, *proposal.token_ids)
         transaction = self.hybrid_cache_manager.begin_transaction(
             [seq.request_id],
@@ -940,7 +966,7 @@ class ModelRunner:
                 ),
             )
             if self.rank != 0:
-                return []
+                raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")
             flat_logits = output.logits.reshape(-1, output.logits.shape[-1])
             temperatures = torch.zeros(
                 flat_logits.shape[0],
@@ -955,18 +981,16 @@ class ModelRunner:
                 tuple(token_ids),
                 int(transaction.original_states[seq.request_id].logical_length),
             )
-            return [
-                VerificationResult(
-                    sequence_id=seq.seq_id,
-                    target_token_ids=tuple(token_ids),
-                    metadata={
-                        "hybrid_cache_transaction_id": transaction.transaction_id,
-                        "hybrid_cache_request_id": seq.request_id,
-                        "verified_tokens": len(query_tokens),
-                        "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
-                    },
-                )
-            ]
+            return VerificationResult(
+                sequence_id=seq.seq_id,
+                target_token_ids=tuple(token_ids),
+                metadata={
+                    "hybrid_cache_transaction_id": transaction.transaction_id,
+                    "hybrid_cache_request_id": seq.request_id,
+                    "verified_tokens": len(query_tokens),
+                    "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
+                },
+            )
         except Exception:
             if transaction.state.name == "ACTIVE":
                 self.hybrid_cache_manager.rollback(transaction)

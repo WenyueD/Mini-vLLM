@@ -26,7 +26,7 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. The regenerated diagnostic fixture shows Oracle actually proposed from token `9419`, while Mini proposed from target bonus token `11`; proposal comparison is therefore skipped because the effective anchors differ. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_offline_b1_20260905.log` has exact target-only/DFlash2 equality for 32 tokens, `proposed=143`, `accepted=8`, acceptance `0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`; verified over SSH. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
-| B=2 continuous batching | PENDING | Added a real-GPU online B=2 smoke requiring per-request losslessness, shared target/speculative batch size 2, proposals for both requests, and accepted draft tokens for each request. Awaiting AutoDL execution. |
+| B=2 continuous batching | PENDING | The first AutoDL run reached the expected batch path but stopped at the old cached-target B=1 guard. The runner now executes each request against isolated target/draft cache state inside one scheduler B=2 step; the real-GPU smoke must be rerun after pulling the fix. |
 | B>1 performance | PENDING | Correctness evidence must pass before performance tuning. |
 
 ## Local Changes
