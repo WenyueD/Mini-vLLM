@@ -138,5 +138,12 @@ from 19.43s to 12.95s (33.3%) and total DFlash2 generation fell from 20.89s to
 - shared target and speculative batch size 2;
 - no shutdown exception or residual GPU process.
 
+A same-input K sweep then showed that proposal length, rather than request
+batching, is the dominant remaining control for this workload. K=1 completed in
+5.31s versus its 7.06s target-only baseline (1.33x faster), while K=2 took 6.52s,
+K=3 took 8.22s, and K=7 took 14.29s. All variants remained target-lossless.
+K=1 is therefore the current workload-specific recommendation; it is not yet a
+global default or an adaptive-K claim.
+
 Oracle proposal alignment remains `PENDING` because the available Oracle fixture
 is not target-lossless.

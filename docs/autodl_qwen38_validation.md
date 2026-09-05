@@ -294,6 +294,25 @@ total DFlash2 generation improved from 20.89s to 14.43s (30.9%). The latest
 target-only generation took 7.19s. No exception or residual GPU process was
 observed after shutdown.
 
+### Speculative-length sweep
+
+The same heterogeneous B=2 workload was rerun with configurable proposal lengths
+on 2026-09-05. All four runs passed exact target-only equality and tensor-batch
+assertions:
+
+| K | Target-only | DFlash2 | Verify | Proposed / accepted | Result |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 7.06s | 5.31s | 3.79s | 43 / 17 | 1.33x faster |
+| 2 | 7.13s | 6.52s | 5.09s | 71 / 24 | 1.09x faster |
+| 3 | 7.20s | 8.22s | 6.77s | 106 / 24 | 0.88x |
+| 7 | 6.90s | 14.29s | 12.82s | 236 / 24 | 0.48x |
+
+Logs are `logs/dflash2_online_b2_k{1,2,3,7}_20260905.log`. For this
+workload, K=1 is the measured optimum. K=3 adds only one accepted token beyond
+K=2, while K=4 through K=7 add none, so their verification cost cannot be
+recovered. Use `--num-speculative-tokens 1` for the current performance smoke;
+keep K configurable until a broader prompt corpus supports an adaptive policy.
+
 ## DFlash2 Oracle Proposal Alignment
 
 Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query

@@ -30,6 +30,7 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
 | B>1 tensor-batched verification | PASS remote/log-verified | The clean heterogeneous B=2 run `logs/dflash2_online_b2_tensor_batched_clean_20260905.log` matched target-only IDs exactly. Verification recorded `max_batch_size=2` and 108 tensor-batched token steps. Verification fell from 19.43s to 12.95s (33.3%); total DFlash2 generation fell from 20.89s to 14.43s (30.9%). The latest target-only run took 7.19s and peak allocation was 71.99 GiB. |
+| B=2 K sweep | PASS remote/log-verified | K=1/2/3/7 all remained target-lossless. DFlash2 times were 5.31s/6.52s/8.22s/14.29s against target-only runs of 7.06s/7.13s/7.20s/6.90s. K=1 is the workload-specific optimum at 1.33x; logs are `logs/dflash2_online_b2_k{1,2,3,7}_20260905.log`. |
 
 ## Local Changes
 
