@@ -208,3 +208,7 @@ def test_qwen_verification_batch_stats_are_exposed_by_engine():
         "max_batch_size": 2,
         "tensor_batched_token_steps": 7,
     }
+
+    del engine.model_runner
+    closed_stats = engine.get_stats()
+    assert "qwen35_verification" not in closed_stats

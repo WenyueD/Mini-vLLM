@@ -282,8 +282,11 @@ class LLMEngine:
         self._ensure_runtime_state()
         result = self.metrics.snapshot()
         result["speculative"] = self.get_speculative_stats()
-        if getattr(self.model_runner, "is_qwen35_target", False):
-            result["qwen35_verification"] = self.model_runner.call(
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None and getattr(
+            model_runner, "is_qwen35_target", False
+        ):
+            result["qwen35_verification"] = model_runner.call(
                 "get_qwen35_verification_stats"
             )
         result["requests"] = {
