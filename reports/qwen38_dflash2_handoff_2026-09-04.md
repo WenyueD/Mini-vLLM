@@ -17,16 +17,17 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
 | Mini DFlash2 target-hidden fallback cache | PASS local | `DFlash2DraftCache.update_target_context()` now records the actual clipped target-hidden context length and stores sliding-window hidden taps. This remains a correctness fallback, not the final high-performance official per-layer draft KV cache. |
 | Proposal rollback/commit semantics | PASS local | `DFlash2DraftCache.begin_proposal()`, `commit_proposal()`, and `rollback_proposal()` now snapshot provisional proposal length. Standalone proposer failures roll back, runner proposal exceptions roll back, and verified commit reconciles to accepted target context length. |
 | Local DFlash2 contract tests | PASS local | `24 passed` after this change. |
-| Local regression | PASS local | `105 passed, 2 skipped`; `compileall` passed. |
+| Local regression | PASS local | `106 passed, 2 skipped`; `compileall` passed. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
 | Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported Oracle exporter failures where DFlash output repeated prompt token `9419` and capture anchors were all `0`; after warmup capture was disabled, capture row 0 became single-prompt and started with `[11, 353, ...]`, while vLLM `CompletionOutput` itself still contained repeated `9419`. This now points mainly at Oracle LLM entrypoint/output behavior. Do not force formal alignment PASS from this fixture. |
 | Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. The regenerated diagnostic fixture shows Oracle actually proposed from token `9419`, while Mini proposed from target bonus token `11`; proposal comparison is therefore skipped because the effective anchors differ. |
-| Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported exact target-only/DFlash2 token ID equality for 32 generated tokens with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`. I did not rerun this locally. |
-| Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/user-reported | User reported `dflash2_online_b1=PASS` with `dflash2_proposed_tokens=143`, `dflash2_accepted_tokens=8`, `dflash2_acceptance_rate=0.055944055944055944`, and multi-token streaming chunks. I did not rerun this locally. |
-| B>1 continuous batching and performance | PENDING | Do not start until Oracle proposal alignment is resolved and B=1 traces are archived. |
+| Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_offline_b1_20260905.log` has exact target-only/DFlash2 equality for 32 tokens, `proposed=143`, `accepted=8`, acceptance `0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`; verified over SSH. |
+| Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
+| B=2 continuous batching | PENDING | Added a real-GPU online B=2 smoke requiring per-request losslessness, shared target/speculative batch size 2, proposals for both requests, and accepted draft tokens for each request. Awaiting AutoDL execution. |
+| B>1 performance | PENDING | Correctness evidence must pass before performance tuning. |
 
 ## Local Changes
 
@@ -62,6 +63,11 @@ This local turn did not run AutoDL/GPU validation. It audited the current Mini-v
   - request-state buffers such as `last_sampled` use `idx_mapping`, while `draft_tokens` and selector diagnostics use compact request rows;
   - the regenerated fixture reported effective Oracle anchor `9419`, despite the diagnostic fixture anchor being overridden to expected target token `11`;
   - the comparator now emits `dflash2_oracle_proposal_diagnostic=SKIP reason=oracle_effective_anchor_mismatch` instead of comparing proposals produced from different anchors.
+- Added `scripts/smoke_qwen38_dflash2_online_b2.py`:
+  - submits two requests concurrently through one `OnlineEngine`;
+  - compares each DFlash2 output with its target-only baseline;
+  - requires shared `active_batch_size=2` and `speculative_batch_size=2` decode evidence;
+  - requires both requests to receive proposals and at least one accepted draft token each.
 
 ## Commands Run Locally
 

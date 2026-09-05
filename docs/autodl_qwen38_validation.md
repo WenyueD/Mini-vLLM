@@ -251,6 +251,29 @@ The pass marker is `dflash2_online_b1=PASS`.  Keep
 `dflash2_oracle_alignment=PENDING` until proposal IDs are compared against the
 Oracle path.
 
+## DFlash2 B=2 Online Smoke
+
+After both B=1 smokes pass, run two requests concurrently and require evidence
+that they share a real target and speculative decode batch:
+
+```bash
+python scripts/smoke_qwen38_dflash2_online_b2.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --safe-open-device cuda \
+  --dflash2-safe-open-device cuda \
+  --max-new-tokens 32 \
+  --debug-metadata \
+  | tee logs/dflash2_online_b2_same_prompt_20260905.log
+```
+
+The default submits two identical `Hello` prompts. The pass marker is
+`dflash2_online_b2=PASS`; the script also requires exact per-request target-only
+equality, `active_batch_size >= 2`, `speculative_batch_size >= 2`, proposals for
+both requests in a shared step, and at least one accepted draft token per request.
+
 ## DFlash2 Oracle Proposal Alignment
 
 Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query
