@@ -16,7 +16,9 @@ def test_smoke_accepts_configurable_speculative_length(monkeypatch):
 def test_smoke_defaults_to_measured_best_speculative_length(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["smoke_qwen38_dflash2_online_b2.py"])
 
-    assert parse_args().num_speculative_tokens == 1
+    args = parse_args()
+    assert args.num_speculative_tokens == 1
+    assert args.target_cache_memory_fraction == 0.05
 
 
 def test_smoke_accepts_dflash2_stage_profiling(monkeypatch):

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--target-cache-memory-fraction", type=float, default=0.02)
+    parser.add_argument("--target-cache-memory-fraction", type=float, default=0.05)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--debug-metadata", action="store_true")
@@ -306,6 +306,25 @@ def main() -> None:
         device,
     )
 
+    target_ids = [result["request_id"] for result in target_results]
+    dflash_ids = [result["request_id"] for result in dflash_results]
+    target_evidence = batch_evidence(target_stats, target_ids)
+    dflash_evidence = batch_evidence(dflash_stats, dflash_ids)
+    speculative = dflash_stats["speculative"]
+    verification = dflash_stats.get("qwen35_verification", {})
+    if target_evidence["max_active_batch_size"] < 2:
+        raise SystemExit("Target-only requests never shared a B=2 decode batch")
+    if dflash_evidence["max_active_batch_size"] < 2:
+        raise SystemExit("DFlash2 requests never shared a B=2 decode batch")
+    if dflash_evidence["max_speculative_batch_size"] < 2:
+        raise SystemExit("DFlash2 requests never shared a B=2 speculative batch")
+    if dflash_evidence["max_position_zero_proposed"] < 2:
+        raise SystemExit("A B=2 speculative step did not propose for both requests")
+    if verification.get("max_batch_size", 0) < 2:
+        raise SystemExit("Qwen3.8 verification never executed a tensor batch of 2")
+    if verification.get("tensor_batched_token_steps", 0) <= 0:
+        raise SystemExit("Qwen3.8 verification recorded no tensor-batched token step")
+
     for index, (target, dflash) in enumerate(zip(target_results, dflash_results)):
         target_tokens = target["token_ids"]
         dflash_tokens = dflash["token_ids"]
@@ -322,26 +341,8 @@ def main() -> None:
                     break
             raise SystemExit(f"DFlash2 B=2 request {index} diverged from target-only")
 
-    target_ids = [result["request_id"] for result in target_results]
-    dflash_ids = [result["request_id"] for result in dflash_results]
-    target_evidence = batch_evidence(target_stats, target_ids)
-    dflash_evidence = batch_evidence(dflash_stats, dflash_ids)
-    speculative = dflash_stats["speculative"]
-    verification = dflash_stats.get("qwen35_verification", {})
-    if target_evidence["max_active_batch_size"] < 2:
-        raise SystemExit("Target-only requests never shared a B=2 decode batch")
-    if dflash_evidence["max_active_batch_size"] < 2:
-        raise SystemExit("DFlash2 requests never shared a B=2 decode batch")
-    if dflash_evidence["max_speculative_batch_size"] < 2:
-        raise SystemExit("DFlash2 requests never shared a B=2 speculative batch")
-    if dflash_evidence["max_position_zero_proposed"] < 2:
-        raise SystemExit("A B=2 speculative step did not propose for both requests")
     if speculative["proposed_tokens"] <= 0:
         raise SystemExit("DFlash2 B=2 run produced no speculative proposals")
-    if verification.get("max_batch_size", 0) < 2:
-        raise SystemExit("Qwen3.8 verification never executed a tensor batch of 2")
-    if verification.get("tensor_batched_token_steps", 0) <= 0:
-        raise SystemExit("Qwen3.8 verification recorded no tensor-batched token step")
     if any(value <= 0 for value in dflash_evidence["accepted_by_request"].values()):
         raise SystemExit(
             "DFlash2 B=2 did not record an accepted draft token for each request: "

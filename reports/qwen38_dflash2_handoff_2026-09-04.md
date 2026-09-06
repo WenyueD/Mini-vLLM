@@ -7,15 +7,14 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. The per-layer context K/V optimization has passed local regression (`122 passed, 2 skipped`) and is pending GPU validation. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. The per-layer context K/V optimization passed local regression (`122 passed, 2 skipped`), remote focused tests (`48 passed`), and the real B=2 GPU smoke. |
 | Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
 | Batching | PARTIAL | Target cached decode and target verification are request-dimension tensor-batched. DFlash2 proposal is still request-serial. |
 | Performance | NOT YET A WIN | The latest B=2/K=1 run took 7.0750s versus 6.3748s for batched target-only, about 11.0% slower. Performance has not shown a stable gain over the current baseline. |
 
-`DFlash2DraftCache` now has a local implementation of per-request, per-layer
+`DFlash2DraftCache` now has a GPU-validated implementation of per-request, per-layer
 draft context K/V caching. The hidden-history path remains available as a
-correctness fallback. GPU correctness and performance validation of the new path
-are still pending.
+correctness fallback.
 
 ### Proposal compute audit
 
@@ -76,8 +75,28 @@ Deterministic tests prove cached and fallback `forward_block()` outputs match,
 sliding-window append stays aligned, malformed multi-request proposal batches
 roll back atomically, and runner commit projects only accepted rows. Stage
 profiling separately records context combination, five-layer K/V projection,
-draft layers, LM head, and selector. Request-dimension proposal batching remains
-future work after GPU validation of this cache lifecycle.
+draft layers, LM head, and selector. With this lifecycle now GPU-validated,
+request-dimension proposal batching is the next implementation step.
+
+### Per-layer K/V GPU result - 2026-09-06
+
+The matched B=2/K=1 run in
+`logs/dflash2_b2_k1_context_kv_cache005_20260906.log` passed with exact target
+token equality, 42 proposed tokens, 19 accepted tokens, 45.24% acceptance,
+`max_batch_size=2`, and 40 tensor-batched verifier token steps. DFlash2 took
+7.2960s versus 6.1242s for target-only, so this short-context workload still has
+no end-to-end speedup.
+
+Against the prior implementation's same-workload log, speculative proposal time
+fell from 0.7121s to 0.6482s (9.0%), while commit time rose from 0.0687s to
+0.1772s because accepted rows now update draft K/V. The synchronized profiling
+run recorded 46 context updates covering 131 rows: 0.0146s in hidden-tap
+combination, 0.1013s in five-layer K/V projection, and 0.0108s in cache install.
+Across 42 proposals, the query-side stages totaled 0.0565s embedding, 0.4972s
+draft layers, 0.0695s norm/LM head, and 0.0745s selector. This optimization
+reduces repeated full-context projection work, but its benefit is not visible at
+these short sequence lengths; proposal request batching remains the next
+performance task.
 
 ## Scope
 
