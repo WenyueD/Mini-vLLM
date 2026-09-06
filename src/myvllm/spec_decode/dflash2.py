@@ -519,6 +519,7 @@ class DFlash2Attention(nn.Module):
         context_states: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        context_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, query_len, _ = hidden_states.shape
         query = self.q_proj(hidden_states).view(
@@ -553,6 +554,18 @@ class DFlash2Attention(nn.Module):
                 raise ValueError("context key and value shapes must match")
             if context_key.shape[2] != context_positions.shape[1]:
                 raise ValueError("context K/V length must match context positions")
+            if context_valid_mask is None:
+                context_valid_mask = torch.ones_like(
+                    context_positions,
+                    dtype=torch.bool,
+                )
+            if (
+                context_valid_mask.shape != context_positions.shape
+                or context_valid_mask.dtype != torch.bool
+            ):
+                raise ValueError(
+                    "context validity mask must be bool with the positions shape"
+                )
             key_parts.insert(0, context_key)
             value_parts.insert(0, context_value)
             position_parts.insert(0, context_positions)
@@ -569,6 +582,20 @@ class DFlash2Attention(nn.Module):
             key_positions[:, None, None, :]
             >= query_positions[:, None, :, None] - self.sliding_window + 1
         )
+        if context_states is not None or context_kv is not None:
+            key_valid = torch.cat(
+                [
+                    context_valid_mask,
+                    torch.ones(
+                        batch_size,
+                        query_len,
+                        dtype=torch.bool,
+                        device=query_positions.device,
+                    ),
+                ],
+                dim=1,
+            )
+            visible = visible & key_valid[:, None, None, :]
         scores = scores.masked_fill(~visible, -torch.inf)
         probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
         output = torch.matmul(probs, value).transpose(1, 2).contiguous()
@@ -622,6 +649,7 @@ class DFlash2DecoderLayer(nn.Module):
         context_states: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        context_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
@@ -632,6 +660,7 @@ class DFlash2DecoderLayer(nn.Module):
             context_states=context_states,
             context_positions=context_positions,
             context_kv=context_kv,
+            context_valid_mask=context_valid_mask,
         )
         hidden_states = residual + self.attention_conv.finish(attn_output, conv_tail)
         residual = hidden_states
@@ -742,7 +771,7 @@ class DFlash2DraftModel(nn.Module):
         self,
         anchor_token_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
-        hidden_taps: Mapping[int, torch.Tensor],
+        hidden_taps: Mapping[int, torch.Tensor] | None,
         token_embedding,
         lm_head,
         *,
@@ -751,6 +780,7 @@ class DFlash2DraftModel(nn.Module):
             int, tuple[torch.Tensor, torch.Tensor]
         ]
         | None = None,
+        context_valid_mask: torch.Tensor | None = None,
         profile_stages: bool = False,
         return_debug: bool = False,
     ) -> tuple[ProposalBatch, dict[str, Any]]:
@@ -768,10 +798,17 @@ class DFlash2DraftModel(nn.Module):
                 torch.cuda.synchronize(anchor_token_ids.device)
             stage_seconds[name] = perf_counter() - started
 
-        context_lengths = {int(value.shape[1]) for value in hidden_taps.values()}
-        if len(context_lengths) != 1:
-            raise ValueError("DFlash2 hidden taps must share context length")
-        context_len = next(iter(context_lengths))
+        if context_kv_by_layer is None:
+            if not hidden_taps:
+                raise ValueError("DFlash2 hidden taps are required without cached K/V")
+            context_lengths = {int(value.shape[1]) for value in hidden_taps.values()}
+            if len(context_lengths) != 1:
+                raise ValueError("DFlash2 hidden taps must share context length")
+            context_len = next(iter(context_lengths))
+        else:
+            if context_positions is None:
+                raise ValueError("DFlash2 cached context requires positions")
+            context_len = context_positions.shape[1]
         if context_positions is None:
             context_positions = (
                 anchor_positions.reshape(-1, 1)
@@ -784,12 +821,21 @@ class DFlash2DraftModel(nn.Module):
             )
         if context_positions.shape != (anchor_token_ids.shape[0], context_len):
             raise ValueError("DFlash2 context positions have the wrong shape")
+        if context_valid_mask is None:
+            context_valid_mask = torch.ones_like(context_positions, dtype=torch.bool)
+        if (
+            context_valid_mask.shape != context_positions.shape
+            or context_valid_mask.dtype != torch.bool
+        ):
+            raise ValueError(
+                "DFlash2 context validity mask must be bool with the positions shape"
+            )
         if context_kv_by_layer is not None and set(context_kv_by_layer) != set(
             range(len(self.layers))
         ):
             raise ValueError("DFlash2 context K/V must cover every draft layer")
         context_states = None
-        if context_kv_by_layer is None or return_debug:
+        if context_kv_by_layer is None or (return_debug and hidden_taps):
             started = stage_start()
             context_states = self.combine_hidden_taps(hidden_taps)
             stage_finish("context_combine", started)
@@ -822,6 +868,7 @@ class DFlash2DraftModel(nn.Module):
                     if context_kv_by_layer is None
                     else context_kv_by_layer[layer_index]
                 ),
+                context_valid_mask=context_valid_mask,
             )
         stage_finish("draft_layers", started)
         started = stage_start()
@@ -840,13 +887,26 @@ class DFlash2DraftModel(nn.Module):
         if profile_stages:
             debug["stage_seconds"] = stage_seconds
         if return_debug:
+            debug_context_shape = (
+                tuple(context_states.shape)
+                if context_states is not None
+                else (
+                    anchor_token_ids.shape[0],
+                    context_len,
+                    self.config.hidden_size,
+                )
+            )
             debug.update(
                 {
-                    "context_shape": tuple(context_states.shape),
+                    "context_shape": debug_context_shape,
                     "query_shape": tuple(hidden_states.shape),
                     "proposal_hidden_shape": tuple(proposal_hidden.shape),
                     "unary_logits_shape": tuple(unary_logits.shape),
-                    "context_checksum": float(context_states.float().sum().item()),
+                    "context_checksum": (
+                        float(context_states.float().sum().item())
+                        if context_states is not None
+                        else None
+                    ),
                     "proposal_hidden_checksum": float(
                         proposal_hidden.float().sum().item()
                     ),
@@ -1296,6 +1356,82 @@ class DFlash2DraftCache:
             raise ValueError("DFlash2 projected context fields lost alignment")
         self.context_positions_by_request[request_id] = context_positions
         self.context_kv_by_request[request_id] = projected
+
+    def batch_projected_context(
+        self,
+        request_ids: list[str],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        dict[int, tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        if not request_ids:
+            raise ValueError("DFlash2 context batching requires requests")
+        try:
+            positions = [self.context_positions_by_request[rid] for rid in request_ids]
+            per_request_kv = [self.context_kv_by_request[rid] for rid in request_ids]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"DFlash2 projected context is missing for request {exc.args[0]}"
+            ) from exc
+
+        layer_ids = set(per_request_kv[0])
+        if not layer_ids or any(set(values) != layer_ids for values in per_request_kv):
+            raise ValueError("DFlash2 requests must have identical draft layer sets")
+        reference_positions = positions[0]
+        if any(
+            value.dim() != 2
+            or value.shape[0] != 1
+            or value.shape[1] == 0
+            or value.device != reference_positions.device
+            or value.dtype != reference_positions.dtype
+            for value in positions
+        ):
+            raise ValueError("DFlash2 request positions are incompatible for batching")
+
+        lengths = [value.shape[1] for value in positions]
+        max_length = max(lengths)
+        batched_positions = torch.cat(
+            [F.pad(value, (0, max_length - value.shape[1])) for value in positions],
+            dim=0,
+        )
+        valid_mask = (
+            torch.arange(max_length, device=reference_positions.device)[None, :]
+            < torch.tensor(
+                lengths,
+                device=reference_positions.device,
+                dtype=torch.long,
+            )[:, None]
+        )
+
+        batched_kv = {}
+        for layer_id in sorted(layer_ids):
+            reference_key, reference_value = per_request_kv[0][layer_id]
+            keys = []
+            values = []
+            for context_positions, context_kv in zip(positions, per_request_kv):
+                key, value = context_kv[layer_id]
+                if (
+                    key.shape != value.shape
+                    or key.dim() != 4
+                    or key.shape[0] != 1
+                    or key.shape[2] != context_positions.shape[1]
+                    or key.shape[1] != reference_key.shape[1]
+                    or key.shape[3] != reference_key.shape[3]
+                    or key.device != reference_key.device
+                    or value.device != reference_value.device
+                    or key.device != context_positions.device
+                    or key.dtype != reference_key.dtype
+                    or value.dtype != reference_value.dtype
+                ):
+                    raise ValueError(
+                        "DFlash2 request K/V tensors are incompatible for batching"
+                    )
+                padding = max_length - key.shape[2]
+                keys.append(F.pad(key, (0, 0, 0, padding)))
+                values.append(F.pad(value, (0, 0, 0, padding)))
+            batched_kv[layer_id] = (torch.cat(keys, dim=0), torch.cat(values, dim=0))
+        return batched_positions, valid_mask, batched_kv
 
     def _restore_snapshot(
         self,

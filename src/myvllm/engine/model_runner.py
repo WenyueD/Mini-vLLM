@@ -217,6 +217,9 @@ class ModelRunner:
             "context_projection_seconds": 0.0,
             "context_cache_install_seconds": 0.0,
             "proposal_calls": 0,
+            "proposal_requests": 0,
+            "max_proposal_batch_size": 0,
+            "tensor_batched_proposal_calls": 0,
             "proposal_stage_seconds": {},
         }
         # warm up model so that we know peak memory usage
@@ -941,76 +944,133 @@ class ModelRunner:
             raise RuntimeError("DFlash2 draft model is not loaded")
         if len(sequences) != len(max_tokens):
             raise ValueError("sequence and proposer budget counts must match")
-        proposals = []
-        try:
-            for seq, max_token_count in zip(sequences, max_tokens):
-                proposals.append(self._propose_dflash2_one(seq, max_token_count))
-            return proposals
-        except Exception:
-            for seq in sequences:
-                self.dflash2_draft_cache.rollback_proposal(seq.request_id)
-            raise
+        budgets = [
+            min(
+                self.dflash2_draft_model.config.num_speculative_tokens,
+                max(0, max_token_count),
+            )
+            for max_token_count in max_tokens
+        ]
+        proposals: list[Proposal | None] = [None] * len(sequences)
+        active_indices = [index for index, budget in enumerate(budgets) if budget]
+        for index, (seq, budget) in enumerate(zip(sequences, budgets)):
+            if not budget:
+                proposals[index] = Proposal(
+                    seq.seq_id,
+                    (),
+                    {"kind": "dflash2", "block_parallel": True, "budget": 0},
+                )
+        if not active_indices:
+            return [proposal for proposal in proposals if proposal is not None]
 
-    def _propose_dflash2_one(self, seq: Sequence, max_tokens: int) -> Proposal:
-        budget = min(
-            self.dflash2_draft_model.config.num_speculative_tokens,
-            max(0, max_tokens),
+        active_sequences = [sequences[index] for index in active_indices]
+        contexts = []
+        for seq in active_sequences:
+            context = self._dflash2_contexts.get(seq.seq_id)
+            if context is None or context["request_id"] != seq.request_id:
+                raise RuntimeError(
+                    "DFlash2 target hidden context is missing for this sequence"
+                )
+            contexts.append(context)
+        request_ids = [seq.request_id for seq in active_sequences]
+        context_positions, context_valid_mask, context_kv = (
+            self.dflash2_draft_cache.batch_projected_context(request_ids)
         )
-        if budget == 0:
-            return Proposal(seq.seq_id, (), {"kind": "dflash2", "budget": 0})
-        context = self._dflash2_contexts.get(seq.seq_id)
-        if context is None or context["request_id"] != seq.request_id:
-            raise RuntimeError(
-                "DFlash2 target hidden context is missing for this sequence"
-            )
         device = next(self.dflash2_draft_model.parameters()).device
-        self.dflash2_draft_cache.begin_proposal(seq.request_id)
+        begun_request_ids = []
         try:
+            for request_id in request_ids:
+                self.dflash2_draft_cache.begin_proposal(request_id)
+                begun_request_ids.append(request_id)
             profile_stages = bool(self.config.get("dflash2_profile_stages", False))
-            context_positions = self.dflash2_draft_cache.context_positions_by_request.get(
-                seq.request_id
-            )
-            context_kv = self.dflash2_draft_cache.context_kv_by_request.get(
-                seq.request_id
-            )
             proposal_batch, debug = self.dflash2_draft_model.forward_block(
                 anchor_token_ids=torch.tensor(
-                    [context["anchor_token_id"]],
+                    [context["anchor_token_id"] for context in contexts],
                     dtype=torch.long,
                     device=device,
                 ),
                 anchor_positions=torch.tensor(
-                    [context["anchor_position"]],
+                    [context["anchor_position"] for context in contexts],
                     dtype=torch.long,
                     device=device,
                 ),
-                hidden_taps=context["hidden_taps"],
+                hidden_taps=None,
                 token_embedding=self.model.model.embed_tokens,
                 lm_head=self.model.lm_head,
                 context_positions=context_positions,
                 context_kv_by_layer=context_kv,
+                context_valid_mask=context_valid_mask,
                 profile_stages=profile_stages,
                 return_debug=bool(self.config.get("dflash2_debug_metadata", False)),
             )
-            if profile_stages:
-                stats = self._dflash2_profile_stats
-                stats["proposal_calls"] += 1
-                totals = stats["proposal_stage_seconds"]
-                for name, seconds in debug["stage_seconds"].items():
-                    totals[name] = totals.get(name, 0.0) + seconds
-            valid_length = min(int(proposal_batch.valid_lengths[0].item()), budget)
-            token_ids = tuple(
-                int(value)
-                for value in proposal_batch.token_ids[0, :valid_length].tolist()
+            self._record_dflash2_proposal_batch(
+                len(active_sequences),
+                debug,
+                profile_stages=profile_stages,
             )
-            metadata = {"kind": "dflash2", "block_parallel": True}
-            if self.config.get("dflash2_debug_metadata", False):
-                metadata.update(debug)
-            self.dflash2_draft_cache.advance(seq.request_id, valid_length)
-            return Proposal(seq.seq_id, token_ids, metadata)
+            if proposal_batch.token_ids.shape[0] != len(active_sequences):
+                raise ValueError("DFlash2 draft model returned the wrong batch size")
+            if proposal_batch.valid_lengths.shape[0] != len(active_sequences):
+                raise ValueError("DFlash2 draft valid lengths have the wrong batch size")
+            for row, index in enumerate(active_indices):
+                seq = sequences[index]
+                valid_length = min(
+                    int(proposal_batch.valid_lengths[row].item()),
+                    budgets[index],
+                )
+                token_ids = tuple(
+                    int(value)
+                    for value in proposal_batch.token_ids[row, :valid_length].tolist()
+                )
+                metadata = {
+                    "kind": "dflash2",
+                    "block_parallel": True,
+                    "proposal_batch_size": len(active_sequences),
+                }
+                if self.config.get("dflash2_debug_metadata", False):
+                    metadata.update(debug)
+                proposals[index] = Proposal(seq.seq_id, token_ids, metadata)
+                self.dflash2_draft_cache.advance(seq.request_id, valid_length)
+            if any(proposal is None for proposal in proposals):
+                raise RuntimeError("DFlash2 proposal batching lost a request row")
+            return [proposal for proposal in proposals if proposal is not None]
         except Exception:
-            self.dflash2_draft_cache.rollback_proposal(seq.request_id)
+            for request_id in begun_request_ids:
+                self.dflash2_draft_cache.rollback_proposal(request_id)
             raise
+
+    def _record_dflash2_proposal_batch(
+        self,
+        batch_size: int,
+        debug: dict,
+        *,
+        profile_stages: bool,
+    ) -> None:
+        stats = getattr(self, "_dflash2_profile_stats", None)
+        if stats is None:
+            stats = {
+                "context_cache_update_calls": 0,
+                "context_cache_update_tokens": 0,
+                "context_combine_seconds": 0.0,
+                "context_projection_seconds": 0.0,
+                "context_cache_install_seconds": 0.0,
+                "proposal_calls": 0,
+                "proposal_requests": 0,
+                "max_proposal_batch_size": 0,
+                "tensor_batched_proposal_calls": 0,
+                "proposal_stage_seconds": {},
+            }
+            self._dflash2_profile_stats = stats
+        stats["proposal_calls"] += 1
+        stats["proposal_requests"] += batch_size
+        stats["max_proposal_batch_size"] = max(
+            stats["max_proposal_batch_size"], batch_size
+        )
+        stats["tensor_batched_proposal_calls"] += int(batch_size > 1)
+        if profile_stages:
+            totals = stats["proposal_stage_seconds"]
+            for name, seconds in debug["stage_seconds"].items():
+                totals[name] = totals.get(name, 0.0) + seconds
 
     def get_dflash2_profile_stats(self) -> dict:
         stats = getattr(self, "_dflash2_profile_stats", None)

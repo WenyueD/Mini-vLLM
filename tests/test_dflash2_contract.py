@@ -635,6 +635,88 @@ def test_dflash2_cached_context_kv_matches_hidden_history_forward():
     }
 
 
+def test_dflash2_batched_cached_context_matches_unequal_length_single_requests():
+    config = tiny_dflash2_config()
+    model = DFlash2DraftModel(config, enforce_contract=False)
+    token_embedding = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+    lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    init_tiny_module(model)
+    init_tiny_module(token_embedding)
+    init_tiny_module(lm_head)
+    cache = DFlash2DraftCache(sliding_window=8)
+    request_ids = ["short", "long"]
+    hidden_by_request = [
+        {
+            0: torch.randn(1, 2, config.hidden_size),
+            1: torch.randn(1, 2, config.hidden_size),
+        },
+        {
+            0: torch.randn(1, 3, config.hidden_size),
+            1: torch.randn(1, 3, config.hidden_size),
+        },
+    ]
+    positions_by_request = [torch.tensor([[0, 1]]), torch.tensor([[5, 6, 7]])]
+    anchor_token_ids = torch.tensor([2, 3])
+    anchor_positions = torch.tensor([2, 8])
+    singles = []
+    single_debug = []
+    for row, request_id in enumerate(request_ids):
+        projected = model.project_context_kv(
+            hidden_by_request[row], positions_by_request[row]
+        )
+        cache.install_projected_context(
+            request_id,
+            positions_by_request[row],
+            projected,
+        )
+        output, debug = model.forward_block(
+            anchor_token_ids[row : row + 1],
+            anchor_positions[row : row + 1],
+            None,
+            token_embedding,
+            lm_head,
+            context_positions=positions_by_request[row],
+            context_kv_by_layer=projected,
+            return_debug=True,
+        )
+        singles.append(output)
+        single_debug.append(debug)
+
+    batched_positions, valid_mask, batched_kv = cache.batch_projected_context(
+        request_ids
+    )
+    batched, batched_debug = model.forward_block(
+        anchor_token_ids,
+        anchor_positions,
+        None,
+        token_embedding,
+        lm_head,
+        context_positions=batched_positions,
+        context_kv_by_layer=batched_kv,
+        context_valid_mask=valid_mask,
+        return_debug=True,
+    )
+
+    assert batched_positions.tolist() == [[0, 1, 0], [5, 6, 7]]
+    assert valid_mask.tolist() == [[True, True, False], [True, True, True]]
+    assert torch.equal(
+        batched.token_ids,
+        torch.cat([output.token_ids for output in singles], dim=0),
+    )
+    assert torch.equal(
+        batched.valid_lengths,
+        torch.cat([output.valid_lengths for output in singles], dim=0),
+    )
+    for row in range(2):
+        assert torch.allclose(
+            torch.tensor(batched_debug["candidate_unary_scores"][row]),
+            torch.tensor(single_debug[row]["candidate_unary_scores"][0]),
+            atol=1e-6,
+            rtol=0,
+        )
+    assert batched_debug["context_checksum"] is None
+
+
 def test_dflash2_projected_context_append_clips_all_fields_together():
     cache = DFlash2DraftCache(sliding_window=3)
     initial_key = torch.arange(4, dtype=torch.float32).view(1, 1, 2, 2)

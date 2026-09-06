@@ -625,16 +625,14 @@ def test_runner_dflash2_b2_proposals_rollback_as_one_batch_on_failure():
                 num_speculative_tokens=7,
                 sliding_window=16,
             )
-            self.calls = 0
+            self.calls = []
 
-        def forward_block(self, **_kwargs):
-            self.calls += 1
-            if self.calls == 2:
-                raise RuntimeError("second request failed")
+        def forward_block(self, **kwargs):
+            self.calls.append(kwargs)
             return (
-                ProposalBatch(
-                    token_ids=torch.tensor([[20, 21, 22]]),
-                    valid_lengths=torch.tensor([3]),
+                SimpleNamespace(
+                    token_ids=torch.tensor([[20, 21, 22], [30, 31, 32]]),
+                    valid_lengths=torch.tensor([2]),
                 ),
                 {},
             )
@@ -667,12 +665,110 @@ def test_runner_dflash2_b2_proposals_rollback_as_one_batch_on_failure():
             seq.last_token,
             1,
         )
+        runner.dflash2_draft_cache.install_projected_context(
+            seq.request_id,
+            torch.tensor([[0]]),
+            {0: (torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1, 1))},
+        )
 
-    with pytest.raises(RuntimeError, match="second request failed"):
+    with pytest.raises(ValueError, match="valid lengths have the wrong batch size"):
         runner.propose_dflash2(seqs, [2, 2])
 
+    assert len(runner.dflash2_draft_model.calls) == 1
+    call = runner.dflash2_draft_model.calls[0]
+    assert call["anchor_token_ids"].tolist() == [1, 2]
+    assert call["context_valid_mask"].tolist() == [[True], [True]]
     assert runner.dflash2_draft_cache.lengths_by_request == {
         "req0": 1,
         "req1": 1,
     }
     assert runner.dflash2_draft_cache._proposal_length_snapshots_by_request == {}
+
+
+def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets():
+    class FakeDraft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(num_speculative_tokens=7, sliding_window=16)
+            self.calls = []
+
+        def forward_block(self, **kwargs):
+            self.calls.append(kwargs)
+            return (
+                ProposalBatch(
+                    token_ids=torch.tensor(
+                        [[20, 21, 22, 23], [30, 31, 32, 33]]
+                    ),
+                    valid_lengths=torch.tensor([4, 3]),
+                ),
+                {},
+            )
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.dflash2_draft_model = FakeDraft()
+    runner.dflash2_draft_cache = DFlash2DraftCache(sliding_window=16)
+    runner.config = {
+        "dflash2_debug_metadata": False,
+        "dflash2_profile_stages": False,
+    }
+    runner.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=object()),
+        lm_head=object(),
+    )
+    seqs = [
+        Sequence([1], request_id="req0"),
+        Sequence([2], request_id="req1"),
+        Sequence([3], request_id="req2"),
+    ]
+    runner._dflash2_contexts = {
+        seq.seq_id: {
+            "request_id": seq.request_id,
+            "anchor_token_id": seq.last_token,
+            "anchor_position": index + 1,
+            "hidden_taps": {5: torch.zeros(1, index + 1, 1)},
+        }
+        for index, seq in enumerate(seqs)
+    }
+    for index, seq in enumerate(seqs):
+        length = index + 1
+        runner.dflash2_draft_cache.update_target_context(
+            seq.request_id,
+            {5: torch.zeros(1, length, 1)},
+            seq.last_token,
+            length,
+        )
+        runner.dflash2_draft_cache.install_projected_context(
+            seq.request_id,
+            torch.arange(length).view(1, -1),
+            {
+                0: (
+                    torch.full((1, 1, length, 1), float(index)),
+                    torch.full((1, 1, length, 1), float(index + 1)),
+                )
+            },
+        )
+
+    proposals = runner.propose_dflash2(seqs, [2, 0, 1])
+
+    assert len(runner.dflash2_draft_model.calls) == 1
+    call = runner.dflash2_draft_model.calls[0]
+    assert call["anchor_token_ids"].tolist() == [1, 3]
+    assert call["context_positions"].tolist() == [[0, 0, 0], [0, 1, 2]]
+    assert call["context_valid_mask"].tolist() == [
+        [True, False, False],
+        [True, True, True],
+    ]
+    assert call["context_kv_by_layer"][0][0].shape == (2, 1, 3, 1)
+    assert [proposal.token_ids for proposal in proposals] == [(20, 21), (), (30,)]
+    assert proposals[0].metadata["proposal_batch_size"] == 2
+    assert proposals[2].metadata["proposal_batch_size"] == 2
+    assert runner.dflash2_draft_cache.lengths_by_request == {
+        "req0": 3,
+        "req1": 2,
+        "req2": 4,
+    }
+    assert runner.get_dflash2_profile_stats()["proposal_calls"] == 1
+    assert runner.get_dflash2_profile_stats()["proposal_requests"] == 2
+    assert runner.get_dflash2_profile_stats()["max_proposal_batch_size"] == 2
+    assert runner.get_dflash2_profile_stats()["tensor_batched_proposal_calls"] == 1
