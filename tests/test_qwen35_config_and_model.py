@@ -457,7 +457,7 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
     seq1.rollback(tx1)
 
 
-def test_qwen35_cached_runner_preserves_batched_request_order():
+def test_qwen35_cached_runner_prefills_requests_independently():
     calls = []
 
     class FakeModel:
@@ -490,6 +490,61 @@ def test_qwen35_cached_runner_preserves_batched_request_order():
     assert calls == [
         ("req0", [1, 2], False),
         ("req1", [3, 4], False),
+    ]
+
+
+def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
+    calls = []
+
+    class FakeModel:
+        def forward_with_cache_batch(
+            self,
+            input_ids,
+            query_lengths,
+            _cache_manager,
+            request_ids,
+            capture_hidden_taps=False,
+        ):
+            calls.append(
+                (
+                    input_ids.tolist(),
+                    list(query_lengths),
+                    list(request_ids),
+                    capture_hidden_taps,
+                )
+            )
+            outputs = []
+            for token_id in (7, 9):
+                logits = torch.zeros(1, 1, 32)
+                logits[:, :, token_id] = 1
+                outputs.append(SimpleNamespace(logits=logits, hidden_taps={}))
+            return outputs
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = FakeModel()
+    runner.hybrid_cache_manager = HybridCacheManager()
+    runner.is_qwen35_target = True
+    runner.dflash2_draft_model = None
+    runner.rank = 0
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+    runner.prepare_decode = lambda seqs: torch.tensor([seq.last_token for seq in seqs])
+    runner.prepare_sample = lambda seqs: torch.zeros(len(seqs))
+
+    seqs = [
+        Sequence([1, 2], request_id="req0"),
+        Sequence([3, 4], request_id="req1"),
+    ]
+
+    token_ids = runner.run(seqs, is_prefill=False)
+
+    assert token_ids.tolist() == [7, 9]
+    assert calls == [
+        (
+            [[2], [4]],
+            [1, 1],
+            ["req0", "req1"],
+            False,
+        )
     ]
 
 

@@ -720,12 +720,38 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if getattr(self, "is_qwen35_target", False):
             try:
+                if not is_prefill:
+                    input_ids = self.prepare_decode(seqs).reshape(len(seqs), 1)
+                    outputs = self.model.forward_with_cache_batch(
+                        input_ids,
+                        [1] * len(seqs),
+                        self.hybrid_cache_manager,
+                        [seq.request_id for seq in seqs],
+                        capture_hidden_taps=self.dflash2_draft_model is not None,
+                    )
+                    if self.rank != 0:
+                        return None
+                    logits = torch.cat(
+                        [output.logits[:, -1, :] for output in outputs], dim=0
+                    )
+                    token_ids = self.sampler(logits, self.prepare_sample(seqs))
+                    token_ids = token_ids.reshape(-1)
+                    if token_ids.numel() != len(seqs):
+                        raise RuntimeError(
+                            "Qwen3.5/Qwen3.8 batched sampler returned the wrong "
+                            "token count"
+                        )
+                    for seq, output, token_id in zip(seqs, outputs, token_ids):
+                        self._store_dflash2_context_from_target_output(
+                            seq,
+                            output,
+                            int(token_id.item()),
+                        )
+                    return token_ids
+
                 sampled_tokens = []
                 for seq in seqs:
-                    if is_prefill:
-                        input_ids = self.prepare_prefill([seq])
-                    else:
-                        input_ids = self.prepare_decode([seq])
+                    input_ids = self.prepare_prefill([seq])
                     output = self.model.forward_with_cache(
                         input_ids.reshape(-1),
                         self.hybrid_cache_manager,
