@@ -7,10 +7,10 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. The per-layer context K/V optimization passed local regression (`122 passed, 2 skipped`), remote focused tests (`48 passed`), and the real B=2 GPU smoke. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal passed local regression (`124 passed, 2 skipped`), remote focused tests (`50 passed`), and the real B=2 GPU smoke. |
 | Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
-| Batching | PARTIAL | Target cached decode and target verification are request-dimension tensor-batched. DFlash2 proposal is still request-serial. |
-| Performance | NOT YET A WIN | The latest B=2/K=1 run took 7.0750s versus 6.3748s for batched target-only, about 11.0% slower. Performance has not shown a stable gain over the current baseline. |
+| Batching | PASS for tested B=2 path | Target cached decode, target verification, and DFlash2 proposal are request-dimension tensor-batched. The GPU smoke recorded 20 B=2 proposal calls, and unequal context lengths plus independent budgets are covered locally. |
+| Performance | NOT YET A WIN | The request-batched B=2/K=1 run took 7.2836s versus 6.6040s for target-only, about 10.3% slower. Proposal time improved by 33.3%, but end-to-end performance has not shown a stable gain. |
 
 `DFlash2DraftCache` now has a GPU-validated implementation of per-request, per-layer
 draft context K/V caching. The hidden-history path remains available as a
@@ -60,23 +60,23 @@ Lifecycle:
   metadata from the snapshot; no in-place tensor writes are allowed;
 - **release:** remove every request-owned tensor and snapshot.
 
-Different requests may have different context lengths. A future batched proposal
-API must pad per-layer K/V and carry an explicit valid-position mask; proposal
-budgets must independently support different K values. Partial failure must roll
-back every request as one atomic batch. A simple padded hidden-history batch would
-remain a temporary fallback optimization and must not be described as the final
-cache-backed implementation.
+Different requests may have different context lengths. The batched proposal API
+right-pads per-layer K/V and carries an explicit valid-position mask; proposal
+budgets are applied independently after the single tensor-batched forward. A
+partial failure rolls back every request as one atomic batch. The normal path
+batches projected per-layer K/V rather than recomputing or padding hidden history.
 
-The minimal implementation now caches per-layer context K/V for the existing
-request-serial proposer. Prefill installs a full projected context; verifier
+The implementation caches per-layer context K/V for the request-batched proposer.
+Prefill installs a full projected context; verifier
 commit combines and projects only newly accepted hidden rows; proposal reads the
 cached tensors; rollback and release cover positions and every layer's K/V.
 Deterministic tests prove cached and fallback `forward_block()` outputs match,
 sliding-window append stays aligned, malformed multi-request proposal batches
 roll back atomically, and runner commit projects only accepted rows. Stage
 profiling separately records context combination, five-layer K/V projection,
-draft layers, LM head, and selector. With this lifecycle now GPU-validated,
-request-dimension proposal batching is the next implementation step.
+draft layers, LM head, and selector. Additional tests prove an unequal-length B=2
+masked forward matches two B=1 forwards and `[2, 0, 1]` budgets preserve request
+order while excluding the zero-budget row from draft compute.
 
 ### Per-layer K/V GPU result - 2026-09-06
 
@@ -95,8 +95,34 @@ combination, 0.1013s in five-layer K/V projection, and 0.0108s in cache install.
 Across 42 proposals, the query-side stages totaled 0.0565s embedding, 0.4972s
 draft layers, 0.0695s norm/LM head, and 0.0745s selector. This optimization
 reduces repeated full-context projection work, but its benefit is not visible at
-these short sequence lengths; proposal request batching remains the next
-performance task.
+these short sequence lengths. It established the cache-backed baseline for the
+request batching result below.
+
+### Request-batched proposal GPU result - 2026-09-06
+
+Commit `1ac0f17` replaces the runner's per-request `_propose_dflash2_one()` loop
+with one tensor-batched draft forward over active non-zero-budget requests. It
+right-pads cached context K/V, masks invalid positions in every draft attention
+layer, applies each request's budget independently, and retains all proposal
+snapshots until verifier commit or whole-batch rollback.
+
+The non-profiling run in
+`logs/dflash2_b2_k1_proposal_tensor_batch_20260906.log` passed with exact target
+token equality, 42 proposed tokens, 19 accepted tokens, and 45.24% acceptance.
+It recorded 22 proposal forwards for 42 request rows, a maximum proposal batch
+size of 2, and 20 tensor-batched proposal calls. Proposal stage time fell from
+0.6482s to 0.4326s (33.3%). DFlash2 end-to-end time was effectively unchanged at
+7.2836s versus the prior 7.2960s and remained 10.3% slower than that run's
+6.6040s target-only baseline.
+
+The synchronized profile in
+`logs/dflash2_b2_k1_proposal_tensor_batch_profile_20260906.log` measured 0.2785s
+for the five draft layers, down 44.0% from 0.4972s before request batching. Total
+query embedding, norm/LM-head, and selector times were 0.0032s, 0.0359s, and
+0.0624s. Context combine/projection/cache-install totals were 0.0162s, 0.1052s,
+and 0.0114s. The remaining end-to-end gap is dominated by target verification,
+commit work, scheduler/runtime overhead, and the low K=1 acceptance benefit, not
+the now-batched proposal forward alone.
 
 ## Scope
 
@@ -114,10 +140,10 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | Official config name | PASS | Prior user/server evidence says Oracle accepts `method=dflash` with the DFlash2 checkpoint. This is not contradicted by local code. |
 | Official selector shape | PASS local/source-audited | Official DFlash2 runtime builds per-step top-k candidates, scores predecessor x successor edge tensors, then walks from the anchor candidate row by argmax. Mini now has a deterministic reference test for this edge-walk behavior. Sources inspected: `https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/spec_decode/dflash.py` and `https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/model_executor/models/qwen3_dflash.py`. |
 | Mini selector all-pairs edge scoring | PASS local | `test_dflash2_candidate_selector_matches_official_edge_walk_reference` and `test_dflash2_candidate_selector_scores_all_previous_candidate_edges` pass. The selector is not a single-predecessor scoring shortcut. |
-| Mini DFlash2 target-hidden fallback cache | PASS local | `DFlash2DraftCache.update_target_context()` now records the actual clipped target-hidden context length and stores sliding-window hidden taps. This remains a correctness fallback, not the final high-performance official per-layer draft KV cache. |
+| Mini DFlash2 context cache | PASS local/GPU | `DFlash2DraftCache` stores aligned sliding-window hidden taps, absolute positions, and projected per-layer K/V. Prefill installs full state and verifier commit appends only accepted rows. |
 | Proposal rollback/commit semantics | PASS local | `DFlash2DraftCache.begin_proposal()`, `commit_proposal()`, and `rollback_proposal()` now snapshot provisional proposal length. Standalone proposer failures roll back, runner proposal exceptions roll back, and verified commit reconciles to accepted target context length. |
 | Local DFlash2 contract tests | PASS local | `24 passed` after this change. |
-| Local regression | PASS local | `116 passed, 2 skipped`; focused AutoDL import/target tests report `18 passed`. |
+| Local regression | PASS local | `124 passed, 2 skipped`; focused AutoDL proposal/target tests report `50 passed`. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
@@ -128,6 +154,7 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
 | B>1 tensor-batched verification | PASS remote/log-verified | The clean heterogeneous B=2 run `logs/dflash2_online_b2_tensor_batched_clean_20260905.log` matched target-only IDs exactly. Verification recorded `max_batch_size=2` and 108 tensor-batched token steps. Verification fell from 19.43s to 12.95s (33.3%); total DFlash2 generation fell from 20.89s to 14.43s (30.9%). The latest target-only run took 7.19s and peak allocation was 71.99 GiB. |
+| B=2 tensor-batched proposal | PASS remote/log-verified | `logs/dflash2_b2_k1_proposal_tensor_batch_20260906.log` matched target-only IDs exactly and recorded 22 proposal calls for 42 request rows, `max_proposal_batch_size=2`, and 20 tensor-batched calls. Proposal time fell 33.3% to 0.4326s. |
 | B=2 K sweep | HISTORICAL | K=1/2/3/7 remained target-lossless, but these timings used the old request-serial target baseline. After target decode batching, the latest K=1 run is 7.0750s versus 6.3748s target-only. K=1 remains the best tested K, not a demonstrated end-to-end speedup. |
 
 ## Local Changes
