@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--num-speculative-tokens",
         type=int,
         choices=range(1, 8),
-        default=7,
+        default=1,
         metavar="K",
         help="Maximum DFlash2 proposal length (1-7).",
     )

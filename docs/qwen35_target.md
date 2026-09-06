@@ -9,12 +9,13 @@ whose language model lives under nested `text_config`.
 - Supported: text-only target execution, greedy correctness scaffolding,
   request-isolated eager cached target steps, Qwen3.5/Qwen3.8 config parsing,
   weight mapping validation, hidden taps, hybrid cache transaction semantics,
-  and DFlash2 draft execution behind the speculative verifier. Cached target
-  verification tensor-batches active requests at each K+1 token position while
-  preserving request-isolated state and ragged query lengths.
-- Not claimed: multimodal inputs, tensor-batched ordinary target decode or
-  DFlash2 proposal, production dynamic batching, CUDA Graph optimization for
-  verification, Oracle proposal-ID alignment, or performance numbers.
+  and DFlash2 draft execution behind the speculative verifier. Ordinary cached
+  decode tensor-batches scheduled requests, and cached verification batches
+  active requests at each K+1 token position while preserving request-isolated
+  state and ragged query lengths.
+- Not claimed: multimodal inputs, tensor-batched DFlash2 proposal, production
+  dynamic batching, CUDA Graph optimization for verification, Oracle proposal-ID
+  alignment, or general performance gains.
 - Multimodal tensors such as `pixel_values`, `image_grid_thw`, and
   `video_grid_thw` are rejected explicitly.
 - Target cache sizing can be constrained with `target_cache_memory_fraction` or
@@ -114,8 +115,9 @@ This path is still not a production DFlash2 integration. The draft checkpoint
 can be audited and loaded, standalone block proposal can be run, and multiple
 requests can share an engine scheduler batch. Cached target verification now
 forms a real request-dimension tensor batch at each active query-token position;
-ordinary target decode and DFlash2 proposal remain request-serial. Oracle
-proposal-ID alignment remains required before broader claims.
+ordinary target decode uses the same request-dimension batch semantics. DFlash2
+proposal remains request-serial. Oracle proposal-ID alignment remains required
+before broader claims.
 
 ## GPU Validation
 
@@ -144,6 +146,22 @@ batching, is the dominant remaining control for this workload. K=1 completed in
 K=3 took 8.22s, and K=7 took 14.29s. All variants remained target-lossless.
 K=1 is therefore the current workload-specific recommendation; it is not yet a
 global default or an adaptive-K claim.
+
+On 2026-09-06, ordinary Qwen3.8 cached decode was tensor-batched as well. A
+teacher-forced real-weight diagnostic found one B=1/B=2 argmax difference across
+64 generated request positions: the B=1 top-two logits were exactly tied, while
+BF16 batch-shape rounding produced a 0.125 margin for B=2. Aligning target-only
+decode and speculative verification to the same B=2 numerical semantics restored
+exact losslessness in `logs/dflash2_corpus_pair1_k1_tensor_target_20260906_rerun.log`.
+That run recorded 42 proposed / 19 accepted tokens, 40 tensor-batched verifier
+steps out of 45, and exact 32-token outputs for both requests.
+
+A three-pair prompt corpus then compared K=1 with K=2. Every valid run was exact
+and reached a shared B=2 speculative batch. Aggregated K=1 accepted 54/128 tokens
+(42.2%) in 20.94s of DFlash generation; K=2 accepted 66/230 (28.7%) in 25.43s.
+K=1 is now the default for the B=2 performance smoke. Adaptive K is deferred
+because K=2 lost on all three pairs, and both settings remained slower than the
+new tensor-batched target-only baseline on this broader corpus.
 
 Oracle proposal alignment remains `PENDING` because the available Oracle fixture
 is not target-lossless.

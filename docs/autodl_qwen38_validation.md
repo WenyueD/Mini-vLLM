@@ -313,6 +313,38 @@ K=2, while K=4 through K=7 add none, so their verification cost cannot be
 recovered. Use `--num-speculative-tokens 1` for the current performance smoke;
 keep K configurable until a broader prompt corpus supports an adaptive policy.
 
+### Tensor-batched target baseline and broader corpus
+
+On 2026-09-06, ordinary Qwen3.8 cached decode was changed from a per-request loop
+to `forward_with_cache_batch()`. This matters for both throughput and correctness:
+BF16 GEMM results are not guaranteed to be bit-identical across batch shapes. A
+real-weight teacher-forced diagnostic found a single argmax difference at an
+exact B=1 top-two logit tie. Comparing B=1 target-only output with B=2 speculative
+verification therefore created an artificial lossless failure. With both paths
+using B=2 semantics, the formerly failing long-prompt run passed exactly.
+
+Three heterogeneous prompt pairs were then run at K=1 and K=2:
+
+| Pair | K | Target-only | DFlash2 | Proposed / accepted | Acceptance | Result |
+|---:|---:|---:|---:|---:|---:|---:|
+| code + explanation | 1 | 6.32s | 7.28s | 42 / 19 | 45.2% | PASS |
+| code + explanation | 2 | 6.11s | 8.57s | 73 / 23 | 31.5% | PASS |
+| translation + arithmetic | 1 | 6.35s | 7.23s | 43 / 18 | 41.9% | PASS |
+| translation + arithmetic | 2 | 6.51s | 8.86s | 76 / 24 | 31.6% | PASS |
+| summary + completion | 1 | 5.34s | 6.43s | 43 / 17 | 39.5% | PASS |
+| summary + completion | 2 | 5.53s | 7.99s | 81 / 19 | 23.5% | PASS |
+
+K=1 wins all three pairs and is the B=2 smoke default. The broader corpus does
+not justify adaptive K yet. It also shows that the earlier K=1 speedup used the
+older request-serial target baseline and must not be presented as the current
+end-to-end comparison.
+
+For 32-token runs on the 80GB A800, prompts near `max_model_length=47` left only
+one DFlash cache block at `--target-cache-memory-fraction 0.05`; use `0.08` for
+that length to admit two requests atomically. Longer prompts can exceed the
+target-plus-draft warmup peak even before cache allocation, so validate memory
+headroom separately from decode correctness.
+
 ## DFlash2 Oracle Proposal Alignment
 
 Run this after `dflash2_online_b1=PASS`.  DFlash uses a `1 + N` draft query
