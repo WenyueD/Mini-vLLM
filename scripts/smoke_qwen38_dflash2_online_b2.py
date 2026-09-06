@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--debug-metadata", action="store_true")
+    parser.add_argument("--profile-dflash2-stages", action="store_true")
     return parser.parse_args()
 
 
@@ -119,6 +120,7 @@ def build_config(
             "strict_language_weights": True,
             "dflash2_safe_open_device": dflash_safe_open,
             "dflash2_debug_metadata": args.debug_metadata,
+            "dflash2_profile_stages": args.profile_dflash2_stages,
             "speculative_config": {
                 "enabled": speculative,
                 "proposer": "dflash2" if speculative else "ngram",

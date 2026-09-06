@@ -1,5 +1,84 @@
 # Qwen3.8 + DFlash2 Handoff - 2026-09-04
 
+## Status Correction - 2026-09-06
+
+The project is not complete. Current status must be reported along four separate
+dimensions:
+
+| Dimension | Status | Current evidence |
+| --- | --- | --- |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. The per-layer context K/V optimization has passed local regression (`122 passed, 2 skipped`) and is pending GPU validation. |
+| Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
+| Batching | PARTIAL | Target cached decode and target verification are request-dimension tensor-batched. DFlash2 proposal is still request-serial. |
+| Performance | NOT YET A WIN | The latest B=2/K=1 run took 7.0750s versus 6.3748s for batched target-only, about 11.0% slower. Performance has not shown a stable gain over the current baseline. |
+
+`DFlash2DraftCache` now has a local implementation of per-request, per-layer
+draft context K/V caching. The hidden-history path remains available as a
+correctness fallback. GPU correctness and performance validation of the new path
+are still pending.
+
+### Proposal compute audit
+
+Before the current local optimization, `DFlash2DraftModel.forward_block()` did
+the following on every request and every proposal call:
+
+1. concatenates all five rolling target hidden taps and applies `fc + hidden_norm`
+   over the full retained context;
+2. passes the same full context to all five draft layers;
+3. each draft layer independently runs K/V projection and RoPE over that full
+   context before attending with the eight-token query block;
+4. applies final norm, target `lm_head`, top-k selection, all-pairs edge scoring,
+   and path selection.
+
+Consequently, a retained context of length L was combined once and had K/V
+recomputed five times per proposal. L can grow to the 2048-token sliding-window
+limit.
+
+### Per-layer context K/V cache design
+
+Each request should own:
+
+- rolling target hidden taps for the existing correctness fallback;
+- absolute context positions shaped `[1, context_len]`;
+- one already-rotated key tensor and one value tensor per draft layer, shaped
+  `[1, num_kv_heads, context_len, head_dim]`;
+- anchor token ID and anchor position;
+- an optional proposal transaction snapshot containing references to every
+  replace-on-write tensor/map above, not only the logical length.
+
+Lifecycle:
+
+- **prefill:** combine the retained target hidden taps once, project K/V once per
+  draft layer, and install the full request context;
+- **accepted target append:** combine/project only newly committed verifier hidden
+  rows, concatenate by sequence dimension, then replace the stored tensors after
+  clipping all fields to the same sliding window;
+- **proposal:** read cached K/V without mutation; the eight-token proposal query
+  remains ephemeral;
+- **commit:** discard the transaction snapshot only after target-hidden and K/V
+  replacement succeeds;
+- **rollback:** restore length, hidden taps, positions, per-layer K/V, and anchor
+  metadata from the snapshot; no in-place tensor writes are allowed;
+- **release:** remove every request-owned tensor and snapshot.
+
+Different requests may have different context lengths. A future batched proposal
+API must pad per-layer K/V and carry an explicit valid-position mask; proposal
+budgets must independently support different K values. Partial failure must roll
+back every request as one atomic batch. A simple padded hidden-history batch would
+remain a temporary fallback optimization and must not be described as the final
+cache-backed implementation.
+
+The minimal implementation now caches per-layer context K/V for the existing
+request-serial proposer. Prefill installs a full projected context; verifier
+commit combines and projects only newly accepted hidden rows; proposal reads the
+cached tensors; rollback and release cover positions and every layer's K/V.
+Deterministic tests prove cached and fallback `forward_block()` outputs match,
+sliding-window append stays aligned, malformed multi-request proposal batches
+roll back atomically, and runner commit projects only accepted rows. Stage
+profiling separately records context combination, five-layer K/V projection,
+draft layers, LM head, and selector. Request-dimension proposal batching remains
+future work after GPU validation of this cache lifecycle.
+
 ## Scope
 
 This handoff starts from clean HEAD `584391f` (`Dump Oracle DFlash speculator runtime debug`) in `D:\LLM项目\MinivLLM`.
@@ -19,7 +98,7 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | Mini DFlash2 target-hidden fallback cache | PASS local | `DFlash2DraftCache.update_target_context()` now records the actual clipped target-hidden context length and stores sliding-window hidden taps. This remains a correctness fallback, not the final high-performance official per-layer draft KV cache. |
 | Proposal rollback/commit semantics | PASS local | `DFlash2DraftCache.begin_proposal()`, `commit_proposal()`, and `rollback_proposal()` now snapshot provisional proposal length. Standalone proposer failures roll back, runner proposal exceptions roll back, and verified commit reconciles to accepted target context length. |
 | Local DFlash2 contract tests | PASS local | `24 passed` after this change. |
-| Local regression | PASS local | `111 passed, 2 skipped`; `compileall` passed. Focused AutoDL tests report `20 passed`. |
+| Local regression | PASS local | `116 passed, 2 skipped`; focused AutoDL import/target tests report `18 passed`. |
 | Qwen3.8 target baseline | PASS remote/user-reported | Prior report says target anchor, cache-vs-recompute token decision, and target-only engine smoke passed on AutoDL after the gated norm fix. I did not rerun these locally. |
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
@@ -30,7 +109,7 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
 | B>1 tensor-batched verification | PASS remote/log-verified | The clean heterogeneous B=2 run `logs/dflash2_online_b2_tensor_batched_clean_20260905.log` matched target-only IDs exactly. Verification recorded `max_batch_size=2` and 108 tensor-batched token steps. Verification fell from 19.43s to 12.95s (33.3%); total DFlash2 generation fell from 20.89s to 14.43s (30.9%). The latest target-only run took 7.19s and peak allocation was 71.99 GiB. |
-| B=2 K sweep | PASS remote/log-verified | K=1/2/3/7 all remained target-lossless. DFlash2 times were 5.31s/6.52s/8.22s/14.29s against target-only runs of 7.06s/7.13s/7.20s/6.90s. K=1 is the workload-specific optimum at 1.33x; logs are `logs/dflash2_online_b2_k{1,2,3,7}_20260905.log`. |
+| B=2 K sweep | HISTORICAL | K=1/2/3/7 remained target-lossless, but these timings used the old request-serial target baseline. After target decode batching, the latest K=1 run is 7.0750s versus 6.3748s target-only. K=1 remains the best tested K, not a demonstrated end-to-end speedup. |
 
 ## Local Changes
 

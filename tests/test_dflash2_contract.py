@@ -552,6 +552,156 @@ def test_dflash2_draft_model_forward_block_proposes_in_one_parallel_call():
     }
 
 
+def test_dflash2_cached_context_kv_matches_hidden_history_forward():
+    config = tiny_dflash2_config()
+    model = DFlash2DraftModel(config, enforce_contract=False)
+    token_embedding = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+    lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    init_tiny_module(model)
+    init_tiny_module(token_embedding)
+    init_tiny_module(lm_head)
+    hidden_taps = {
+        0: torch.randn(
+            1, 3, config.hidden_size, generator=torch.Generator().manual_seed(11)
+        ),
+        1: torch.randn(
+            1, 3, config.hidden_size, generator=torch.Generator().manual_seed(12)
+        ),
+    }
+    anchor_token_ids = torch.tensor([2])
+    anchor_positions = torch.tensor([3])
+    context_positions = torch.tensor([[0, 1, 2]])
+
+    fallback, fallback_debug = model.forward_block(
+        anchor_token_ids,
+        anchor_positions,
+        hidden_taps,
+        token_embedding,
+        lm_head,
+        return_debug=True,
+    )
+    context_kv = model.project_context_kv(hidden_taps, context_positions)
+    cached, cached_debug = model.forward_block(
+        anchor_token_ids,
+        anchor_positions,
+        hidden_taps,
+        token_embedding,
+        lm_head,
+        context_positions=context_positions,
+        context_kv_by_layer=context_kv,
+        return_debug=True,
+    )
+
+    assert torch.equal(cached.token_ids, fallback.token_ids)
+    assert torch.equal(cached.valid_lengths, fallback.valid_lengths)
+    assert cached_debug["proposal_hidden_checksum"] == pytest.approx(
+        fallback_debug["proposal_hidden_checksum"], abs=1e-6
+    )
+    assert cached_debug["candidate_unary_scores"] == fallback_debug[
+        "candidate_unary_scores"
+    ]
+
+    _profiled_fallback, fallback_profile = model.forward_block(
+        anchor_token_ids,
+        anchor_positions,
+        hidden_taps,
+        token_embedding,
+        lm_head,
+        profile_stages=True,
+    )
+    _profiled_cached, cached_profile = model.forward_block(
+        anchor_token_ids,
+        anchor_positions,
+        hidden_taps,
+        token_embedding,
+        lm_head,
+        context_positions=context_positions,
+        context_kv_by_layer=context_kv,
+        profile_stages=True,
+    )
+    assert set(fallback_profile["stage_seconds"]) == {
+        "context_combine",
+        "context_projection",
+        "query_embedding",
+        "draft_layers",
+        "norm_and_lm_head",
+        "selector",
+    }
+    assert set(cached_profile["stage_seconds"]) == {
+        "query_embedding",
+        "draft_layers",
+        "norm_and_lm_head",
+        "selector",
+    }
+
+
+def test_dflash2_projected_context_append_clips_all_fields_together():
+    cache = DFlash2DraftCache(sliding_window=3)
+    initial_key = torch.arange(4, dtype=torch.float32).view(1, 1, 2, 2)
+    initial_value = initial_key + 10
+    cache.install_projected_context(
+        "req",
+        torch.tensor([[4, 5]]),
+        {0: (initial_key, initial_value)},
+    )
+    appended_key = torch.arange(4, 8, dtype=torch.float32).view(1, 1, 2, 2)
+    appended_value = appended_key + 10
+
+    cache.install_projected_context(
+        "req",
+        torch.tensor([[6, 7]]),
+        {0: (appended_key, appended_value)},
+        append=True,
+    )
+
+    key, value = cache.context_kv_by_request["req"][0]
+    assert cache.context_positions_by_request["req"].tolist() == [[5, 6, 7]]
+    assert key.tolist() == torch.cat([initial_key, appended_key], dim=2)[
+        :, :, -3:, :
+    ].tolist()
+    assert value.tolist() == torch.cat([initial_value, appended_value], dim=2)[
+        :, :, -3:, :
+    ].tolist()
+
+
+def test_dflash2_draft_cache_rolls_back_all_projected_context_state():
+    cache = DFlash2DraftCache(sliding_window=4)
+    old_hidden = {5: torch.zeros(1, 2, 2)}
+    old_positions = torch.tensor([[0, 1]])
+    old_kv = {0: (torch.zeros(1, 1, 2, 2), torch.ones(1, 1, 2, 2))}
+    cache.update_target_context(
+        "req", old_hidden, anchor_token_id=10, anchor_position=2
+    )
+    cache.install_projected_context("req", old_positions, old_kv)
+    cached_hidden = cache.hidden_taps_by_request["req"]
+    cached_positions = cache.context_positions_by_request["req"]
+    cached_kv = cache.context_kv_by_request["req"]
+    cache.begin_proposal("req")
+
+    cache.update_target_context(
+        "req", {5: torch.ones(1, 3, 2)}, anchor_token_id=11, anchor_position=3
+    )
+    cache.install_projected_context(
+        "req",
+        torch.tensor([[2]]),
+        {0: (torch.full((1, 1, 1, 2), 2.0), torch.full((1, 1, 1, 2), 3.0))},
+        append=True,
+    )
+    cache.advance("req", 1)
+    cache.rollback_proposal("req")
+
+    assert cache.hidden_taps_by_request["req"] is cached_hidden
+    assert cache.context_positions_by_request["req"] is cached_positions
+    assert cache.context_kv_by_request["req"] is cached_kv
+    assert cache.anchor_token_ids_by_request["req"] == 10
+    assert cache.anchor_positions_by_request["req"] == 2
+    assert cache.lengths_by_request["req"] == 2
+
+    cache.release("req")
+    assert "req" not in cache.context_positions_by_request
+    assert "req" not in cache.context_kv_by_request
+
+
 def test_dflash2_proposer_requires_block_parallel_model():
     class SerialDraft:
         supports_block_parallel = False
@@ -621,6 +771,83 @@ def test_dflash2_proposer_rolls_back_cache_when_block_forward_fails():
         proposer.propose_batch([seq], [3])
 
     assert cache.lengths_by_request == {"boom": 2}
+
+
+def test_dflash2_proposer_rolls_back_every_request_when_row_postprocess_fails():
+    class MalformedBatchDraft:
+        supports_block_parallel = True
+
+        def propose_block(self, sequences, max_tokens, draft_cache):
+            for index, seq in enumerate(sequences):
+                draft_cache.update_target_context(
+                    seq.request_id,
+                    {5: torch.full((1, 1, 1), float(index + 1))},
+                    anchor_token_id=20 + index,
+                    anchor_position=3,
+                )
+                draft_cache.install_projected_context(
+                    seq.request_id,
+                    torch.tensor([[2]]),
+                    {
+                        0: (
+                            torch.full((1, 1, 1, 1), float(index + 2)),
+                            torch.full((1, 1, 1, 1), float(index + 3)),
+                        )
+                    },
+                    append=True,
+                )
+            return ProposalBatch(
+                token_ids=torch.tensor([[101], [201]]),
+                valid_lengths=torch.tensor([1]),
+            )
+
+    sequences = [
+        Sequence([1, 2], 4, SamplingParams(temperature=0), request_id="a"),
+        Sequence([3, 4], 4, SamplingParams(temperature=0), request_id="b"),
+    ]
+    cache = DFlash2DraftCache(sliding_window=4)
+    originals = {}
+    for index, seq in enumerate(sequences):
+        cache.update_target_context(
+            seq.request_id,
+            {5: torch.zeros(1, 2, 1)},
+            anchor_token_id=seq.last_token,
+            anchor_position=2,
+        )
+        cache.install_projected_context(
+            seq.request_id,
+            torch.tensor([[0, 1]]),
+            {
+                0: (
+                    torch.full((1, 1, 2, 1), float(index)),
+                    torch.full((1, 1, 2, 1), float(index + 1)),
+                )
+            },
+        )
+        originals[seq.request_id] = (
+            cache.hidden_taps_by_request[seq.request_id],
+            cache.context_positions_by_request[seq.request_id],
+            cache.context_kv_by_request[seq.request_id],
+        )
+    proposer = DFlash2StandaloneProposer(
+        DFlash2Config(),
+        MalformedBatchDraft(),
+        draft_cache=cache,
+    )
+
+    with pytest.raises(ValueError, match="valid_lengths batch size mismatch"):
+        proposer.propose_batch(sequences, [1, 1])
+
+    for seq in sequences:
+        hidden, positions, context_kv = originals[seq.request_id]
+        assert cache.hidden_taps_by_request[seq.request_id] is hidden
+        assert cache.context_positions_by_request[seq.request_id] is positions
+        assert cache.context_kv_by_request[seq.request_id] is context_kv
+        assert cache.anchor_token_ids_by_request[seq.request_id] == seq.last_token
+        assert cache.anchor_positions_by_request[seq.request_id] == 2
+        assert cache.lengths_by_request[seq.request_id] == 2
+    assert cache._proposal_length_snapshots_by_request == {}
+    assert cache._proposal_context_snapshots_by_request == {}
 
 
 def test_dflash2_proposer_uses_target_context_provider_for_standalone_model():

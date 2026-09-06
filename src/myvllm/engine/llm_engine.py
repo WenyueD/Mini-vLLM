@@ -289,6 +289,12 @@ class LLMEngine:
             result["qwen35_verification"] = model_runner.call(
                 "get_qwen35_verification_stats"
             )
+        if model_runner is not None and getattr(
+            model_runner, "dflash2_draft_model", None
+        ) is not None:
+            result["dflash2_profile"] = model_runner.call(
+                "get_dflash2_profile_stats"
+            )
         result["requests"] = {
             "total": len(self.requests),
             "waiting": len(self.scheduler.waiting),

@@ -6,6 +6,7 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Mapping, Protocol
 
 import torch
@@ -503,12 +504,21 @@ class DFlash2Attention(nn.Module):
         value = value.transpose(1, 2)
         return key, value
 
+    def project_context(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key, value = self._project_kv(hidden_states)
+        return self._apply_rotary(key, positions), value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         query_positions: torch.Tensor,
         context_states: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, query_len, _ = hidden_states.shape
         query = self.q_proj(hidden_states).view(
@@ -525,11 +535,24 @@ class DFlash2Attention(nn.Module):
         key_parts = [query_key]
         value_parts = [query_value]
         position_parts = [query_positions]
-        if context_states is not None:
+        if context_states is not None and context_kv is not None:
+            raise ValueError("pass context_states or context_kv, not both")
+        if context_states is not None or context_kv is not None:
             if context_positions is None:
-                raise ValueError("context_positions are required with context_states")
-            context_key, context_value = self._project_kv(context_states)
-            context_key = self._apply_rotary(context_key, context_positions)
+                raise ValueError("context_positions are required with context")
+            if context_kv is None:
+                context_key, context_value = self.project_context(
+                    context_states,
+                    context_positions,
+                )
+            else:
+                context_key, context_value = context_kv
+            if context_key.shape[0] != batch_size:
+                raise ValueError("context K/V batch size must match query batch")
+            if context_key.shape != context_value.shape:
+                raise ValueError("context key and value shapes must match")
+            if context_key.shape[2] != context_positions.shape[1]:
+                raise ValueError("context K/V length must match context positions")
             key_parts.insert(0, context_key)
             value_parts.insert(0, context_value)
             position_parts.insert(0, context_positions)
@@ -598,6 +621,7 @@ class DFlash2DecoderLayer(nn.Module):
         query_positions: torch.Tensor,
         context_states: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
@@ -607,6 +631,7 @@ class DFlash2DecoderLayer(nn.Module):
             query_positions,
             context_states=context_states,
             context_positions=context_positions,
+            context_kv=context_kv,
         )
         hidden_states = residual + self.attention_conv.finish(attn_output, conv_tail)
         residual = hidden_states
@@ -647,7 +672,11 @@ class DFlash2DraftModel(nn.Module):
         self,
         hidden_taps: Mapping[int, torch.Tensor],
     ) -> torch.Tensor:
-        missing = [layer_id for layer_id in self.config.target_layer_ids if layer_id not in hidden_taps]
+        missing = [
+            layer_id
+            for layer_id in self.config.target_layer_ids
+            if layer_id not in hidden_taps
+        ]
         if missing:
             raise ValueError(f"missing DFlash2 target hidden taps: {missing}")
         values = [hidden_taps[layer_id] for layer_id in self.config.target_layer_ids]
@@ -659,6 +688,29 @@ class DFlash2DraftModel(nn.Module):
                 raise ValueError("DFlash2 hidden tap hidden size mismatch")
         combined = torch.cat(values, dim=-1)
         return self.hidden_norm(self.fc(combined))
+
+    def project_context_kv(
+        self,
+        hidden_taps: Mapping[int, torch.Tensor],
+        context_positions: torch.Tensor,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        context_states = self.combine_hidden_taps(hidden_taps)
+        if context_states.shape[:2] != context_positions.shape:
+            raise ValueError("DFlash2 context positions must match hidden taps")
+        return self.project_combined_context_kv(context_states, context_positions)
+
+    def project_combined_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        return {
+            layer_index: layer.self_attn.project_context(
+                context_states,
+                context_positions,
+            )
+            for layer_index, layer in enumerate(self.layers)
+        }
 
     def embed_block_inputs(
         self,
@@ -694,52 +746,112 @@ class DFlash2DraftModel(nn.Module):
         token_embedding,
         lm_head,
         *,
+        context_positions: torch.Tensor | None = None,
+        context_kv_by_layer: Mapping[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None = None,
+        profile_stages: bool = False,
         return_debug: bool = False,
     ) -> tuple[ProposalBatch, dict[str, Any]]:
-        context_states = self.combine_hidden_taps(hidden_taps)
-        context_len = context_states.shape[1]
-        context_positions = (
-            anchor_positions.reshape(-1, 1)
-            - context_len
-            + torch.arange(
-                context_len,
-                device=anchor_positions.device,
-                dtype=anchor_positions.dtype,
-            ).view(1, -1)
-        )
+        stage_seconds = {}
+
+        def stage_start() -> float:
+            if profile_stages and anchor_token_ids.is_cuda:
+                torch.cuda.synchronize(anchor_token_ids.device)
+            return perf_counter()
+
+        def stage_finish(name: str, started: float) -> None:
+            if not profile_stages:
+                return
+            if anchor_token_ids.is_cuda:
+                torch.cuda.synchronize(anchor_token_ids.device)
+            stage_seconds[name] = perf_counter() - started
+
+        context_lengths = {int(value.shape[1]) for value in hidden_taps.values()}
+        if len(context_lengths) != 1:
+            raise ValueError("DFlash2 hidden taps must share context length")
+        context_len = next(iter(context_lengths))
+        if context_positions is None:
+            context_positions = (
+                anchor_positions.reshape(-1, 1)
+                - context_len
+                + torch.arange(
+                    context_len,
+                    device=anchor_positions.device,
+                    dtype=anchor_positions.dtype,
+                ).view(1, -1)
+            )
+        if context_positions.shape != (anchor_token_ids.shape[0], context_len):
+            raise ValueError("DFlash2 context positions have the wrong shape")
+        if context_kv_by_layer is not None and set(context_kv_by_layer) != set(
+            range(len(self.layers))
+        ):
+            raise ValueError("DFlash2 context K/V must cover every draft layer")
+        context_states = None
+        if context_kv_by_layer is None or return_debug:
+            started = stage_start()
+            context_states = self.combine_hidden_taps(hidden_taps)
+            stage_finish("context_combine", started)
+        if profile_stages and context_kv_by_layer is None:
+            started = stage_start()
+            context_kv_by_layer = self.project_combined_context_kv(
+                context_states,
+                context_positions,
+            )
+            stage_finish("context_projection", started)
+        started = stage_start()
         hidden_states = self.embed_block_inputs(anchor_token_ids, token_embedding)
         query_positions = anchor_positions.reshape(-1, 1) + torch.arange(
             self.config.block_size,
             device=anchor_positions.device,
             dtype=anchor_positions.dtype,
         ).view(1, -1)
-        for layer in self.layers:
+        stage_finish("query_embedding", started)
+        started = stage_start()
+        for layer_index, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states,
                 query_positions,
-                context_states=context_states,
+                context_states=(
+                    context_states if context_kv_by_layer is None else None
+                ),
                 context_positions=context_positions,
+                context_kv=(
+                    None
+                    if context_kv_by_layer is None
+                    else context_kv_by_layer[layer_index]
+                ),
             )
+        stage_finish("draft_layers", started)
+        started = stage_start()
         hidden_states = self.norm(hidden_states)
         proposal_hidden = hidden_states[:, 1:, :]
         unary_logits = self.compute_unary_logits(proposal_hidden, lm_head)
+        stage_finish("norm_and_lm_head", started)
+        started = stage_start()
         proposal_batch = self.candidate_selector.select_path(
             unary_logits,
             proposal_hidden,
             anchor_token_ids,
         )
+        stage_finish("selector", started)
         debug = {}
+        if profile_stages:
+            debug["stage_seconds"] = stage_seconds
         if return_debug:
-            debug = {
-                "context_shape": tuple(context_states.shape),
-                "query_shape": tuple(hidden_states.shape),
-                "proposal_hidden_shape": tuple(proposal_hidden.shape),
-                "unary_logits_shape": tuple(unary_logits.shape),
-                "context_checksum": float(context_states.float().sum().item()),
-                "proposal_hidden_checksum": float(
-                    proposal_hidden.float().sum().item()
-                ),
-            }
+            debug.update(
+                {
+                    "context_shape": tuple(context_states.shape),
+                    "query_shape": tuple(hidden_states.shape),
+                    "proposal_hidden_shape": tuple(proposal_hidden.shape),
+                    "unary_logits_shape": tuple(unary_logits.shape),
+                    "context_checksum": float(context_states.float().sum().item()),
+                    "proposal_hidden_checksum": float(
+                        proposal_hidden.float().sum().item()
+                    ),
+                }
+            )
             candidate_ids = unary_logits.topk(
                 self.candidate_selector.top_k,
                 dim=-1,
@@ -1038,6 +1150,16 @@ def select_topk_candidates(scores: torch.Tensor, top_k: int) -> CandidateSelecti
     return CandidateSelection(token_ids=token_ids, scores=values)
 
 
+@dataclass(frozen=True)
+class DFlash2DraftCacheSnapshot:
+    length: int | None
+    hidden_taps: dict[int, torch.Tensor] | None
+    anchor_token_id: int | None
+    anchor_position: int | None
+    context_positions: torch.Tensor | None
+    context_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] | None
+
+
 @dataclass
 class DFlash2DraftCache:
     sliding_window: int
@@ -1045,17 +1167,36 @@ class DFlash2DraftCache:
     _proposal_length_snapshots_by_request: dict[str, int | None] = field(
         default_factory=dict
     )
+    _proposal_context_snapshots_by_request: dict[
+        str, DFlash2DraftCacheSnapshot
+    ] = field(default_factory=dict)
     hidden_taps_by_request: dict[str, dict[int, torch.Tensor]] = field(
         default_factory=dict
     )
     anchor_token_ids_by_request: dict[str, int] = field(default_factory=dict)
     anchor_positions_by_request: dict[str, int] = field(default_factory=dict)
+    context_positions_by_request: dict[str, torch.Tensor] = field(
+        default_factory=dict
+    )
+    context_kv_by_request: dict[
+        str, dict[int, tuple[torch.Tensor, torch.Tensor]]
+    ] = field(default_factory=dict)
 
     def begin_proposal(self, request_id: str) -> None:
         if request_id in self._proposal_length_snapshots_by_request:
             raise RuntimeError(f"DFlash2 proposal already active: {request_id}")
         self._proposal_length_snapshots_by_request[request_id] = (
             self.lengths_by_request.get(request_id)
+        )
+        self._proposal_context_snapshots_by_request[request_id] = (
+            DFlash2DraftCacheSnapshot(
+                length=self.lengths_by_request.get(request_id),
+                hidden_taps=self.hidden_taps_by_request.get(request_id),
+                anchor_token_id=self.anchor_token_ids_by_request.get(request_id),
+                anchor_position=self.anchor_positions_by_request.get(request_id),
+                context_positions=self.context_positions_by_request.get(request_id),
+                context_kv_by_layer=self.context_kv_by_request.get(request_id),
+            )
         )
 
     def advance(self, request_id: str, tokens: int) -> None:
@@ -1090,28 +1231,100 @@ class DFlash2DraftCache:
 
     def commit_proposal(self, request_id: str) -> None:
         self._proposal_length_snapshots_by_request.pop(request_id, None)
+        self._proposal_context_snapshots_by_request.pop(request_id, None)
 
     def rollback_proposal(self, request_id: str) -> None:
         if request_id not in self._proposal_length_snapshots_by_request:
             return
-        snapshot = self._proposal_length_snapshots_by_request.pop(request_id)
-        if snapshot is None:
-            self.lengths_by_request.pop(request_id, None)
-        else:
-            self.lengths_by_request[request_id] = snapshot
+        self._proposal_length_snapshots_by_request.pop(request_id)
+        snapshot = self._proposal_context_snapshots_by_request.pop(request_id)
+        self._restore_snapshot(request_id, snapshot)
 
     def rollback(self, request_id: str, length: int) -> None:
         if length < 0:
             raise ValueError("draft cache length cannot be negative")
         self._proposal_length_snapshots_by_request.pop(request_id, None)
+        self._proposal_context_snapshots_by_request.pop(request_id, None)
         self.lengths_by_request[request_id] = min(length, self.sliding_window)
+
+    def install_projected_context(
+        self,
+        request_id: str,
+        context_positions: torch.Tensor,
+        context_kv_by_layer: Mapping[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ],
+        *,
+        append: bool = False,
+    ) -> None:
+        if context_positions.dim() != 2 or context_positions.shape[0] != 1:
+            raise ValueError("DFlash2 context positions must have shape [1, length]")
+        if not context_kv_by_layer:
+            raise ValueError("DFlash2 projected context must include draft layers")
+        previous_layers = self.context_kv_by_request.get(request_id)
+        if append and previous_layers is not None and set(context_kv_by_layer) != set(
+            previous_layers
+        ):
+            raise ValueError("DFlash2 projected context layer set changed on append")
+        new_length = context_positions.shape[1]
+        projected = {}
+        for layer_id, (key, value) in context_kv_by_layer.items():
+            if key.shape != value.shape or key.dim() != 4 or key.shape[0] != 1:
+                raise ValueError("DFlash2 context K/V must have equal 4D shapes")
+            if key.shape[2] != new_length:
+                raise ValueError("DFlash2 context K/V length mismatch")
+            if append and request_id in self.context_kv_by_request:
+                previous = self.context_kv_by_request[request_id].get(layer_id)
+                if previous is None:
+                    raise ValueError("DFlash2 append is missing a cached draft layer")
+                key = torch.cat([previous[0], key], dim=2)
+                value = torch.cat([previous[1], value], dim=2)
+            projected[layer_id] = (
+                key[:, :, -self.sliding_window :, :].detach(),
+                value[:, :, -self.sliding_window :, :].detach(),
+            )
+        if append and request_id in self.context_positions_by_request:
+            context_positions = torch.cat(
+                [self.context_positions_by_request[request_id], context_positions],
+                dim=1,
+            )
+        context_positions = context_positions[:, -self.sliding_window :].detach()
+        if any(
+            key.shape[2] != context_positions.shape[1]
+            for key, _value in projected.values()
+        ):
+            raise ValueError("DFlash2 projected context fields lost alignment")
+        self.context_positions_by_request[request_id] = context_positions
+        self.context_kv_by_request[request_id] = projected
+
+    def _restore_snapshot(
+        self,
+        request_id: str,
+        snapshot: DFlash2DraftCacheSnapshot,
+    ) -> None:
+        fields = (
+            (self.lengths_by_request, snapshot.length),
+            (self.hidden_taps_by_request, snapshot.hidden_taps),
+            (self.anchor_token_ids_by_request, snapshot.anchor_token_id),
+            (self.anchor_positions_by_request, snapshot.anchor_position),
+            (self.context_positions_by_request, snapshot.context_positions),
+            (self.context_kv_by_request, snapshot.context_kv_by_layer),
+        )
+        for mapping, value in fields:
+            if value is None:
+                mapping.pop(request_id, None)
+            else:
+                mapping[request_id] = value
 
     def release(self, request_id: str) -> None:
         self.lengths_by_request.pop(request_id, None)
         self._proposal_length_snapshots_by_request.pop(request_id, None)
+        self._proposal_context_snapshots_by_request.pop(request_id, None)
         self.hidden_taps_by_request.pop(request_id, None)
         self.anchor_token_ids_by_request.pop(request_id, None)
         self.anchor_positions_by_request.pop(request_id, None)
+        self.context_positions_by_request.pop(request_id, None)
+        self.context_kv_by_request.pop(request_id, None)
 
 
 @dataclass(frozen=True)
@@ -1173,23 +1386,18 @@ class DFlash2StandaloneProposer(Proposer):
             min(self.config.num_speculative_tokens, max(0, value))
             for value in max_tokens
         ]
-        if self.target_context_provider is None:
-            try:
-                for seq in sequences:
-                    self.draft_cache.begin_proposal(seq.request_id)
+        begun_request_ids = []
+        try:
+            for seq in sequences:
+                self.draft_cache.begin_proposal(seq.request_id)
+                begun_request_ids.append(seq.request_id)
+            if self.target_context_provider is None:
                 batch = self.draft_model.propose_block(
                     sequences,
                     bounded,
                     self.draft_cache,
                 )
-            except Exception:
-                for seq in sequences:
-                    self.draft_cache.rollback_proposal(seq.request_id)
-                raise
-        else:
-            try:
-                for seq in sequences:
-                    self.draft_cache.begin_proposal(seq.request_id)
+            else:
                 context = self.target_context_provider(sequences)
                 batch, debug = self.draft_model.forward_block(
                     context.anchor_token_ids,
@@ -1199,26 +1407,27 @@ class DFlash2StandaloneProposer(Proposer):
                     context.lm_head,
                     return_debug=self.include_debug_metadata,
                 )
-            except Exception:
-                for seq in sequences:
-                    self.draft_cache.rollback_proposal(seq.request_id)
-                raise
-            if self.include_debug_metadata:
-                batch.metadata.update(debug)
-        if batch.token_ids.shape[0] != len(sequences):
-            raise ValueError("DFlash2 draft model returned the wrong batch size")
-        if batch.token_ids.shape[1] > self.config.num_speculative_tokens:
-            raise ValueError("DFlash2 draft model exceeded K=7")
-        proposals = []
-        for row, (seq, budget) in enumerate(zip(sequences, bounded)):
-            valid_length = min(int(batch.valid_lengths[row].item()), budget)
-            tokens = tuple(
-                int(v) for v in batch.token_ids[row, :valid_length].tolist()
-            )
-            metadata = dict(batch.metadata) if self.include_debug_metadata else {}
-            metadata["kind"] = "dflash2"
-            metadata["block_parallel"] = True
-            proposals.append(Proposal(seq.seq_id, tokens, metadata))
-            self.draft_cache.advance(seq.request_id, valid_length)
-            self.draft_cache.commit_proposal(seq.request_id)
-        return proposals
+                if self.include_debug_metadata:
+                    batch.metadata.update(debug)
+            if batch.token_ids.shape[0] != len(sequences):
+                raise ValueError("DFlash2 draft model returned the wrong batch size")
+            if batch.token_ids.shape[1] > self.config.num_speculative_tokens:
+                raise ValueError("DFlash2 draft model exceeded K=7")
+            proposals = []
+            for row, (seq, budget) in enumerate(zip(sequences, bounded)):
+                valid_length = min(int(batch.valid_lengths[row].item()), budget)
+                tokens = tuple(
+                    int(v) for v in batch.token_ids[row, :valid_length].tolist()
+                )
+                metadata = dict(batch.metadata) if self.include_debug_metadata else {}
+                metadata["kind"] = "dflash2"
+                metadata["block_parallel"] = True
+                proposals.append(Proposal(seq.seq_id, tokens, metadata))
+                self.draft_cache.advance(seq.request_id, valid_length)
+            for request_id in begun_request_ids:
+                self.draft_cache.commit_proposal(request_id)
+            return proposals
+        except Exception:
+            for request_id in begun_request_ids:
+                self.draft_cache.rollback_proposal(request_id)
+            raise

@@ -19,6 +19,16 @@ def test_smoke_defaults_to_measured_best_speculative_length(monkeypatch):
     assert parse_args().num_speculative_tokens == 1
 
 
+def test_smoke_accepts_dflash2_stage_profiling(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke_qwen38_dflash2_online_b2.py", "--profile-dflash2-stages"],
+    )
+
+    assert parse_args().profile_dflash2_stages is True
+
+
 def test_batch_evidence_aggregates_shared_batch_and_per_request_acceptance():
     stats = {
         "recent_decode_steps": [

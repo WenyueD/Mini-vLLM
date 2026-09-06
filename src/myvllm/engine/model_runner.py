@@ -5,6 +5,7 @@ import torch.distributed as dist
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from time import perf_counter
 
 from myvllm.engine.sequence import Sequence
 from myvllm.spec_decode.types import (
@@ -209,6 +210,15 @@ class ModelRunner:
         # Debug flag for first decode step
         self._first_decode = False
 
+        self._dflash2_profile_stats = {
+            "context_cache_update_calls": 0,
+            "context_cache_update_tokens": 0,
+            "context_combine_seconds": 0.0,
+            "context_projection_seconds": 0.0,
+            "context_cache_install_seconds": 0.0,
+            "proposal_calls": 0,
+            "proposal_stage_seconds": {},
+        }
         # warm up model so that we know peak memory usage
         self.warmup_model()
         # allocate kv cache
@@ -840,6 +850,65 @@ class ModelRunner:
                 int(anchor_token_id),
                 int(self._dflash2_contexts[seq.seq_id]["anchor_position"]),
             )
+            self._install_dflash2_projected_context(
+                seq.request_id,
+                hidden_taps,
+                int(self._dflash2_contexts[seq.seq_id]["anchor_position"])
+                - next(iter(hidden_taps.values())).shape[1],
+                append=False,
+            )
+
+    def _install_dflash2_projected_context(
+        self,
+        request_id: str,
+        hidden_taps: dict[int, torch.Tensor],
+        start_position: int,
+        *,
+        append: bool,
+    ) -> None:
+        if self.dflash2_draft_model is None or self.dflash2_draft_cache is None:
+            return
+        context_length = next(iter(hidden_taps.values())).shape[1]
+        reference = next(iter(hidden_taps.values()))
+        positions = torch.arange(
+            start_position,
+            start_position + context_length,
+            dtype=torch.long,
+            device=reference.device,
+        ).view(1, -1)
+        profile_stages = bool(self.config.get("dflash2_profile_stages", False))
+        if profile_stages and reference.is_cuda:
+            torch.cuda.synchronize(reference.device)
+        started = perf_counter()
+        context_states = self.dflash2_draft_model.combine_hidden_taps(hidden_taps)
+        if profile_stages:
+            if reference.is_cuda:
+                torch.cuda.synchronize(reference.device)
+            combined = perf_counter()
+        projected = self.dflash2_draft_model.project_combined_context_kv(
+            context_states,
+            positions,
+        )
+        if profile_stages:
+            if reference.is_cuda:
+                torch.cuda.synchronize(reference.device)
+            projected_at = perf_counter()
+        self.dflash2_draft_cache.install_projected_context(
+            request_id,
+            positions,
+            projected,
+            append=append,
+        )
+        if profile_stages:
+            if reference.is_cuda:
+                torch.cuda.synchronize(reference.device)
+            stats = self._dflash2_profile_stats
+            stats["context_cache_update_calls"] += 1
+            stats["context_cache_update_tokens"] += context_length
+            finished = perf_counter()
+            stats["context_combine_seconds"] += combined - started
+            stats["context_projection_seconds"] += projected_at - combined
+            stats["context_cache_install_seconds"] += finished - projected_at
 
     def _append_dflash2_hidden_history(
         self,
@@ -897,6 +966,13 @@ class ModelRunner:
         device = next(self.dflash2_draft_model.parameters()).device
         self.dflash2_draft_cache.begin_proposal(seq.request_id)
         try:
+            profile_stages = bool(self.config.get("dflash2_profile_stages", False))
+            context_positions = self.dflash2_draft_cache.context_positions_by_request.get(
+                seq.request_id
+            )
+            context_kv = self.dflash2_draft_cache.context_kv_by_request.get(
+                seq.request_id
+            )
             proposal_batch, debug = self.dflash2_draft_model.forward_block(
                 anchor_token_ids=torch.tensor(
                     [context["anchor_token_id"]],
@@ -911,8 +987,17 @@ class ModelRunner:
                 hidden_taps=context["hidden_taps"],
                 token_embedding=self.model.model.embed_tokens,
                 lm_head=self.model.lm_head,
+                context_positions=context_positions,
+                context_kv_by_layer=context_kv,
+                profile_stages=profile_stages,
                 return_debug=bool(self.config.get("dflash2_debug_metadata", False)),
             )
+            if profile_stages:
+                stats = self._dflash2_profile_stats
+                stats["proposal_calls"] += 1
+                totals = stats["proposal_stage_seconds"]
+                for name, seconds in debug["stage_seconds"].items():
+                    totals[name] = totals.get(name, 0.0) + seconds
             valid_length = min(int(proposal_batch.valid_lengths[0].item()), budget)
             token_ids = tuple(
                 int(value)
@@ -926,6 +1011,23 @@ class ModelRunner:
         except Exception:
             self.dflash2_draft_cache.rollback_proposal(seq.request_id)
             raise
+
+    def get_dflash2_profile_stats(self) -> dict:
+        stats = getattr(self, "_dflash2_profile_stats", None)
+        if stats is None:
+            return {}
+        result = dict(stats)
+        result["proposal_stage_seconds"] = dict(stats["proposal_stage_seconds"])
+        calls = stats["proposal_calls"]
+        result["proposal_stage_seconds_per_call"] = (
+            {
+                name: seconds / calls
+                for name, seconds in stats["proposal_stage_seconds"].items()
+            }
+            if calls
+            else {}
+        )
+        return result
 
     def verify(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
         """Greedy K+1 target decisions for each speculative request."""
@@ -1111,7 +1213,7 @@ class ModelRunner:
             return
         pending = getattr(self, "_pending_verified_cache_transactions", {})
         for sequence_id, accepted_length in accepted_lengths_by_sequence.items():
-            entry = pending.pop(sequence_id, None)
+            entry = pending.get(sequence_id)
             if entry is None:
                 continue
             if len(entry) == 5:
@@ -1143,6 +1245,19 @@ class ModelRunner:
                             int(target_token_ids[decision_index]),
                             start_position + decision_index + 1,
                         )
+                        new_hidden_taps = {
+                            layer_id: value[:, : decision_index + 1, :].detach()
+                            for layer_id, value in output.hidden_taps.items()
+                        }
+                        self._install_dflash2_projected_context(
+                            request_id,
+                            new_hidden_taps,
+                            start_position,
+                            append=(
+                                request_id
+                                in self.dflash2_draft_cache.context_kv_by_request
+                            ),
+                        )
                         self.dflash2_draft_cache.commit_proposal(request_id)
             else:
                 transaction, request_id = entry
@@ -1150,6 +1265,7 @@ class ModelRunner:
                 transaction,
                 {request_id: accepted_length},
             )
+            pending.pop(sequence_id, None)
 
     def rollback_verified_cache(self, sequence_ids: list[int]) -> None:
         if self.hybrid_cache_manager is None:

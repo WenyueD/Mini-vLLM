@@ -457,6 +457,74 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
     seq1.rollback(tx1)
 
 
+def test_dflash2_verified_commit_projects_only_new_accepted_context():
+    class FakeDraftModel:
+        config = SimpleNamespace(sliding_window=4)
+
+        def __init__(self):
+            self.projected_positions = []
+
+        def combine_hidden_taps(self, hidden_taps):
+            return next(iter(hidden_taps.values()))
+
+        def project_combined_context_kv(self, context_states, positions):
+            self.projected_positions.append(positions.clone())
+            values = context_states.unsqueeze(1)
+            return {0: (values, values + 1)}
+
+    class FakeHybridCache:
+        def __init__(self):
+            self.commits = []
+
+        def commit(self, transaction, accepted):
+            self.commits.append((transaction, accepted))
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {"dflash2_profile_stages": False}
+    runner.dflash2_draft_model = FakeDraftModel()
+    runner.dflash2_draft_cache = DFlash2DraftCache(sliding_window=4)
+    runner.hybrid_cache_manager = FakeHybridCache()
+    old_hidden = {5: torch.zeros(1, 2, 2)}
+    runner._dflash2_contexts = {
+        17: {
+            "request_id": "req",
+            "anchor_token_id": 20,
+            "anchor_position": 7,
+            "hidden_taps": old_hidden,
+        }
+    }
+    runner.dflash2_draft_cache.update_target_context(
+        "req", old_hidden, anchor_token_id=20, anchor_position=7
+    )
+    runner.dflash2_draft_cache.install_projected_context(
+        "req",
+        torch.tensor([[5, 6]]),
+        {0: (torch.zeros(1, 1, 2, 2), torch.ones(1, 1, 2, 2))},
+    )
+    runner.dflash2_draft_cache.begin_proposal("req")
+    transaction = object()
+    output = SimpleNamespace(
+        hidden_taps={5: torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])}
+    )
+    runner._pending_verified_cache_transactions = {
+        17: (transaction, "req", output, [31, 32, 33], 7)
+    }
+
+    runner.commit_verified_cache({17: 2})
+
+    assert runner.dflash2_draft_model.projected_positions[0].tolist() == [[7, 8]]
+    assert runner.dflash2_draft_cache.context_positions_by_request[
+        "req"
+    ].tolist() == [[5, 6, 7, 8]]
+    assert runner.dflash2_draft_cache.context_kv_by_request["req"][0][0].shape[2] == 4
+    assert runner._dflash2_contexts[17]["hidden_taps"][5].shape[1] == 4
+    assert runner._dflash2_contexts[17]["anchor_token_id"] == 32
+    assert runner._dflash2_contexts[17]["anchor_position"] == 9
+    assert runner.hybrid_cache_manager.commits == [(transaction, {"req": 2})]
+    assert runner._pending_verified_cache_transactions == {}
+    assert runner.dflash2_draft_cache._proposal_context_snapshots_by_request == {}
+
+
 def test_qwen35_cached_runner_prefills_requests_independently():
     calls = []
 
