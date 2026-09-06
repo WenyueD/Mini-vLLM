@@ -7,7 +7,7 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal passed local regression (`124 passed, 2 skipped`), remote focused tests (`50 passed`), and the real B=2 GPU smoke. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`131 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
 | Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
 | Batching | PASS for tested B=2 path | Target cached decode, target verification, and DFlash2 proposal are request-dimension tensor-batched. The GPU smoke recorded 20 B=2 proposal calls, and unequal context lengths plus independent budgets are covered locally. |
 | Performance | NOT YET A WIN | The request-batched B=2/K=1 run took 7.2836s versus 6.6040s for target-only, about 10.3% slower. Proposal time improved by 33.3%, but end-to-end performance has not shown a stable gain. |
@@ -395,14 +395,70 @@ Current Mini-vLLM implementation is expected to match this minimal DFlash2 propo
 6. Candidate selection takes top-k unary candidates for each speculative position, constructs predecessor x successor edge scores for each adjacent step, starts from anchor row index 0, and follows argmax successor indices step by step.
 7. Rejection or failure must not advance the stored target-hidden fallback context beyond the accepted target prefix.
 
+## Oracle Contract Gate - 2026-09-06
+
+The Oracle exporter and comparator now enforce the official DFlash target-bonus
+contract instead of selecting the first capture with `num_sampled > 0`:
+
+- formal export requires target-only evidence;
+- the selected first-decode capture must have `num_sampled=1` and an effective
+  anchor equal to the target-only first token;
+- the runtime must explicitly expose `sample_from_anchor=False`; a missing
+  attribute is no longer silently interpreted as `False`;
+- the fixture records the vLLM version, runtime contract, and whether the
+  target-bonus capture matched;
+- the comparator independently rejects old or manually edited fixtures that do
+  not carry this evidence.
+
+This identifies the prior `Hello -> HelloHello...` Oracle result as a legacy or
+incompatible Oracle path: it anchored the proposal at prompt token `9419`, and
+the proposal's first slot predicted target token `11`. That is an anchor-sampling
+layout, not the required DFlash 1+N layout where `11` is already the bonus anchor
+and the seven mask slots predict subsequent tokens.
+
+The upstream DFlash documentation and current vLLM source both define
+`sample_from_anchor=False` for DFlash. The source audited on 2026-09-06 was vLLM
+main commit `a1541f5742a29864a80087af313ad460066a1524`.
+
 ## Next AutoDL Validation
+
+First audit the isolated Oracle runtime without loading either model:
+
+```bash
+cd /root/autodl-tmp/Mini-vLLM
+MINI_PY=/root/autodl-tmp/Mini-vLLM/.venv/bin/python
+ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
+
+"$ORACLE_PY" - <<'PY'
+import inspect
+import vllm
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+source = inspect.getsource(DFlashSpeculator)
+print(f"vllm_version={vllm.__version__}")
+print(f"speculator_file={inspect.getsourcefile(DFlashSpeculator)}")
+print(f"has_fixed_1_plus_n_layout={'self.num_query_per_req = 1 + self.num_speculative_steps' in source}")
+print(f"rejects_sample_from_anchor={'sample_from_anchor=True is not supported for DFlash' in source}")
+PY
+```
+
+Both contract booleans must be `True`. If either is `False`, upgrade only the
+isolated Oracle environment to the audited vLLM commit:
+
+```bash
+cd /root/autodl-tmp/Mini-vLLM
+ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
+VLLM_USE_PRECOMPILED=1 uv pip install --python "$ORACLE_PY" --upgrade \
+  "vllm @ git+https://github.com/vllm-project/vllm.git@a1541f5742a29864a80087af313ad460066a1524"
+```
 
 Standalone proposal, offline B=1, and online B=1 have now been reported as passed by the user. Run Oracle proposal alignment next:
 
 ```bash
 mkdir -p results/qwen38_target/oracle_alignment
+MINI_PY=/root/autodl-tmp/Mini-vLLM/.venv/bin/python
 
-python scripts/smoke_dflash2_standalone_proposal.py \
+"$MINI_PY" scripts/smoke_dflash2_standalone_proposal.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
   --draft-model "$MINIVLLM_DFLASH2_PATH" \
   --device cuda:0 \
@@ -413,17 +469,19 @@ python scripts/smoke_dflash2_standalone_proposal.py \
   | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Then run a diagnostic Oracle exporter pass in the official vLLM/Oracle environment. Use `--allow-non-lossless-fixture` for this pass so the JSON is saved:
+Then run a formal Oracle exporter pass in the isolated vLLM environment. Do not
+use `--allow-non-lossless-fixture` for this gate:
 
 ```bash
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_WORKER_MULTIPROC_METHOD=fork
 export CUDA_LAUNCH_BLOCKING=1
+ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
 
-python scripts/export_oracle_dflash2_fixture.py \
+"$ORACLE_PY" scripts/export_oracle_dflash2_fixture.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
   --draft-model "$MINIVLLM_DFLASH2_PATH" \
-  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.json \
+  --output results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
   --prompt "Hello" \
   --max-tokens 16 \
   --num-speculative-tokens 7 \
@@ -431,18 +489,23 @@ python scripts/export_oracle_dflash2_fixture.py \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.9 \
   --max-model-len 256 \
-  --expected-target-first-token-id 11 \
-  --skip-target-preflight \
   --anchor-token-mode minivllm \
   --anchor-position-mode minivllm \
   --trust-remote-code \
   --enforce-eager \
   --dump-speculator-debug \
-  --allow-non-lossless-fixture \
-  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.txt
+  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```
 
-Do not compare this diagnostic fixture unless it prints `oracle_dflash2_fixture=PASS`. If it still prints `DEBUG_NON_LOSSLESS`, inspect and report:
+The formal exporter must print all of:
+
+```text
+oracle_target_bonus_capture_matched=True
+oracle_target_lossless=True
+oracle_dflash2_fixture=PASS
+```
+
+If it fails, inspect and report:
 
 - `dflash_output_summary`
 - `capture.last_sampled`
@@ -455,7 +518,8 @@ Do not compare this diagnostic fixture unless it prints `oracle_dflash2_fixture=
 For proposal-only diagnostics against the currently non-lossless Oracle fixture, run:
 
 ```bash
-python scripts/compare_dflash2_oracle_fixture.py \
+MINI_PY=/root/autodl-tmp/Mini-vLLM/.venv/bin/python
+"$MINI_PY" scripts/compare_dflash2_oracle_fixture.py \
   --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
   --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello_debug_nonlossless.json \
   --checksum-atol 0.5 \
@@ -468,7 +532,8 @@ This diagnostic compare can only print `dflash2_oracle_proposal_diagnostic=PASS`
 Compare fixtures:
 
 ```bash
-python scripts/compare_dflash2_oracle_fixture.py \
+MINI_PY=/root/autodl-tmp/Mini-vLLM/.venv/bin/python
+"$MINI_PY" scripts/compare_dflash2_oracle_fixture.py \
   --minivllm results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.json \
   --oracle results/qwen38_target/oracle_alignment/oracle_dflash2_hello.json \
   --checksum-atol 0.5 \
@@ -485,8 +550,11 @@ If CUDA staging is tight for the Mini fixture, rerun it with `--safe-open-device
 
 ## Remaining Work
 
-- Resolve why the Oracle `LLM.generate` path feeds prompt token `9419` as the effective DFlash bonus anchor and emits prompt repetition instead of target-only token `11`.
+- Audit the AutoDL Oracle environment and replace the legacy anchor-sampling
+  build if it does not expose the fixed DFlash 1+N target-bonus contract.
 - Align one Mini proposal block with Oracle under identical anchor token, anchor position, hidden taps, and checkpoint.
-- If proposals still have zero acceptance after this cache fix, inspect target hidden tap values and selector candidate lattice before changing anchor fields.
-- Implement official-style per-layer draft context/KV cache for performance after correctness fallback alignment is proven.
-- Extend to B>1 only after B=1 has drafted and accepted real tokens.
+- If proposal IDs differ under a valid Oracle fixture, compare the top-k candidate
+  lattice and selector path before changing model semantics.
+- Continue performance work only after semantic parity passes; B=2 proposal,
+  verification, and per-layer draft K/V caching are already implemented and
+  GPU-validated.

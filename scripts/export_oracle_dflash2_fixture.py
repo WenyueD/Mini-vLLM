@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 CAPTURES: list[dict[str, Any]] = []
 SPECULATOR_DEBUG_PRINTED = False
 CAPTURE_ENABLED = False
@@ -21,8 +20,12 @@ def parse_args() -> argparse.Namespace:
             "proposal as a Mini-vLLM comparator fixture."
         )
     )
-    parser.add_argument("--target-model", default=os.environ.get("MINIVLLM_QWEN38_PATH"))
-    parser.add_argument("--draft-model", default=os.environ.get("MINIVLLM_DFLASH2_PATH"))
+    parser.add_argument(
+        "--target-model", default=os.environ.get("MINIVLLM_QWEN38_PATH")
+    )
+    parser.add_argument(
+        "--draft-model", default=os.environ.get("MINIVLLM_DFLASH2_PATH")
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--max-tokens", type=int, default=16)
@@ -212,6 +215,73 @@ def as_int(value: Any) -> int:
     return int(value)
 
 
+def is_decode_capture(capture: dict[str, Any]) -> bool:
+    return as_int(capture.get("num_sampled", 0)) > 0
+
+
+def select_target_bonus_capture(
+    captures: list[dict[str, Any]],
+    *,
+    expected_target_first_token_id: int | None,
+    allow_prefill_anchor: bool,
+) -> tuple[int | None, bool]:
+    eligible = [
+        (index, capture)
+        for index, capture in enumerate(captures)
+        if allow_prefill_anchor or is_decode_capture(capture)
+    ]
+    if expected_target_first_token_id is not None:
+        for index, capture in eligible:
+            if (
+                as_int(capture.get("num_sampled", 0)) == 1
+                and int(capture.get("anchor_token_id", -1))
+                == expected_target_first_token_id
+            ):
+                return index, True
+    if eligible:
+        return eligible[0][0], expected_target_first_token_id is None
+    return None, False
+
+
+def capture_summary(captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "num_sampled": capture.get("num_sampled"),
+            "anchor_token_id": capture.get("anchor_token_id"),
+            "last_sampled": capture.get("last_sampled"),
+            "next_prefill_tokens": capture.get("next_prefill_tokens"),
+            "proposal_rows": capture.get("proposal_rows"),
+            "proposal_first_token_id": capture.get("proposal_first_token_id"),
+            "sample_from_anchor": capture.get("sample_from_anchor"),
+            "sample_from_anchor_attr_present": capture.get(
+                "sample_from_anchor_attr_present"
+            ),
+            "active_request_indices": capture.get("active_request_indices"),
+            "input_batch_summary": capture.get("input_batch_summary"),
+            "candidate_token_ids_present": capture.get("candidate_token_ids")
+            is not None,
+            "selector_selected_indices_present": capture.get(
+                "selector_selected_indices"
+            )
+            is not None,
+        }
+        for index, capture in enumerate(captures)
+    ]
+
+
+def dflash_capture_contract_error(
+    capture: dict[str, Any], *, target_bonus_capture_matched: bool
+) -> str | None:
+    if not target_bonus_capture_matched:
+        return "target_bonus_capture_not_matched"
+    if capture.get("sample_from_anchor_attr_present") is not True:
+        return "sample_from_anchor_contract_unknown"
+    if capture.get("sample_from_anchor") is not False:
+        return "sample_from_anchor_must_be_false"
+    return None
+
+
 def bound_propose_arguments(signature, owner, args, kwargs) -> dict[str, Any]:
     try:
         return dict(signature.bind_partial(owner, *args, **kwargs).arguments)
@@ -315,9 +385,7 @@ def install_dflash_capture_hook(
     expected_num_prompts: int = 1,
 ) -> None:
     try:
-        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
-            DFlashSpeculator,
-        )
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
     except Exception as exc:  # pragma: no cover - Oracle-only environment.
         raise RuntimeError(
             "Could not import vLLM DFlashSpeculator. Run this inside the "
@@ -383,7 +451,9 @@ def install_dflash_capture_hook(
         next_prefill_rows = tensor_rows_to_list(
             next_prefill_tokens, rows, indices=active_indices
         )
-        sample_pos = tensor_to_list(getattr(self, "sample_pos", [])[: self.num_speculative_steps])
+        sample_pos = tensor_to_list(
+            getattr(self, "sample_pos", [])[: self.num_speculative_steps]
+        )
         sample_indices = tensor_to_list(
             getattr(self, "sample_indices", [])[: self.num_speculative_steps]
         )
@@ -405,9 +475,11 @@ def install_dflash_capture_hook(
                 "proposal_first_token_id": proposal_first_token_id,
                 "num_reqs": rows,
                 "inferred_num_reqs": inferred_num_reqs,
-                "active_request_indices": tensor_to_list(active_indices)
-                if active_indices is not None
-                else None,
+                "active_request_indices": (
+                    tensor_to_list(active_indices)
+                    if active_indices is not None
+                    else None
+                ),
                 "input_batch_summary": summarize_input_batch(input_batch, rows),
                 "num_sampled": num_sampled_rows,
                 "num_rejected": num_rejected_rows,
@@ -418,7 +490,8 @@ def install_dflash_capture_hook(
                 "num_query_per_req": int(getattr(self, "num_query_per_req", 0)),
                 "sample_pos": sample_pos,
                 "sample_indices": sample_indices,
-                "sample_from_anchor": bool(getattr(self, "sample_from_anchor", False)),
+                "sample_from_anchor": getattr(self, "sample_from_anchor", None),
+                "sample_from_anchor_attr_present": hasattr(self, "sample_from_anchor"),
                 "candidate_token_ids": tensor_attr_to_list(
                     self,
                     "_cached_candidate_ids",
@@ -468,6 +541,15 @@ def first_output_token_ids(output: Any) -> list[int]:
     return []
 
 
+def completion_output_token_ids(output: Any, prompt_token_ids: list[int]) -> list[int]:
+    completions = getattr(output, "outputs", None)
+    if completions:
+        token_ids = getattr(completions[0], "token_ids", None)
+        if token_ids is not None:
+            return [int(value) for value in token_ids]
+    return completion_token_ids(first_output_token_ids(output), prompt_token_ids)
+
+
 def summarize_generation_output(output: Any) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "type": type(output).__name__,
@@ -510,7 +592,9 @@ def summarize_generation_output(output: Any) -> dict[str, Any]:
     return summary
 
 
-def completion_token_ids(raw_token_ids: list[int], prompt_token_ids: list[int]) -> list[int]:
+def completion_token_ids(
+    raw_token_ids: list[int], prompt_token_ids: list[int]
+) -> list[int]:
     if raw_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
         return raw_token_ids[len(prompt_token_ids) :]
     return raw_token_ids
@@ -547,9 +631,20 @@ def main() -> None:
         raise SystemExit("Pass --target-model or set MINIVLLM_QWEN38_PATH")
     if not args.draft_model:
         raise SystemExit("Pass --draft-model or set MINIVLLM_DFLASH2_PATH")
+    if (
+        args.skip_target_preflight
+        and args.expected_target_first_token_id is None
+        and not args.allow_non_lossless_fixture
+    ):
+        raise SystemExit(
+            "Formal Oracle export requires target-only evidence. Remove "
+            "--skip-target-preflight or also pass "
+            "--expected-target-first-token-id."
+        )
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
 
+    import vllm
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -577,8 +672,11 @@ def main() -> None:
     elif not args.skip_target_preflight:
         target_llm = LLM(**build_llm_kwargs(args, speculative=False))
         target_outputs = target_llm.generate([args.prompt], sampling_params)
-        target_raw = first_output_token_ids(target_outputs[0]) if target_outputs else []
-        target_only_token_ids = completion_token_ids(target_raw, prompt_token_ids)
+        target_only_token_ids = (
+            completion_output_token_ids(target_outputs[0], prompt_token_ids)
+            if target_outputs
+            else []
+        )
         print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
         release_llm(target_llm)
 
@@ -601,60 +699,56 @@ def main() -> None:
             f"{os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')!r}."
         )
 
-    selected_index = None
-    for index, candidate in enumerate(CAPTURES):
-        if args.allow_prefill_anchor or as_int(candidate["num_sampled"]) > 0:
-            selected_index = index
-            break
+    expected_target_first_token_id = (
+        target_only_token_ids[0] if target_only_token_ids else None
+    )
+    selected_index, target_bonus_capture_matched = select_target_bonus_capture(
+        CAPTURES,
+        expected_target_first_token_id=expected_target_first_token_id,
+        allow_prefill_anchor=args.allow_prefill_anchor,
+    )
     if selected_index is None:
-        summary = [
-            {
-                "index": index,
-                "num_sampled": candidate.get("num_sampled"),
-                "anchor_token_id": candidate.get("anchor_token_id"),
-                "proposal_rows": candidate.get("proposal_rows"),
-            }
-            for index, candidate in enumerate(CAPTURES)
-        ]
         raise SystemExit(
             "Only prefill-anchor DFlash captures were found; no capture with "
-            f"num_sampled > 0 is available. Captures={summary}"
+            "num_sampled > 0 is available. "
+            f"Captures={capture_summary(CAPTURES)}"
         )
 
     capture = CAPTURES[selected_index]
+    contract_error = dflash_capture_contract_error(
+        capture,
+        target_bonus_capture_matched=target_bonus_capture_matched,
+    )
+    if contract_error is not None and not args.allow_non_lossless_fixture:
+        raise SystemExit(
+            "Oracle DFlash runtime is incompatible with the formal "
+            "target-bonus contract: "
+            f"detail={contract_error} "
+            f"expected_anchor={expected_target_first_token_id} "
+            f"captures={capture_summary(CAPTURES)}. "
+            "The formal DFlash contract requires sample_from_anchor=False and "
+            "a 1+N query layout whose anchor is the target bonus token. Use a "
+            "vLLM build containing that contract. For diagnostics only, rerun "
+            "with --allow-non-lossless-fixture."
+        )
+
     proposal_rows = capture["proposal_rows"]
     proposal_token_ids = [int(value) for value in proposal_rows[0]]
     raw_output_token_ids = first_output_token_ids(outputs[0]) if outputs else []
-    output_token_ids = completion_token_ids(raw_output_token_ids, prompt_token_ids)
-    dflash_output_summary = (
-        summarize_generation_output(outputs[0]) if outputs else {}
+    output_token_ids = (
+        completion_output_token_ids(outputs[0], prompt_token_ids) if outputs else []
     )
+    dflash_output_summary = summarize_generation_output(outputs[0]) if outputs else {}
     if not output_token_ids:
         raise SystemExit("Oracle generation produced no output tokens")
     oracle_target_lossless = not target_only_token_ids or (
         output_token_ids[0] == target_only_token_ids[0]
     )
-    if target_only_token_ids and not oracle_target_lossless and not args.allow_non_lossless_fixture:
-        summary = [
-            {
-                "index": index,
-                "num_sampled": candidate.get("num_sampled"),
-                "anchor_token_id": candidate.get("anchor_token_id"),
-                "last_sampled": candidate.get("last_sampled"),
-                "next_prefill_tokens": candidate.get("next_prefill_tokens"),
-                "proposal_rows": candidate.get("proposal_rows"),
-                "proposal_first_token_id": candidate.get("proposal_first_token_id"),
-                "active_request_indices": candidate.get("active_request_indices"),
-                "input_batch_summary": candidate.get("input_batch_summary"),
-                "candidate_token_ids_present": candidate.get("candidate_token_ids")
-                is not None,
-                "selector_selected_indices_present": candidate.get(
-                    "selector_selected_indices"
-                )
-                is not None,
-            }
-            for index, candidate in enumerate(CAPTURES)
-        ]
+    if (
+        target_only_token_ids
+        and not oracle_target_lossless
+        and not args.allow_non_lossless_fixture
+    ):
         raise SystemExit(
             "Oracle DFlash generation is not target-lossless for this prompt: "
             f"target_first={target_only_token_ids[0]} "
@@ -662,7 +756,7 @@ def main() -> None:
             f"target_tokens={target_only_token_ids} "
             f"dflash_tokens={output_token_ids} "
             f"dflash_output_summary={dflash_output_summary} "
-            f"captures={summary}. "
+            f"captures={capture_summary(CAPTURES)}. "
             "Retry with --method dflash2 if supported, or align a prompt/config "
             "where Oracle target-only and Oracle DFlash outputs match first. "
             "For diagnostics only, rerun with --allow-non-lossless-fixture."
@@ -713,6 +807,17 @@ def main() -> None:
         "oracle_effective_anchor_matches_fixture": (
             int(oracle_anchor_token_id) == int(anchor_token_id)
         ),
+        "oracle_target_bonus_capture_matched": target_bonus_capture_matched,
+        "oracle_runtime": {
+            "vllm_version": getattr(vllm, "__version__", None),
+            "speculator_class": (
+                "vllm.v1.worker.gpu.spec_decode.dflash.speculator." "DFlashSpeculator"
+            ),
+            "sample_from_anchor": capture.get("sample_from_anchor"),
+            "sample_from_anchor_attr_present": capture.get(
+                "sample_from_anchor_attr_present"
+            ),
+        },
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
         "minivllm_anchor_token_source": minivllm_anchor_token_source,
         "prompt_final_anchor_token_id": int(prompt_final_anchor_token_id),
@@ -761,6 +866,14 @@ def main() -> None:
     )
     print(f"anchor_token_id={fixture['anchor_token_id']}", flush=True)
     print(f"oracle_capture_anchor_token_id={oracle_anchor_token_id}", flush=True)
+    print(
+        f"oracle_target_bonus_capture_matched={target_bonus_capture_matched}",
+        flush=True,
+    )
+    print(
+        "oracle_runtime=" + json.dumps(fixture["oracle_runtime"], sort_keys=True),
+        flush=True,
+    )
     print(f"anchor_position={fixture['anchor_position']}", flush=True)
     print(f"oracle_anchor_position={oracle_anchor_position}", flush=True)
     print(f"proposal_token_ids={proposal_token_ids}", flush=True)

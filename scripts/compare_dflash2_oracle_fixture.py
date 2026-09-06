@@ -10,7 +10,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare Mini-vLLM and Oracle DFlash2 proposal fixtures."
     )
-    parser.add_argument("--minivllm", required=True, help="Mini-vLLM fixture JSON path.")
+    parser.add_argument(
+        "--minivllm", required=True, help="Mini-vLLM fixture JSON path."
+    )
     parser.add_argument("--oracle", required=True, help="Oracle fixture JSON path.")
     parser.add_argument(
         "--checksum-atol",
@@ -188,6 +190,21 @@ def oracle_effective_anchor_mismatch(fixture: dict[str, Any]) -> bool:
     )
 
 
+def oracle_target_bonus_contract_error(fixture: dict[str, Any]) -> str | None:
+    if fixture.get("oracle_target_bonus_capture_matched") is not True:
+        return "target_bonus_capture_not_matched"
+    runtime = fixture.get("oracle_runtime")
+    if not isinstance(runtime, dict):
+        return "runtime_metadata_missing"
+    if runtime.get("sample_from_anchor_attr_present") is not True:
+        return "sample_from_anchor_contract_unknown"
+    if runtime.get("sample_from_anchor") is not False:
+        return "sample_from_anchor_must_be_false"
+    if oracle_effective_anchor_mismatch(fixture):
+        return "oracle_effective_anchor_mismatch"
+    return None
+
+
 def main() -> None:
     args = parse_args()
     minivllm = normalize_fixture_schema(
@@ -200,6 +217,23 @@ def main() -> None:
         label="oracle",
         path=args.oracle,
     )
+    contract_error = oracle_target_bonus_contract_error(oracle)
+    if contract_error is not None:
+        print_mismatch_context(oracle, label="oracle")
+        runtime = oracle.get("oracle_runtime")
+        if runtime is not None:
+            print(f"oracle_runtime={runtime}", flush=True)
+        message = (
+            "reason=oracle_contract_incompatible "
+            f"detail={contract_error} path={args.oracle}"
+        )
+        if args.allow_oracle_non_lossless:
+            print(
+                f"dflash2_oracle_proposal_diagnostic=SKIP {message}",
+                flush=True,
+            )
+            return
+        raise SystemExit(f"dflash2_oracle_alignment=FAIL {message}")
     if oracle.get("oracle_target_lossless") is False:
         print_mismatch_context(oracle, label="oracle")
         print_candidate_diagnostics(oracle, label="oracle")
@@ -264,9 +298,7 @@ def main() -> None:
                 if args.allow_oracle_non_lossless
                 else "dflash2_oracle_alignment"
             )
-            raise SystemExit(
-                f"{prefix}=FAIL key={key} delta={delta}"
-            )
+            raise SystemExit(f"{prefix}=FAIL key={key} delta={delta}")
 
     if args.allow_oracle_non_lossless:
         print("dflash2_oracle_proposal_diagnostic=PASS", flush=True)
