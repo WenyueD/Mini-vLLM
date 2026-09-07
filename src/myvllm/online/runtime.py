@@ -20,6 +20,13 @@ class _Command:
     future: Future
 
 
+@dataclass(frozen=True)
+class OnlineRequestSpec:
+    prompt: str
+    sampling_params: SamplingParams
+    request_id: str | None = None
+
+
 class OnlineRequest:
     """Thread-safe consumer handle for one online request's committed outputs."""
 
@@ -147,6 +154,29 @@ class OnlineEngine:
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("request_ids must be unique within a batch")
 
+        return self.submit_requests(
+            [
+                OnlineRequestSpec(prompt, sampling_params, request_id)
+                for prompt, request_id in zip(prompts, request_ids)
+            ],
+            timeout=timeout,
+        )
+
+    def submit_requests(
+        self,
+        requests: list[OnlineRequestSpec],
+        timeout: float | None = None,
+    ) -> list[OnlineRequest]:
+        """Atomically admit request specs before the engine advances a step."""
+        self._require_running()
+        if not requests:
+            raise ValueError("submit_requests requires at least one request")
+        request_ids = [
+            spec.request_id or f"online-{uuid.uuid4().hex}" for spec in requests
+        ]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("request_ids must be unique within a batch")
+
         future = Future()
         self._commands.put(
             _Command(
@@ -154,11 +184,11 @@ class OnlineEngine:
                 {
                     "requests": [
                         {
-                            "prompt": prompt,
-                            "sampling_params": sampling_params,
+                            "prompt": spec.prompt,
+                            "sampling_params": spec.sampling_params,
                             "request_id": request_id,
                         }
-                        for prompt, request_id in zip(prompts, request_ids)
+                        for spec, request_id in zip(requests, request_ids)
                     ]
                 },
                 future,

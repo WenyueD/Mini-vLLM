@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from myvllm.online import OnlineEngine, OnlineRequest
+from myvllm.online import OnlineEngine, OnlineRequest, OnlineRequestSpec
 from myvllm.sampling_parameters import SamplingParams
 
 from test_engine_requests import FakeRunner, make_engine
@@ -106,6 +106,37 @@ def test_submit_batch_rejects_invalid_request_ids_before_admission():
         with pytest.raises(ValueError, match="unique"):
             online.submit_batch(["1", "2"], params, request_ids=["same", "same"])
         assert not engine.requests
+    finally:
+        online.close()
+
+
+def test_submit_requests_allows_per_request_sampling_params():
+    engine = make_engine(speculative=False)
+    online = OnlineEngine(engine, close_engine=False)
+    online.start()
+    try:
+        handles = online.submit_requests(
+            [
+                OnlineRequestSpec(
+                    "1,2",
+                    SamplingParams(temperature=0, max_tokens=2, ignore_eos=True),
+                    "short",
+                ),
+                OnlineRequestSpec(
+                    "3,4",
+                    SamplingParams(temperature=0, max_tokens=4, ignore_eos=True),
+                    "long",
+                ),
+            ]
+        )
+        outputs = {handle.request_id: consume(handle) for handle in handles}
+
+        assert sum(len(item.token_ids) for item in outputs["short"]) == 2
+        assert sum(len(item.token_ids) for item in outputs["long"]) == 4
+        assert any(
+            step["active_batch_size"] == 2
+            for step in online.stats()["recent_decode_steps"]
+        )
     finally:
         online.close()
 
