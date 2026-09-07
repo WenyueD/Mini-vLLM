@@ -43,6 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help=(
+            "Disable the multimodal tower in vLLM. This is recommended for "
+            "text-only Qwen3.8 DFlash2 alignment."
+        ),
+    )
+    parser.add_argument(
         "--skip-target-preflight",
         action="store_true",
         help=(
@@ -612,6 +620,7 @@ def build_llm_kwargs(args: argparse.Namespace, speculative: bool) -> dict[str, A
         "max_model_len": args.max_model_len,
         "trust_remote_code": args.trust_remote_code,
         "enforce_eager": args.enforce_eager,
+        "language_model_only": args.language_model_only,
         **extra_kwargs,
     }
     if args.dtype:
@@ -817,6 +826,7 @@ def main() -> None:
             "sample_from_anchor_attr_present": capture.get(
                 "sample_from_anchor_attr_present"
             ),
+            "language_model_only": args.language_model_only,
         },
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
         "minivllm_anchor_token_source": minivllm_anchor_token_source,

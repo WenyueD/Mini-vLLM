@@ -3,12 +3,28 @@ from scripts.compare_dflash2_oracle_fixture import (
     oracle_target_bonus_contract_error,
 )
 from scripts.export_oracle_dflash2_fixture import (
+    build_llm_kwargs,
     completion_output_token_ids,
     dflash_capture_contract_error,
     select_target_bonus_capture,
     tensor_attr_to_list,
     tensor_rows_to_list,
 )
+
+
+class ExportArgs:
+    target_model = "target"
+    tensor_parallel_size = 1
+    gpu_memory_utilization = 0.9
+    max_model_len = 256
+    trust_remote_code = True
+    enforce_eager = True
+    language_model_only = True
+    extra_llm_kwargs = "{}"
+    dtype = "bfloat16"
+    method = "dflash"
+    draft_model = "draft"
+    num_speculative_tokens = 7
 
 
 class CpuOnlyTensor:
@@ -55,6 +71,17 @@ def test_completion_output_does_not_strip_matching_prompt_prefix():
     output = RequestOutput([9419, 11])
 
     assert completion_output_token_ids(output, [9419]) == [9419, 11]
+
+
+def test_build_llm_kwargs_enables_language_model_only():
+    kwargs = build_llm_kwargs(ExportArgs(), speculative=True)
+
+    assert kwargs["language_model_only"] is True
+    assert kwargs["speculative_config"] == {
+        "method": "dflash",
+        "model": "draft",
+        "num_speculative_tokens": 7,
+    }
 
 
 def test_tensor_rows_falls_back_for_compact_per_step_values():

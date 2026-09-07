@@ -7,7 +7,7 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`131 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`132 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
 | Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
 | Batching | PASS for tested B=2 path | Target cached decode, target verification, and DFlash2 proposal are request-dimension tensor-batched. The GPU smoke recorded 20 B=2 proposal calls, and unequal context lengths plus independent budgets are covered locally. |
 | Performance | NOT YET A WIN | The request-batched B=2/K=1 run took 7.2836s versus 6.6040s for target-only, about 10.3% slower. Proposal time improved by 33.3%, but end-to-end performance has not shown a stable gain. |
@@ -492,6 +492,7 @@ ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
   --anchor-token-mode minivllm \
   --anchor-position-mode minivllm \
   --trust-remote-code \
+  --language-model-only \
   --enforce-eager \
   --dump-speculator-debug \
   | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
