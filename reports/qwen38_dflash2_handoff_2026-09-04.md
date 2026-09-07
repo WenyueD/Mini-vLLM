@@ -7,7 +7,7 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`132 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`134 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
 | Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
 | Batching | PASS for tested B=2 path | Target cached decode, target verification, and DFlash2 proposal are request-dimension tensor-batched. The GPU smoke recorded 20 B=2 proposal calls, and unequal context lengths plus independent budgets are covered locally. |
 | Performance | NOT YET A WIN | The request-batched B=2/K=1 run took 7.2836s versus 6.6040s for target-only, about 10.3% slower. Proposal time improved by 33.3%, but end-to-end performance has not shown a stable gain. |
@@ -469,14 +469,36 @@ MINI_PY=/root/autodl-tmp/Mini-vLLM/.venv/bin/python
   | tee results/qwen38_target/oracle_alignment/minivllm_dflash2_hello.txt
 ```
 
-Then run a formal Oracle exporter pass in the isolated vLLM environment. Do not
-use `--allow-non-lossless-fixture` for this gate:
+Then run target preflight and DFlash export in separate Oracle processes. This
+avoids vLLM 0.28 retaining the first engine's CUDA allocation while the second
+engine starts. Do not use `--allow-non-lossless-fixture` for this gate:
 
 ```bash
+set -o pipefail
+source /root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/activate
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_WORKER_MULTIPROC_METHOD=fork
 export CUDA_LAUNCH_BLOCKING=1
-ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
+ORACLE_PY=python
+
+"$ORACLE_PY" scripts/export_oracle_dflash2_fixture.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --output /tmp/oracle_target_preflight_unused.json \
+  --prompt "Hello" \
+  --max-tokens 16 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 256 \
+  --trust-remote-code \
+  --language-model-only \
+  --enforce-eager \
+  --target-preflight-only \
+  2>&1 | tee results/qwen38_target/oracle_alignment/oracle_target_hello.txt
+
+TARGET_FIRST=$(sed -n 's/^oracle_target_first_token_id=//p' \
+  results/qwen38_target/oracle_alignment/oracle_target_hello.txt | tail -1)
+test -n "$TARGET_FIRST"
 
 "$ORACLE_PY" scripts/export_oracle_dflash2_fixture.py \
   --target-model "$MINIVLLM_QWEN38_PATH" \
@@ -489,13 +511,15 @@ ORACLE_PY=/root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/python
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.9 \
   --max-model-len 256 \
+  --expected-target-first-token-id "$TARGET_FIRST" \
+  --skip-target-preflight \
   --anchor-token-mode minivllm \
   --anchor-position-mode minivllm \
   --trust-remote-code \
   --language-model-only \
   --enforce-eager \
   --dump-speculator-debug \
-  | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
+  2>&1 | tee results/qwen38_target/oracle_alignment/oracle_dflash2_hello.txt
 ```
 
 The formal exporter must print all of:

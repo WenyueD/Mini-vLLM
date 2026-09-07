@@ -1,3 +1,6 @@
+import pytest
+
+import scripts.export_oracle_dflash2_fixture as oracle_exporter
 from scripts.compare_dflash2_oracle_fixture import (
     oracle_effective_anchor_mismatch,
     oracle_target_bonus_contract_error,
@@ -6,6 +9,7 @@ from scripts.export_oracle_dflash2_fixture import (
     build_llm_kwargs,
     completion_output_token_ids,
     dflash_capture_contract_error,
+    parse_args,
     select_target_bonus_capture,
     tensor_attr_to_list,
     tensor_rows_to_list,
@@ -82,6 +86,40 @@ def test_build_llm_kwargs_enables_language_model_only():
         "model": "draft",
         "num_speculative_tokens": 7,
     }
+
+
+def test_parse_args_accepts_target_preflight_only(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "export_oracle_dflash2_fixture.py",
+            "--output",
+            "unused.json",
+            "--target-preflight-only",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.target_preflight_only is True
+    assert args.skip_target_preflight is False
+
+
+def test_main_rejects_conflicting_target_preflight_modes(monkeypatch):
+    args = type(
+        "Args",
+        (),
+        {
+            "target_model": "target",
+            "draft_model": "draft",
+            "target_preflight_only": True,
+            "skip_target_preflight": True,
+        },
+    )()
+    monkeypatch.setattr(oracle_exporter, "parse_args", lambda: args)
+
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        oracle_exporter.main()
 
 
 def test_tensor_rows_falls_back_for_compact_per_step_values():

@@ -60,6 +60,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--target-preflight-only",
+        action="store_true",
+        help=(
+            "Run the target-only generation, print its token IDs, and exit. "
+            "Use this before a separate --skip-target-preflight DFlash run "
+            "when vLLM does not release enough GPU memory in-process."
+        ),
+    )
+    parser.add_argument(
         "--expected-target-first-token-id",
         type=int,
         default=None,
@@ -640,6 +649,11 @@ def main() -> None:
         raise SystemExit("Pass --target-model or set MINIVLLM_QWEN38_PATH")
     if not args.draft_model:
         raise SystemExit("Pass --draft-model or set MINIVLLM_DFLASH2_PATH")
+    if args.target_preflight_only and args.skip_target_preflight:
+        raise SystemExit(
+            "--target-preflight-only and --skip-target-preflight are mutually "
+            "exclusive"
+        )
     if (
         args.skip_target_preflight
         and args.expected_target_first_token_id is None
@@ -688,6 +702,15 @@ def main() -> None:
         )
         print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
         release_llm(target_llm)
+        if args.target_preflight_only:
+            if not target_only_token_ids:
+                raise SystemExit("Oracle target-only generation produced no tokens")
+            print(
+                f"oracle_target_first_token_id={target_only_token_ids[0]}",
+                flush=True,
+            )
+            print("oracle_target_preflight=PASS", flush=True)
+            return
 
     install_dflash_capture_hook(dump_speculator_debug=args.dump_speculator_debug)
 
