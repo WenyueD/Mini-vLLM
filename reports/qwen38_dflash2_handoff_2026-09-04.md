@@ -1,5 +1,46 @@
 # Qwen3.8 + DFlash2 Handoff - 2026-09-04
 
+## Oracle Alignment Update - 2026-09-07
+
+Commit `7ef41d7` adds `--target-preflight-only` so the Oracle target baseline and
+DFlash2 export can run in separate processes. This avoids vLLM 0.28 retaining
+enough CUDA memory after target shutdown to prevent the draft engine from
+starting. The local regression is `135 passed, 2 skipped`; the focused AutoDL
+Oracle tests are `14 passed`.
+
+The two-process run isolated an Oracle runtime blocker rather than producing a
+formal fixture:
+
+- language-only target with the default V1 model runner produced first token
+  `11`;
+- language-only target with `VLLM_USE_V2_MODEL_RUNNER=1`, matching the runner
+  forced by DFlash2, produced `[0, 198, 9419, 0, 198, 9419, ...]`;
+- language-only DFlash2 on that V2 runner produced
+  `[198, 9419, 198, 9419, ...]`, dropping the target-only leading token `0`;
+- the first DFlash2 capture used target bonus token `198` and proposed
+  `[510, 9419, 0, 248046, 198, 27, 9419]`.
+
+Therefore `oracle_target_lossless=False` and semantic parity remains blocked in
+the Oracle vLLM runtime. The exporter correctly refuses a formal fixture; the
+only emitted fixture is explicitly marked `DEBUG_NON_LOSSLESS`. Relevant logs:
+
+- `logs/oracle_target_hello_language_only_20260907.log`
+- `logs/oracle_target_hello_v2_language_only_20260907.log`
+- `logs/oracle_dflash2_hello_formal_twoprocess_20260907.log`
+- `logs/oracle_dflash2_hello_v2_debug_20260907.log`
+
+This result is consistent with open upstream vLLM reports #50837 (repetitive or
+degenerate Qwen3.5 DFlash output) and #54928 (greedy Qwen3.8 divergence). Do not
+modify Mini-vLLM proposal semantics to imitate these Oracle outputs and do not
+promote the diagnostic fixture to PASS. Rerun the formal gate after the upstream
+runtime is fixed or replaced with a build that is target-lossless for this
+checkpoint.
+
+The exporter records the concrete runtime speculator class via `type(self)`.
+This matters because `DFlash2Speculator` inherits `DFlashSpeculator.propose()`;
+reporting the hooked parent method alone incorrectly labels a real DFlash2 run
+as DFlash1. The fixture also records `VLLM_USE_V2_MODEL_RUNNER`.
+
 ## Status Correction - 2026-09-06
 
 The project is not complete. Current status must be reported along four separate
@@ -7,8 +48,8 @@ dimensions:
 
 | Dimension | Status | Current evidence |
 | --- | --- | --- |
-| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`134 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
-| Semantic parity | PENDING | Formal one-step Oracle proposal alignment has not passed. Oracle exporter/output anomalies are tooling or API-path bugs and are not evidence that official Oracle DFlash is non-lossless. |
+| Correctness | PASS for tested B=1/B=2 smokes | Target-only and DFlash2 outputs are lossless in the recorded smokes, with non-zero drafted and accepted tokens. Request-batched proposal and the Oracle fixture gates pass the local regression (`135 passed, 2 skipped`); proposal batching also passed remote focused tests (`50 passed`) and the real B=2 GPU smoke. |
+| Semantic parity | BLOCKED in Oracle vLLM 0.28 | The two-process, same-runner check proves Oracle DFlash2 is not target-lossless for this checkpoint: V2 target-only begins with `0`, while DFlash2 begins with `198`. No formal fixture was accepted. |
 | Batching | PASS for tested B=2 path | Target cached decode, target verification, and DFlash2 proposal are request-dimension tensor-batched. The GPU smoke recorded 20 B=2 proposal calls, and unequal context lengths plus independent budgets are covered locally. |
 | Performance | NOT YET A WIN | The request-batched B=2/K=1 run took 7.2836s versus 6.6040s for target-only, about 10.3% slower. Proposal time improved by 33.3%, but end-to-end performance has not shown a stable gain. |
 
@@ -148,8 +189,8 @@ AutoDL GPU validation of request-dimension tensor-batched target verification.
 | DFlash2 weight/load-only | PASS remote/user-reported | Prior report says checkpoint audit and load-only passed. I did not rerun them locally. |
 | Fresh DFlash2 standalone proposal | PASS remote/user-reported | User reported `dflash2_standalone_proposal=PASS` after pulling commit `89fd865`. I did not rerun this locally. |
 | Old DFlash2 B=1 offline/online | STALE | Old B=1 PASS claims must be rerun after anchor/path/cache changes. The reported online B=1 run had `dflash2_proposed_tokens=189` and `dflash2_accepted_tokens=0`, so it proves target losslessness under rejection, not useful DFlash2 acceptance. |
-| Oracle fixtures with prompt-repeat/raw-output anomalies | TOOLING_BUG | Treat these as fixture/export interpretation failures, not evidence that official DFlash is non-lossless. The user reported Oracle exporter failures where DFlash output repeated prompt token `9419` and capture anchors were all `0`; after warmup capture was disabled, capture row 0 became single-prompt and started with `[11, 353, ...]`, while vLLM `CompletionOutput` itself still contained repeated `9419`. This now points mainly at Oracle LLM entrypoint/output behavior. Do not force formal alignment PASS from this fixture. |
-| Mini vs Oracle one-step proposal alignment | PENDING | Formal alignment still requires Oracle target-lossless output. The regenerated diagnostic fixture shows Oracle actually proposed from token `9419`, while Mini proposed from target bonus token `11`; proposal comparison is therefore skipped because the effective anchors differ. |
+| Oracle fixtures with prompt-repeat/raw-output anomalies | ORACLE_RUNTIME_BUG | The same-runner two-process check rules out retained CUDA state and completion-token parsing. V2 target-only emits `[0, 198, 9419, ...]`; V2 DFlash2 emits `[198, 9419, ...]`. The formal exporter rejects this non-lossless output. |
+| Mini vs Oracle one-step proposal alignment | BLOCKED | Formal alignment requires target-lossless Oracle output. The only current Oracle fixture is `DEBUG_NON_LOSSLESS`; it must not be compared as passing semantic evidence. |
 | Real GPU B=1 offline drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_offline_b1_20260905.log` has exact target-only/DFlash2 equality for 32 tokens, `proposed=143`, `accepted=8`, acceptance `0.055944055944055944`, and `qwen38_dflash2_engine_b1=PASS`; verified over SSH. |
 | Real GPU B=1 online drafted > 0 and accepted > 0 | PASS remote/log-verified | AutoDL log `logs/dflash2_online_b1_20260905.log` has exact token equality, the same proposal counters, multi-token chunks up to length 3, and `dflash2_online_b1=PASS`; verified over SSH. |
 | B=2 continuous batching | PASS remote/log-verified | Same-prompt and heterogeneous-prompt AutoDL runs both matched target-only token IDs exactly and reached shared target/speculative batch size 2. The heterogeneous log `logs/dflash2_online_b2_heterogeneous_20260905.log` reports `236 proposed`, `24 accepted`, acceptance `0.1016949152542373`, and per-request accepted counts 8 and 16. |
@@ -478,6 +519,7 @@ set -o pipefail
 source /root/autodl-tmp/vllm_qwen38_dflash2_oracle/.venv/bin/activate
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_WORKER_MULTIPROC_METHOD=fork
+export VLLM_USE_V2_MODEL_RUNNER=1
 export CUDA_LAUNCH_BLOCKING=1
 ORACLE_PY=python
 

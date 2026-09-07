@@ -10,6 +10,7 @@ from scripts.export_oracle_dflash2_fixture import (
     completion_output_token_ids,
     dflash_capture_contract_error,
     parse_args,
+    qualified_type_name,
     select_target_bonus_capture,
     tensor_attr_to_list,
     tensor_rows_to_list,
@@ -120,6 +121,15 @@ def test_main_rejects_conflicting_target_preflight_modes(monkeypatch):
 
     with pytest.raises(SystemExit, match="mutually exclusive"):
         oracle_exporter.main()
+
+
+def test_qualified_type_name_reports_runtime_subclass():
+    class RuntimeDFlash2Speculator:
+        pass
+
+    assert qualified_type_name(RuntimeDFlash2Speculator()).endswith(
+        ".RuntimeDFlash2Speculator"
+    )
 
 
 def test_tensor_rows_falls_back_for_compact_per_step_values():

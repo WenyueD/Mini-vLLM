@@ -329,6 +329,11 @@ def safe_len(value: Any) -> int | None:
         return None
 
 
+def qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__name__}"
+
+
 def tensor_rows_to_list(
     value: Any,
     rows: int,
@@ -488,6 +493,7 @@ def install_dflash_capture_hook(
             pass
         CAPTURES.append(
             {
+                "speculator_class": qualified_type_name(self),
                 "proposal_rows": proposal_rows,
                 "proposal_first_token_id": proposal_first_token_id,
                 "num_reqs": rows,
@@ -842,14 +848,13 @@ def main() -> None:
         "oracle_target_bonus_capture_matched": target_bonus_capture_matched,
         "oracle_runtime": {
             "vllm_version": getattr(vllm, "__version__", None),
-            "speculator_class": (
-                "vllm.v1.worker.gpu.spec_decode.dflash.speculator." "DFlashSpeculator"
-            ),
+            "speculator_class": capture.get("speculator_class"),
             "sample_from_anchor": capture.get("sample_from_anchor"),
             "sample_from_anchor_attr_present": capture.get(
                 "sample_from_anchor_attr_present"
             ),
             "language_model_only": args.language_model_only,
+            "use_v2_model_runner": os.environ.get("VLLM_USE_V2_MODEL_RUNNER"),
         },
         "minivllm_anchor_token_id": int(minivllm_anchor_token_id),
         "minivllm_anchor_token_source": minivllm_anchor_token_source,
