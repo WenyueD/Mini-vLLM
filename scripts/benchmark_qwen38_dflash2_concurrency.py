@@ -818,7 +818,26 @@ def compare_token_outputs(
     target: dict[str, list[int]],
     candidate: dict[str, list[int]],
     sample_limit: int,
+    target_diagnostics: list[dict[str, Any]] | None = None,
+    candidate_diagnostics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    def find_decision(
+        diagnostics: list[dict[str, Any]] | None,
+        request_id: str,
+        output_index: int,
+        *,
+        verifier: bool,
+    ) -> dict[str, Any] | None:
+        expected_offset = 0 if verifier else None
+        for record in diagnostics or ():
+            if (
+                record.get("request_id") == request_id
+                and record.get("output_index") == output_index
+                and record.get("query_offset") == expected_offset
+            ):
+                return dict(record)
+        return None
+
     sampled = list(target)[:sample_limit]
     mismatches = []
     for request_id in sampled:
@@ -832,27 +851,51 @@ def compare_token_outputs(
                     break
             if mismatch_at is None and len(target_tokens) != len(candidate_tokens):
                 mismatch_at = min(len(target_tokens), len(candidate_tokens))
-            mismatches.append(
-                {
-                    "request_id": request_id,
-                    "first_mismatch_output_index": mismatch_at,
-                    "target_token": (
-                        target_tokens[mismatch_at]
-                        if mismatch_at is not None and mismatch_at < len(target_tokens)
-                        else None
-                    ),
-                    "candidate_token": (
-                        candidate_tokens[mismatch_at]
-                        if mismatch_at is not None and mismatch_at < len(candidate_tokens)
-                        else None
-                    ),
-                    "top2_margin": None,
-                    "note": (
-                        "OnlineEngine streams token ids only; run the cached batch "
-                        "logit diagnostic for a top-2 margin if this mismatch occurs."
-                    ),
-                }
-            )
+            mismatch = {
+                "request_id": request_id,
+                "first_mismatch_output_index": mismatch_at,
+                "target_token": (
+                    target_tokens[mismatch_at]
+                    if mismatch_at is not None and mismatch_at < len(target_tokens)
+                    else None
+                ),
+                "candidate_token": (
+                    candidate_tokens[mismatch_at]
+                    if mismatch_at is not None and mismatch_at < len(candidate_tokens)
+                    else None
+                ),
+                "top2_margin": None,
+                "note": (
+                    "Enable --debug-metadata to attach target and candidate "
+                    "top-2 decision evidence."
+                ),
+            }
+            if mismatch_at is not None:
+                target_decision = find_decision(
+                    target_diagnostics,
+                    request_id,
+                    mismatch_at,
+                    verifier=False,
+                )
+                candidate_decision = find_decision(
+                    candidate_diagnostics,
+                    request_id,
+                    mismatch_at,
+                    verifier=True,
+                )
+                if target_decision is not None or candidate_decision is not None:
+                    mismatch["target_decision"] = target_decision
+                    mismatch["candidate_decision"] = candidate_decision
+                    mismatch["top2_margin"] = (
+                        None
+                        if candidate_decision is None
+                        else candidate_decision.get("top2_margin")
+                    )
+                    mismatch["note"] = (
+                        "Exact token mismatch; attached decisions are diagnostic "
+                        "evidence and do not relax the fairness failure."
+                    )
+            mismatches.append(mismatch)
     return {
         "sampled_requests": len(sampled),
         "exact_token_match": not mismatches,
@@ -1239,6 +1282,7 @@ def main() -> None:
                 prompt_audit,
             )
             for repeat in range(args.repeats):
+                repeat_summaries = {}
                 for variant in args.variants:
                     print(
                         f"run variant={variant} workload={workload_name} "
@@ -1257,6 +1301,7 @@ def main() -> None:
                         int(eos),
                     )
                     all_summaries.append(summary)
+                    repeat_summaries[variant] = summary
                     raw_path = summary.get("artifacts", {}).get("request_jsonl")
                     if raw_path and Path(raw_path).exists():
                         outputs = {}
@@ -1269,7 +1314,19 @@ def main() -> None:
                 dflash_key = ("dflash2", workload_name, concurrency, repeat)
                 if target_key in token_samples and dflash_key in token_samples:
                     fairness = compare_token_outputs(
-                        token_samples[target_key], token_samples[dflash_key], sample_limit=8
+                        token_samples[target_key],
+                        token_samples[dflash_key],
+                        sample_limit=8,
+                        target_diagnostics=(
+                            repeat_summaries.get("target_only", {})
+                            .get("engine", {})
+                            .get("target_decision_diagnostics", [])
+                        ),
+                        candidate_diagnostics=(
+                            repeat_summaries.get("dflash2", {})
+                            .get("engine", {})
+                            .get("target_decision_diagnostics", [])
+                        ),
                     )
                     fairness_path = (
                         run_dir

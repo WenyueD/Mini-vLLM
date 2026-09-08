@@ -2,23 +2,43 @@
 
 ## Status
 
-This phase produced the reproducible benchmark harness and CPU-verifiable tests,
-but did not produce A800 performance numbers in this local run.
+The A800 host became reachable at the new endpoint on 2026-09-08. Pilot,
+short-matrix, cleanup, repeatability, and target-decision diagnostic runs were
+completed. The performance cells run successfully, but strict lossless status
+is blocked by one reproducible C=4 BF16 near-tie mismatch.
 
-- Locally verified: `141 passed, 2 skipped` with
-  `D:\LLM项目\MinivLLM\.venv\Scripts\python.exe -m pytest`.
-- Locally verified: dry-run plan generation with
-  `D:\LLM项目\MinivLLM\.venv\Scripts\python.exe scripts\benchmark_qwen38_dflash2_concurrency.py --dry-run --run-id local_dry_run`.
-- Locally blocked: the local `.venv` has `torch 2.9.1+cpu`; no CUDA runtime is
-  available here for real Qwen3.8-27B execution.
-- Remote blocked: the prior AutoDL SSH endpoint
-  `root@connect.bjb1.seetacloud.com:15723` refused the connection after an
-  escalated SSH reachability check.
+- Local regression: `150 passed, 2 skipped`.
+- Remote focused Qwen regression at commit `525f7cf`: `19 passed`.
+- Remote runtime: NVIDIA A800-SXM4-80GB, Python 3.11.16, PyTorch 2.9.1+cu128,
+  CUDA 12.8, BF16.
+- Target-only reproducibility: two independent C=4 model reloads produced
+  identical outputs for all 8 requests and all 512 generated tokens.
+- Short matrix: C=1, C=2, and C=8 passed exact token equality; C=4 did not.
+- Formal multi-workload matrix and soak remain gated because C=4 is not
+  strictly target-lossless.
 
 The benchmark remains Mini-vLLM target-only vs Mini-vLLM DFlash2. The official
 vLLM 0.28 V2 Oracle semantic alignment limitation remains in force: the Oracle
 runner is blocked by non-lossless runtime behavior, so this report must not be
 read as full official DFlash2 alignment.
+
+## Remote Fixes
+
+The remote campaign exposed and fixed several independent implementation and
+harness failures:
+
+- `0531f1b`: run target inference under `torch.inference_mode()` and make
+  constructor failures clean up distributed state.
+- `62f7143`: preserve every runtime counter key when resetting after warmup.
+- `46776ba`: release the speculative proposer and retained model runner during
+  engine shutdown. This removed a 53.7 GiB cross-cell GPU memory leak.
+- `de89110`: hold cached Qwen attention context width constant.
+- `f3534e2`: hold cached Qwen batch size constant with dummy request states.
+- `525f7cf`: capture bounded target-decision top-2 diagnostics for ordinary and
+  speculative paths.
+
+All remote cells after the cleanup fix could load target-only and DFlash2
+sequentially in one process without OOM or NCCL shutdown failures.
 
 ## Harness
 
@@ -64,10 +84,58 @@ Local tests cover:
   lengths while still reaching shared decode batching.
 
 The harness records exact token-ID comparisons for sampled target-only/DFlash2
-outputs. If a sampled mismatch appears, the current streaming API cannot attach
-top-2 logit margins directly; the mismatch record is preserved and should be
-followed by the existing cached-batch logit diagnostic to classify exact argmax
-ties.
+outputs. With `--debug-metadata`, it also records the request, output index,
+source path, query offset, active batch size, input token, actual argmax token,
+top-two token IDs/logits, and top-two margin. Fairness remains a strict token-ID
+comparison; diagnostics classify failures but never turn them into passes.
+
+## Short Results
+
+The C=1/C=2/C=8 rows are from the fixed-attention-width short matrix at
+`de89110`. The C=4 row is the newer fixed-batch gate at `f3534e2`. Each row has
+8 requests, 128 input tokens, 64 output tokens, K=1, and one measured repeat.
+
+| C | Target output tok/s | DFlash2 output tok/s | DFlash/target | Acceptance | Target peak GiB | DFlash peak GiB | Exact |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 1 | 4.275 | 3.454 | 0.808x | 25.19% | 55.17 | 58.07 | yes |
+| 2 | 5.381 | 4.436 | 0.824x | 24.87% | 55.18 | 58.07 | yes |
+| 4 | 5.825 | 5.118 | 0.879x | 25.19% | 55.17 | 58.07 | no |
+| 8 | 6.272 | 5.586 | 0.891x | 27.04% | 55.18 | 58.91 | yes |
+
+DFlash2 is slower than target-only at every tested concurrency. Its relative
+throughput improves as concurrency rises, but this pilot does not demonstrate a
+speedup. C=4 DFlash2 has better median TTFT (34.07s versus 37.81s) but worse
+median E2E latency (49.86s versus 43.94s) and worse median TPOT (0.251s versus
+0.084s).
+
+Artifacts:
+
+- `results/qwen38_dflash2_perf/qwen38_dflash2_short_matrix_fixedpad_k1_20260908`
+- `results/qwen38_dflash2_perf/qwen38_dflash2_fixedbatch_c4_gate_20260908`
+- `logs/qwen38_dflash2_perf/qwen38_target_repro_c4_r2_20260908`
+
+## Fairness Diagnosis
+
+Fixed attention width reduced the short matrix to one C=4 mismatch. Fixed batch
+size removed that mismatch, but another appeared for `short-000000` at output
+index 61. The diagnostic rerun at `525f7cf` reproduced the same token pair after
+an exact prefix through index 60:
+
+| Path | Token 25 logit | Token 13 logit | Margin | Greedy result |
+|---|---:|---:|---:|---:|
+| target-only decode | 22.375 | 22.250 | 0.125 | 25 |
+| DFlash2 verifier, query offset 0 | 22.250 | 22.250 | 0.000 | 13 |
+
+The DFlash2 verifier produces an exact BF16 tie, and `torch.argmax` selects the
+lower token ID, 13. This is consistent with accumulated low-precision state
+sensitivity after accepted speculative tokens. It is not consistent with an
+unstable target-only baseline, and no request failure, cache exception, OOM, or
+shutdown error accompanied it.
+
+Artifacts:
+
+- `results/qwen38_dflash2_perf/qwen38_dflash2_target_decision_diag_c4_20260908`
+- `logs/qwen38_dflash2_perf/qwen38_dflash2_target_decision_diag_c4_20260908`
 
 ## Remote Commands
 
@@ -125,13 +193,12 @@ use the recorded memory/failure fields as capacity evidence.
 
 ## Current Conclusion
 
-No new A800 throughput or latency conclusion is available from this run. The
-latest measured performance conclusion remains the prior log-verified B=2/K=1
-short run: target-only around 6.6040s and DFlash2 around 7.2836s, with DFlash2
-about 10.3% slower. Treat that as prior evidence, not as a result from the new
-high-concurrency matrix.
+The A800 execution and memory lifecycle are now healthy, and the concurrency
+harness produces complete performance artifacts. K=1 DFlash2 remains slower
+than target-only across C=1/2/4/8, with roughly 25-27% draft acceptance.
 
-The next useful step is to run the pilot command on a reachable A800 host, check
-lossless sampled outputs, drafted/accepted counters, queue/active-batch traces,
-and memory release, then expand to the formal matrix without changing the
-algorithm between runs.
+The implementation cannot yet claim strict target losslessness at C=4. The
+formal matrix should remain blocked until the cached target state is numerically
+invariant across ordinary and accepted-speculative scheduling, or a documented
+higher-precision target decision policy is implemented for both paths. A logit
+tolerance must not be used to relabel the current mismatch as an exact pass.

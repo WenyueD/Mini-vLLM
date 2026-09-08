@@ -130,6 +130,35 @@ def test_schema_validation_and_token_comparison_diagnostics():
     assert comparison["mismatches"][0]["first_mismatch_output_index"] == 1
     assert comparison["mismatches"][0]["top2_margin"] is None
 
+    diagnostic_comparison = compare_token_outputs(
+        {"a": [1, 2]},
+        {"a": [1, 9]},
+        sample_limit=8,
+        target_diagnostics=[
+            {
+                "request_id": "a",
+                "output_index": 1,
+                "query_offset": None,
+                "argmax_token_id": 2,
+                "top2_margin": 0.125,
+            }
+        ],
+        candidate_diagnostics=[
+            {
+                "request_id": "a",
+                "output_index": 1,
+                "query_offset": 0,
+                "argmax_token_id": 9,
+                "top2_margin": 0.0,
+            }
+        ],
+    )
+    diagnostic = diagnostic_comparison["mismatches"][0]
+    assert diagnostic["target_decision"]["argmax_token_id"] == 2
+    assert diagnostic["candidate_decision"]["argmax_token_id"] == 9
+    assert diagnostic["top2_margin"] == 0.0
+    assert not diagnostic_comparison["exact_token_match"]
+
 
 def test_reset_runtime_stats_preserves_and_zeros_all_counter_keys():
     runner = SimpleNamespace(

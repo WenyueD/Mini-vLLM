@@ -859,6 +859,7 @@ class ModelRunner:
                 int(input_token_id) if input_token_id is not None else None
             ),
             "query_offset": int(query_offset) if query_offset is not None else None,
+            "argmax_token_id": int(flat_logits.argmax().item()),
             "top1_token_id": int(token_ids[0]),
             "top1_logit": float(values[0]),
             "top2_token_id": int(token_ids[1]) if top_count > 1 else None,

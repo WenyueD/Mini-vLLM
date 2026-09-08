@@ -756,6 +756,7 @@ def test_runner_target_decision_diagnostics_capture_top2_and_cap_history():
         "active_batch_size": 3,
         "input_token_id": 7,
         "query_offset": 1,
+        "argmax_token_id": 1,
         "top1_token_id": 1,
         "top1_logit": 4.0,
         "top2_token_id": 2,
