@@ -333,26 +333,47 @@ def reset_runtime_stats(engine: Any) -> None:
     from myvllm.engine.metrics import EngineMetrics
     from myvllm.spec_decode.metrics import SpecDecodeMetrics
 
+    def reset_counters(counters: dict[str, Any]) -> dict[str, Any]:
+        reset: dict[str, Any] = {}
+        for key, value in counters.items():
+            if isinstance(value, bool):
+                reset[key] = False
+            elif isinstance(value, int):
+                reset[key] = 0
+            elif isinstance(value, float):
+                reset[key] = 0.0
+            elif isinstance(value, dict):
+                reset[key] = {}
+            elif isinstance(value, list):
+                reset[key] = []
+            elif isinstance(value, tuple):
+                reset[key] = ()
+            else:
+                reset[key] = value
+        return reset
+
     engine.metrics = EngineMetrics(engine.config.get("max_metrics_history", 256))
     coordinator = getattr(engine, "spec_decode_coordinator", None)
     if coordinator is not None:
         coordinator.metrics = SpecDecodeMetrics()
     runner = getattr(engine, "model_runner", None)
     if runner is not None and hasattr(runner, "_qwen35_verification_stats"):
-        runner._qwen35_verification_stats = {
-            "max_batch_size": 0,
-            "tensor_batched_token_steps": 0,
-        }
+        runner._qwen35_verification_stats = reset_counters(
+            runner._qwen35_verification_stats
+        )
     if runner is not None and hasattr(runner, "_dflash2_profile_stats"):
-        runner._dflash2_profile_stats = {
-            "max_proposal_batch_size": 0,
-            "proposal_calls": 0,
-            "context_combine_seconds": 0.0,
-            "context_projection_seconds": 0.0,
-            "context_cache_install_seconds": 0.0,
-            "tensor_batched_proposal_calls": 0,
-            "proposal_stage_seconds": {},
-        }
+        runner._dflash2_profile_stats = reset_counters(
+            runner._dflash2_profile_stats
+        )
+
+
+def run_summary_failed(summary: dict[str, Any]) -> bool:
+    if summary.get("error") or summary.get("schema_errors"):
+        return True
+    if summary.get("timing", {}).get("failed_requests", 0):
+        return True
+    admission_failures = summary.get("failures", {}).get("admission_failures", [])
+    return bool(admission_failures)
 
 
 def cuda_memory_snapshot(device: Any) -> dict[str, Any]:
@@ -1180,6 +1201,7 @@ def main() -> None:
     if eos is None:
         eos = normalize_eos(text_config.eos_token_id)
     all_summaries: list[dict[str, Any]] = []
+    fairness_failures: list[str] = []
     token_samples: dict[tuple[str, str, int, int], dict[str, list[int]]] = {}
     for workload_name in args.workload:
         for concurrency in args.concurrency:
@@ -1241,19 +1263,25 @@ def main() -> None:
                     fairness = compare_token_outputs(
                         token_samples[target_key], token_samples[dflash_key], sample_limit=8
                     )
-                    write_json(
-                        run_dir / f"fairness_{workload_name}_c{concurrency}_r{repeat}.json",
-                        fairness,
+                    fairness_path = (
+                        run_dir
+                        / f"fairness_{workload_name}_c{concurrency}_r{repeat}.json"
                     )
+                    write_json(fairness_path, fairness)
+                    if not fairness["exact_token_match"]:
+                        fairness_failures.append(os.fspath(fairness_path))
     write_json(run_dir / "all_summaries.json", all_summaries)
     aggregate = aggregate_matrix(all_summaries)
     write_json(run_dir / "aggregate.json", aggregate)
     write_summary_csv(run_dir / "summary.csv", all_summaries)
     print(f"results_dir={run_dir}", flush=True)
     print(f"logs_dir={log_dir}", flush=True)
-    failures = [summary for summary in all_summaries if summary.get("error")]
-    if failures:
-        raise SystemExit(f"{len(failures)} benchmark cell(s) failed; inspect summary JSON")
+    failures = [summary for summary in all_summaries if run_summary_failed(summary)]
+    if failures or fairness_failures:
+        raise SystemExit(
+            f"{len(failures)} benchmark cell(s) failed and "
+            f"{len(fairness_failures)} fairness check(s) failed; inspect result JSON"
+        )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from scripts.benchmark_qwen38_dflash2_concurrency import (
@@ -5,6 +7,8 @@ from scripts.benchmark_qwen38_dflash2_concurrency import (
     compare_token_outputs,
     latency_summary,
     percentile,
+    reset_runtime_stats,
+    run_summary_failed,
     summarize_acceptance,
     summarize_monitor,
     summarize_repeats,
@@ -125,3 +129,60 @@ def test_schema_validation_and_token_comparison_diagnostics():
     assert not comparison["exact_token_match"]
     assert comparison["mismatches"][0]["first_mismatch_output_index"] == 1
     assert comparison["mismatches"][0]["top2_margin"] is None
+
+
+def test_reset_runtime_stats_preserves_and_zeros_all_counter_keys():
+    runner = SimpleNamespace(
+        _qwen35_verification_stats={
+            "calls": 7,
+            "max_batch_size": 4,
+            "last_active_batch_sizes": (2, 4),
+        },
+        _dflash2_profile_stats={
+            "context_cache_update_calls": 9,
+            "proposal_seconds": 1.25,
+            "proposal_stage_seconds": {"forward": 0.5},
+        },
+    )
+    engine = SimpleNamespace(
+        config={"max_metrics_history": 32},
+        metrics=None,
+        spec_decode_coordinator=SimpleNamespace(metrics=None),
+        model_runner=runner,
+    )
+
+    reset_runtime_stats(engine)
+
+    assert runner._qwen35_verification_stats == {
+        "calls": 0,
+        "max_batch_size": 0,
+        "last_active_batch_sizes": (),
+    }
+    assert runner._dflash2_profile_stats == {
+        "context_cache_update_calls": 0,
+        "proposal_seconds": 0.0,
+        "proposal_stage_seconds": {},
+    }
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"error": "boom"},
+        {"schema_errors": ["missing timing"]},
+        {"timing": {"failed_requests": 1}},
+        {"failures": {"admission_failures": [{"request_id": "a"}]}},
+    ],
+)
+def test_run_summary_failed_catches_cell_and_request_failures(summary):
+    assert run_summary_failed(summary)
+
+
+def test_run_summary_failed_accepts_clean_summary():
+    assert not run_summary_failed(
+        {
+            "schema_errors": [],
+            "timing": {"failed_requests": 0},
+            "failures": {"admission_failures": []},
+        }
+    )
