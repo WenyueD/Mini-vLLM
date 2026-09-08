@@ -317,6 +317,7 @@ def build_config(
             "strict_language_weights": True,
             "dflash2_safe_open_device": dflash_safe_open,
             "dflash2_debug_metadata": args.debug_metadata,
+            "debug_target_decisions": args.debug_metadata,
             "dflash2_profile_stages": args.profile_dflash2_stages,
             "speculative_config": {
                 "enabled": speculative,
@@ -365,6 +366,8 @@ def reset_runtime_stats(engine: Any) -> None:
         runner._dflash2_profile_stats = reset_counters(
             runner._dflash2_profile_stats
         )
+    if runner is not None and hasattr(runner, "_target_decision_diagnostics"):
+        runner._target_decision_diagnostics = []
 
 
 def run_summary_failed(summary: dict[str, Any]) -> bool:
@@ -773,6 +776,9 @@ def summarize_engine_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "target_forward_count_estimate": stats.get("engine_steps"),
         "speculative_stage_seconds": stage_seconds,
         "qwen35_verification": stats.get("qwen35_verification", {}),
+        "target_decision_diagnostics": stats.get(
+            "target_decision_diagnostics", []
+        ),
         "dflash2_profile": stats.get("dflash2_profile", {}),
         "requests": stats.get("requests", {}),
         "online_requests": stats.get("online_requests", {}),

@@ -708,6 +708,79 @@ def test_runner_dflash2_b2_proposals_rollback_as_one_batch_on_failure():
     assert runner.dflash2_draft_cache._proposal_length_snapshots_by_request == {}
 
 
+def test_runner_target_decision_diagnostics_capture_top2_and_cap_history():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {
+        "debug_target_decisions": True,
+        "max_metrics_history": 2,
+    }
+    runner._target_decision_diagnostics = []
+    seq = Sequence([10, 11], request_id="req0")
+
+    runner._record_target_decision(
+        seq,
+        torch.tensor([0.5, 2.0, 1.75]),
+        output_index=0,
+        source="prefill",
+        active_batch_size=1,
+        input_token_id=11,
+    )
+    runner._record_target_decision(
+        seq,
+        torch.tensor([3.0, 2.5, 1.0]),
+        output_index=1,
+        source="decode",
+        active_batch_size=4,
+        input_token_id=2,
+    )
+    runner._record_target_decision(
+        seq,
+        torch.tensor([1.0, 4.0, 3.0]),
+        output_index=2,
+        source="verify",
+        active_batch_size=3,
+        input_token_id=7,
+        query_offset=1,
+    )
+
+    diagnostics = runner.get_target_decision_diagnostics()
+    assert [record["output_index"] for record in diagnostics] == [1, 2]
+    assert diagnostics[0]["top1_token_id"] == 0
+    assert diagnostics[0]["top2_token_id"] == 1
+    assert diagnostics[0]["top2_margin"] == pytest.approx(0.5)
+    assert diagnostics[1] == {
+        "request_id": "req0",
+        "sequence_id": seq.seq_id,
+        "output_index": 2,
+        "source": "verify",
+        "active_batch_size": 3,
+        "input_token_id": 7,
+        "query_offset": 1,
+        "top1_token_id": 1,
+        "top1_logit": 4.0,
+        "top2_token_id": 2,
+        "top2_logit": 3.0,
+        "top2_margin": 1.0,
+    }
+
+
+def test_runner_target_decision_diagnostics_are_disabled_by_default():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {}
+    runner._target_decision_diagnostics = []
+    seq = Sequence([10], request_id="req0")
+
+    runner._record_target_decision(
+        seq,
+        torch.tensor([0.0, 1.0]),
+        output_index=0,
+        source="prefill",
+        active_batch_size=1,
+    )
+
+    assert runner.get_target_decision_diagnostics() == []
+
+
 def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets():
     class FakeDraft(torch.nn.Module):
         def __init__(self):

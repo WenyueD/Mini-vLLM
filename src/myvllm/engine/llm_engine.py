@@ -303,6 +303,10 @@ class LLMEngine:
             result["qwen35_verification"] = model_runner.call(
                 "get_qwen35_verification_stats"
             )
+            if hasattr(model_runner, "get_target_decision_diagnostics"):
+                result["target_decision_diagnostics"] = model_runner.call(
+                    "get_target_decision_diagnostics"
+                )
         if model_runner is not None and getattr(
             model_runner, "dflash2_draft_model", None
         ) is not None:

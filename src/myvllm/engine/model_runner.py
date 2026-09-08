@@ -77,6 +77,7 @@ class ModelRunner:
             "total_token_steps": 0,
             "last_active_batch_sizes": (),
         }
+        self._target_decision_diagnostics = []
         self.dflash2_draft_model = None
         self.dflash2_draft_cache = None
         self._dflash2_contexts = {}
@@ -750,6 +751,15 @@ class ModelRunner:
                     logits = torch.cat(
                         [output.logits[:, -1, :] for output in outputs], dim=0
                     )
+                    for seq, row_logits in zip(seqs, logits):
+                        self._record_target_decision(
+                            seq,
+                            row_logits,
+                            output_index=seq.num_completion_tokens,
+                            source="decode",
+                            active_batch_size=len(seqs),
+                            input_token_id=seq.last_token,
+                        )
                     token_ids = self.sampler(logits, self.prepare_sample(seqs))
                     token_ids = token_ids.reshape(-1)
                     if token_ids.numel() != len(seqs):
@@ -777,6 +787,14 @@ class ModelRunner:
                     if self.rank != 0:
                         continue
                     logits = output.logits[:, -1, :]
+                    self._record_target_decision(
+                        seq,
+                        logits[0],
+                        output_index=0,
+                        source="prefill",
+                        active_batch_size=1,
+                        input_token_id=seq.last_token,
+                    )
                     token_ids = self.sampler(logits, self.prepare_sample([seq]))
                     token_ids = token_ids.reshape(-1)
                     if token_ids.numel() != 1:
@@ -808,6 +826,58 @@ class ModelRunner:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
+
+    def _record_target_decision(
+        self,
+        seq: Sequence,
+        logits: torch.Tensor,
+        *,
+        output_index: int,
+        source: str,
+        active_batch_size: int,
+        input_token_id: int | None = None,
+        query_offset: int | None = None,
+    ) -> None:
+        config = getattr(self, "config", {})
+        if not config.get("debug_target_decisions", False):
+            return
+        history_limit = int(config.get("max_metrics_history", 256))
+        if history_limit <= 0:
+            return
+        flat_logits = logits.detach().reshape(-1)
+        top_count = min(2, flat_logits.numel())
+        top_values, top_indices = torch.topk(flat_logits, k=top_count)
+        token_ids = top_indices.detach().cpu().tolist()
+        values = top_values.float().detach().cpu().tolist()
+        record = {
+            "request_id": seq.request_id,
+            "sequence_id": seq.seq_id,
+            "output_index": int(output_index),
+            "source": source,
+            "active_batch_size": int(active_batch_size),
+            "input_token_id": (
+                int(input_token_id) if input_token_id is not None else None
+            ),
+            "query_offset": int(query_offset) if query_offset is not None else None,
+            "top1_token_id": int(token_ids[0]),
+            "top1_logit": float(values[0]),
+            "top2_token_id": int(token_ids[1]) if top_count > 1 else None,
+            "top2_logit": float(values[1]) if top_count > 1 else None,
+            "top2_margin": (
+                float(values[0] - values[1]) if top_count > 1 else None
+            ),
+        }
+        history = getattr(self, "_target_decision_diagnostics", None)
+        if history is None:
+            history = []
+            self._target_decision_diagnostics = history
+        history.append(record)
+        if len(history) > history_limit:
+            del history[:-history_limit]
+
+    def get_target_decision_diagnostics(self) -> list[dict]:
+        history = getattr(self, "_target_decision_diagnostics", ())
+        return [dict(record) for record in history]
 
     def _store_dflash2_context_from_target_output(
         self,
@@ -1202,6 +1272,18 @@ class ModelRunner:
             for seq, query_tokens, output in zip(
                 batch.sequences, query_tokens_by_request, outputs
             ):
+                for query_offset, input_token_id in enumerate(query_tokens):
+                    self._record_target_decision(
+                        seq,
+                        output.logits[0, query_offset, :],
+                        output_index=seq.num_completion_tokens + query_offset,
+                        source="verify",
+                        active_batch_size=sum(
+                            length > query_offset for length in query_lengths
+                        ),
+                        input_token_id=input_token_id,
+                        query_offset=query_offset,
+                    )
                 transaction = transactions[seq.request_id]
                 token_ids = tuple(flat_token_ids[offset : offset + len(query_tokens)])
                 offset += len(query_tokens)
