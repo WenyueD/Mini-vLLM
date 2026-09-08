@@ -1,7 +1,7 @@
 import torch
 
 from myvllm.engine.sequence import Sequence
-from myvllm.sampling import logits_to_token_ids
+from myvllm.sampling import greedy_token_ids, logits_to_token_ids
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.spec_decode import (
     MockProposer,
@@ -20,6 +20,20 @@ def test_temperature_zero_is_legal_and_exact_argmax():
     temperatures = torch.zeros(2)
     expected = torch.tensor([1, 2])
     assert torch.equal(logits_to_token_ids(logits, temperatures), expected)
+
+
+def test_temperature_zero_uses_documented_exact_tie_break():
+    logits = torch.tensor(
+        [
+            [1.0, 4.0, 4.0, 2.0],
+            [3.0, 3.0, 1.0, 3.0],
+        ]
+    )
+
+    expected = torch.tensor([2, 3])
+
+    assert torch.equal(greedy_token_ids(logits), expected)
+    assert torch.equal(logits_to_token_ids(logits, torch.zeros(2)), expected)
 
 
 def test_positive_temperature_path_remains_available():

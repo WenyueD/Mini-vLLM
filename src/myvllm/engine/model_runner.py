@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 import pickle
 import torch.distributed as dist
 from pathlib import Path
@@ -28,6 +29,7 @@ from myvllm.spec_decode.dflash2 import (
     DFlash2DraftModel,
     load_dflash2_weights_from_safetensors,
 )
+from myvllm.sampling import greedy_token_ids
 
 
 _CONFIG_DTYPES = {
@@ -751,7 +753,26 @@ class ModelRunner:
                     logits = torch.cat(
                         [output.logits[:, -1, :] for output in outputs], dim=0
                     )
-                    for seq, row_logits in zip(seqs, logits):
+                    hidden_states = (
+                        torch.cat(
+                            [output.hidden_states[:, -1, :] for output in outputs],
+                            dim=0,
+                        )
+                        if all(hasattr(output, "hidden_states") for output in outputs)
+                        else None
+                    )
+                    token_ids = self._sample_qwen35_logits(
+                        logits,
+                        self.prepare_sample(seqs),
+                        hidden_states=hidden_states,
+                    )
+                    token_ids = token_ids.reshape(-1)
+                    if token_ids.numel() != len(seqs):
+                        raise RuntimeError(
+                            "Qwen3.5/Qwen3.8 batched sampler returned the wrong "
+                            "token count"
+                        )
+                    for seq, row_logits, token_id in zip(seqs, logits, token_ids):
                         self._record_target_decision(
                             seq,
                             row_logits,
@@ -759,13 +780,7 @@ class ModelRunner:
                             source="decode",
                             active_batch_size=len(seqs),
                             input_token_id=seq.last_token,
-                        )
-                    token_ids = self.sampler(logits, self.prepare_sample(seqs))
-                    token_ids = token_ids.reshape(-1)
-                    if token_ids.numel() != len(seqs):
-                        raise RuntimeError(
-                            "Qwen3.5/Qwen3.8 batched sampler returned the wrong "
-                            "token count"
+                            selected_token_id=int(token_id.item()),
                         )
                     for seq, output, token_id in zip(seqs, outputs, token_ids):
                         self._store_dflash2_context_from_target_output(
@@ -787,6 +802,21 @@ class ModelRunner:
                     if self.rank != 0:
                         continue
                     logits = output.logits[:, -1, :]
+                    token_ids = self._sample_qwen35_logits(
+                        logits,
+                        self.prepare_sample([seq]),
+                        hidden_states=(
+                            output.hidden_states[:, -1, :]
+                            if hasattr(output, "hidden_states")
+                            else None
+                        ),
+                    )
+                    token_ids = token_ids.reshape(-1)
+                    if token_ids.numel() != 1:
+                        raise RuntimeError(
+                            "Qwen3.5/Qwen3.8 per-request sampler returned "
+                            f"{token_ids.numel()} tokens"
+                        )
                     self._record_target_decision(
                         seq,
                         logits[0],
@@ -794,14 +824,8 @@ class ModelRunner:
                         source="prefill",
                         active_batch_size=1,
                         input_token_id=seq.last_token,
+                        selected_token_id=int(token_ids[0].item()),
                     )
-                    token_ids = self.sampler(logits, self.prepare_sample([seq]))
-                    token_ids = token_ids.reshape(-1)
-                    if token_ids.numel() != 1:
-                        raise RuntimeError(
-                            "Qwen3.5/Qwen3.8 per-request sampler returned "
-                            f"{token_ids.numel()} tokens"
-                        )
                     sampled_tokens.append(token_ids)
                     self._store_dflash2_context_from_target_output(
                         seq,
@@ -827,6 +851,42 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def _sample_qwen35_logits(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        *,
+        hidden_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hidden_states is None or not torch.all(temperatures == 0):
+            return self.sampler(logits, temperatures)
+        token_ids = greedy_token_ids(logits)
+        if not self.config.get("resolve_greedy_ties_with_fp32_lm_head", True):
+            return token_ids
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_hidden = hidden_states.reshape(flat_logits.shape[0], -1)
+        flat_token_ids = token_ids.reshape(-1)
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is None:
+            return token_ids
+        bias = getattr(lm_head, "bias", None)
+        for row in range(flat_logits.shape[0]):
+            row_logits = flat_logits[row]
+            tied_token_ids = (
+                (row_logits == row_logits.max()).nonzero(as_tuple=False).reshape(-1)
+            )
+            if tied_token_ids.numel() <= 1:
+                continue
+            tied_weight = lm_head.weight.index_select(0, tied_token_ids)
+            tied_scores = F.linear(
+                flat_hidden[row : row + 1].float(),
+                tied_weight.float(),
+                None if bias is None else bias.index_select(0, tied_token_ids).float(),
+            )
+            tied_index = int(greedy_token_ids(tied_scores).item())
+            flat_token_ids[row] = tied_token_ids[tied_index]
+        return flat_token_ids.reshape(token_ids.shape)
+
     def _record_target_decision(
         self,
         seq: Sequence,
@@ -837,6 +897,7 @@ class ModelRunner:
         active_batch_size: int,
         input_token_id: int | None = None,
         query_offset: int | None = None,
+        selected_token_id: int | None = None,
     ) -> None:
         config = getattr(self, "config", {})
         if not config.get("debug_target_decisions", False):
@@ -849,6 +910,8 @@ class ModelRunner:
         top_values, top_indices = torch.topk(flat_logits, k=top_count)
         token_ids = top_indices.detach().cpu().tolist()
         values = top_values.float().detach().cpu().tolist()
+        max_logit = flat_logits.max()
+        tied_token_ids = (flat_logits == max_logit).nonzero(as_tuple=False).reshape(-1)
         record = {
             "request_id": seq.request_id,
             "sequence_id": seq.seq_id,
@@ -859,7 +922,23 @@ class ModelRunner:
                 int(input_token_id) if input_token_id is not None else None
             ),
             "query_offset": int(query_offset) if query_offset is not None else None,
-            "argmax_token_id": int(flat_logits.argmax().item()),
+            "argmax_token_id": int(
+                selected_token_id
+                if selected_token_id is not None
+                else greedy_token_ids(flat_logits).item()
+            ),
+            "exact_tie_break_policy": (
+                "bf16_max_then_fp32_lm_head_tied_tokens"
+                if config.get("resolve_greedy_ties_with_fp32_lm_head", True)
+                else "highest_token_id"
+            ),
+            "max_tie_count": int(tied_token_ids.numel()),
+            "max_tie_min_token_id": (
+                int(tied_token_ids.min().item()) if tied_token_ids.numel() else None
+            ),
+            "max_tie_max_token_id": (
+                int(tied_token_ids.max().item()) if tied_token_ids.numel() else None
+            ),
             "top1_token_id": int(token_ids[0]),
             "top1_logit": float(values[0]),
             "top2_token_id": int(token_ids[1]) if top_count > 1 else None,
@@ -1260,14 +1339,28 @@ class ModelRunner:
                 ],
                 dim=0,
             )
+            flat_hidden_states = (
+                torch.cat(
+                    [
+                        output.hidden_states.reshape(-1, output.hidden_states.shape[-1])
+                        for output in outputs
+                    ],
+                    dim=0,
+                )
+                if all(hasattr(output, "hidden_states") for output in outputs)
+                else None
+            )
             temperatures = torch.zeros(
                 flat_logits.shape[0],
                 dtype=torch.float32,
                 device=flat_logits.device,
             )
-            flat_token_ids = (
-                self.sampler(flat_logits, temperatures).detach().cpu().tolist()
+            flat_token_ids_tensor = self._sample_qwen35_logits(
+                flat_logits,
+                temperatures,
+                hidden_states=flat_hidden_states,
             )
+            flat_token_ids = flat_token_ids_tensor.detach().cpu().tolist()
             results = []
             offset = 0
             for seq, query_tokens, output in zip(
@@ -1284,6 +1377,7 @@ class ModelRunner:
                         ),
                         input_token_id=input_token_id,
                         query_offset=query_offset,
+                        selected_token_id=int(flat_token_ids[offset + query_offset]),
                     )
                 transaction = transactions[seq.request_id]
                 token_ids = tuple(flat_token_ids[offset : offset + len(query_tokens)])

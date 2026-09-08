@@ -757,6 +757,10 @@ def test_runner_target_decision_diagnostics_capture_top2_and_cap_history():
         "input_token_id": 7,
         "query_offset": 1,
         "argmax_token_id": 1,
+        "exact_tie_break_policy": "bf16_max_then_fp32_lm_head_tied_tokens",
+        "max_tie_count": 1,
+        "max_tie_min_token_id": 1,
+        "max_tie_max_token_id": 1,
         "top1_token_id": 1,
         "top1_logit": 4.0,
         "top2_token_id": 2,
@@ -780,6 +784,31 @@ def test_runner_target_decision_diagnostics_are_disabled_by_default():
     )
 
     assert runner.get_target_decision_diagnostics() == []
+
+
+def test_runner_qwen35_resolves_bf16_greedy_ties_with_fp32_lm_head():
+    config = tiny_config(num_layers=1)
+    config["text_config"]["vocab_size"] = 4
+    model = Qwen35ForCausalLM.from_config_dict(config)
+    model.lm_head.weight.data.zero_()
+    model.lm_head.weight.data[1, 0] = 1.0
+    model.lm_head.weight.data[2, 0] = 0.5
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.config = {"resolve_greedy_ties_with_fp32_lm_head": True}
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+
+    logits = torch.tensor([[0.0, 2.0, 2.0, 1.0]])
+    hidden_states = torch.zeros(1, model.config.hidden_size)
+    hidden_states[0, 0] = 1.0
+
+    token_ids = runner._sample_qwen35_logits(
+        logits,
+        torch.zeros(1),
+        hidden_states=hidden_states,
+    )
+
+    assert token_ids.tolist() == [1]
 
 
 def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets():
