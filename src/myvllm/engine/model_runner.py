@@ -743,6 +743,7 @@ class ModelRunner:
                         [seq.request_id for seq in seqs],
                         capture_hidden_taps=self.dflash2_draft_model is not None,
                         attention_pad_to_length=self.config.get("max_model_length"),
+                        batch_pad_to_size=self.config.get("max_num_sequences"),
                     )
                     if self.rank != 0:
                         return None
@@ -1173,6 +1174,7 @@ class ModelRunner:
                     or self.dflash2_draft_model is not None
                 ),
                 attention_pad_to_length=self.config.get("max_model_length"),
+                batch_pad_to_size=self.config.get("max_num_sequences"),
             )
             if self.rank != 0:
                 raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")

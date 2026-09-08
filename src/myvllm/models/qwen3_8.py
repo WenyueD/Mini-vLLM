@@ -730,6 +730,7 @@ class Qwen35ForCausalLM(nn.Module):
         capture_hidden_taps: bool = False,
         hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
         attention_pad_to_length: int | None = None,
+        batch_pad_to_size: int | None = None,
     ) -> list[Qwen35ForwardOutput]:
         """Run ragged request queries with a tensor batch at each token position."""
         reject_qwen35_multimodal_inputs()
@@ -748,6 +749,8 @@ class Qwen35ForCausalLM(nn.Module):
             request_id not in transactions for request_id in request_ids
         ):
             raise ValueError("batched cached target is missing a request transaction")
+        if batch_pad_to_size is not None and batch_pad_to_size < batch_size:
+            raise ValueError("batch padding size cannot be smaller than the input batch")
 
         request_states = [cache_manager.ensure_request(rid) for rid in request_ids]
         taps = hidden_tap_layers if capture_hidden_taps else ()
@@ -767,12 +770,31 @@ class Qwen35ForCausalLM(nn.Module):
                 dtype=torch.long,
                 device=input_ids.device,
             )
+            step_input_ids = input_ids.index_select(0, active_indices)[:, token_index]
+            step_request_states = [request_states[row] for row in active_rows]
+            if batch_pad_to_size is not None:
+                padding_rows = batch_pad_to_size - len(active_rows)
+                if padding_rows:
+                    step_input_ids = torch.cat(
+                        [step_input_ids, step_input_ids.new_zeros(padding_rows)]
+                    )
+                    step_request_states.extend(
+                        HybridRequestState(
+                            request_id=("batch-padding", token_index, row)
+                        )
+                        for row in range(padding_rows)
+                    )
             hidden, hidden_taps = self.model.forward_cached_batch_step(
-                input_ids.index_select(0, active_indices)[:, token_index],
-                [request_states[row] for row in active_rows],
+                step_input_ids,
+                step_request_states,
                 hidden_tap_layers=taps,
                 attention_pad_to_length=attention_pad_to_length,
             )
+            hidden = hidden[: len(active_rows)]
+            hidden_taps = {
+                layer_id: value[: len(active_rows)]
+                for layer_id, value in hidden_taps.items()
+            }
             step_logits = self.compute_logits(hidden)
             for active_row, request_row in enumerate(active_rows):
                 hidden_by_request[request_row].append(

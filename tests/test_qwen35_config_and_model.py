@@ -306,9 +306,10 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
         batch_cache,
         list(prefixes),
         attention_pad_to_length=16,
+        batch_pad_to_size=4,
     )
 
-    assert batch_sizes == [2, 2, 1]
+    assert batch_sizes == [4, 4, 4]
     for request_id, serial_output, batch_output in zip(
         prefixes, serial_outputs, batch_outputs
     ):
@@ -588,6 +589,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             request_ids,
             capture_hidden_taps=False,
             attention_pad_to_length=None,
+            batch_pad_to_size=None,
         ):
             calls.append(
                 (
@@ -596,6 +598,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
                     list(request_ids),
                     capture_hidden_taps,
                     attention_pad_to_length,
+                    batch_pad_to_size,
                 )
             )
             outputs = []
@@ -611,7 +614,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
     runner.is_qwen35_target = True
     runner.dflash2_draft_model = None
     runner.rank = 0
-    runner.config = {"max_model_length": 64}
+    runner.config = {"max_model_length": 64, "max_num_sequences": 8}
     runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
     runner.prepare_decode = lambda seqs: torch.tensor([seq.last_token for seq in seqs])
     runner.prepare_sample = lambda seqs: torch.zeros(len(seqs))
@@ -631,6 +634,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             ["req0", "req1"],
             False,
             64,
+            8,
         )
     ]
 

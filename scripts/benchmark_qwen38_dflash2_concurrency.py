@@ -979,6 +979,8 @@ def run_variant(
                 "num_speculative_tokens": args.num_speculative_tokens,
                 "temperature": 0.0,
                 "ignore_eos": args.ignore_eos,
+                "cached_batch_pad_to_size": config["max_num_sequences"],
+                "cached_attention_pad_to_length": config["max_model_length"],
             },
             "timing": summarize_timelines(
                 timelines, args.goodput_ttft_slo, args.goodput_tpot_slo
