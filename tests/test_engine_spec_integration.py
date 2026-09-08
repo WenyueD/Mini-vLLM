@@ -1,3 +1,7 @@
+import gc
+import weakref
+from types import SimpleNamespace
+
 import torch
 
 from myvllm.engine.llm_engine import LLMEngine
@@ -39,6 +43,33 @@ class FakeRunner:
                 ), "ordinary pending token was not allocated before ModelRunner"
             return torch.tensor([target(seq.token_ids) for seq in seqs])
         raise AssertionError(method)
+
+
+def test_engine_exit_releases_dflash_runner_reference():
+    calls = []
+
+    class ExitRunner:
+        def call(self, method, *args):
+            calls.append((method, args))
+
+    runner = ExitRunner()
+    runner_ref = weakref.ref(runner)
+    engine = LLMEngine.__new__(LLMEngine)
+    engine._closed = False
+    engine.processes = []
+    engine.model_runner = runner
+    engine.spec_decode_coordinator = SimpleNamespace(
+        proposer=SimpleNamespace(model_runner=runner)
+    )
+    del runner
+
+    engine.exit()
+    gc.collect()
+
+    assert calls == [("exit", ())]
+    assert engine.spec_decode_coordinator is None
+    assert not hasattr(engine, "model_runner")
+    assert runner_ref() is None
 
 
 def add_running(scheduler, tokens, temperature):

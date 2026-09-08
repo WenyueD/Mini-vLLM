@@ -109,16 +109,30 @@ class LLMEngine:
                 self.speculative_config, proposer
             )
 
-        atexit.register(self.exit)
+        self._atexit_callback = self.exit
+        atexit.register(self._atexit_callback)
 
     def exit(self):
         if self._closed:
             return
         self._closed = True
-        self.model_runner.call("exit")
-        del self.model_runner
-        for process in self.processes:
-            process.join()
+        try:
+            model_runner = getattr(self, "model_runner", None)
+            if model_runner is not None:
+                model_runner.call("exit")
+        finally:
+            # RunnerDFlash2Proposer owns a second reference to the model runner.
+            # Break it before dropping the engine so repeated in-process runs can
+            # actually return the model weights to CUDA.
+            self.spec_decode_coordinator = None
+            if hasattr(self, "model_runner"):
+                del self.model_runner
+            for process in getattr(self, "processes", []):
+                process.join()
+            callback = getattr(self, "_atexit_callback", None)
+            if callback is not None:
+                atexit.unregister(callback)
+                self._atexit_callback = None
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling
