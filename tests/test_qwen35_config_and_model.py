@@ -284,12 +284,19 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
     batch_sizes = []
     original_batch_step = model.model.forward_cached_batch_step
 
-    def tracked_batch_step(input_ids, request_states, hidden_tap_layers=None):
+    def tracked_batch_step(
+        input_ids,
+        request_states,
+        hidden_tap_layers=None,
+        attention_pad_to_length=None,
+    ):
         batch_sizes.append(len(request_states))
+        assert attention_pad_to_length == 16
         return original_batch_step(
             input_ids,
             request_states,
             hidden_tap_layers=hidden_tap_layers,
+            attention_pad_to_length=attention_pad_to_length,
         )
 
     model.model.forward_cached_batch_step = tracked_batch_step
@@ -298,6 +305,7 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
         [3, 2],
         batch_cache,
         list(prefixes),
+        attention_pad_to_length=16,
     )
 
     assert batch_sizes == [2, 2, 1]
@@ -579,6 +587,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             _cache_manager,
             request_ids,
             capture_hidden_taps=False,
+            attention_pad_to_length=None,
         ):
             calls.append(
                 (
@@ -586,6 +595,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
                     list(query_lengths),
                     list(request_ids),
                     capture_hidden_taps,
+                    attention_pad_to_length,
                 )
             )
             outputs = []
@@ -601,6 +611,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
     runner.is_qwen35_target = True
     runner.dflash2_draft_model = None
     runner.rank = 0
+    runner.config = {"max_model_length": 64}
     runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
     runner.prepare_decode = lambda seqs: torch.tensor([seq.last_token for seq in seqs])
     runner.prepare_sample = lambda seqs: torch.zeros(len(seqs))
@@ -619,6 +630,7 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             [1, 1],
             ["req0", "req1"],
             False,
+            64,
         )
     ]
 

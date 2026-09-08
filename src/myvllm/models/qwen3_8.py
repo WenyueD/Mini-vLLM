@@ -234,6 +234,7 @@ class Qwen35Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         request_states: list[HybridRequestState],
+        attention_pad_to_length: int | None = None,
     ) -> torch.Tensor:
         batch_size, query_length, _ = hidden_states.shape
         if query_length != 1:
@@ -261,7 +262,10 @@ class Qwen35Attention(nn.Module):
             cached_rows.append((row_key, row_value))
             context_lengths.append(row_key.shape[1])
 
-        max_context_length = max(context_lengths)
+        max_context_length = max(
+            max(context_lengths),
+            0 if attention_pad_to_length is None else attention_pad_to_length,
+        )
         padded_key = key_states.new_zeros(
             batch_size,
             max_context_length,
@@ -544,6 +548,7 @@ class Qwen35TextModel(nn.Module):
         input_ids: torch.Tensor,
         request_states: list[HybridRequestState],
         hidden_tap_layers: tuple[int, ...] | None = None,
+        attention_pad_to_length: int | None = None,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         input_ids = input_ids.reshape(-1, 1)
         batch_size = input_ids.shape[0]
@@ -588,7 +593,10 @@ class Qwen35TextModel(nn.Module):
                     )
             else:
                 attn_out = layer.self_attn.forward_with_cache_batch(
-                    normed, position_embeddings, request_states
+                    normed,
+                    position_embeddings,
+                    request_states,
+                    attention_pad_to_length=attention_pad_to_length,
                 )
             hidden_states = residual + attn_out
             residual = hidden_states
@@ -721,6 +729,7 @@ class Qwen35ForCausalLM(nn.Module):
         transactions: Mapping[str, HybridCacheTransaction] | None = None,
         capture_hidden_taps: bool = False,
         hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
+        attention_pad_to_length: int | None = None,
     ) -> list[Qwen35ForwardOutput]:
         """Run ragged request queries with a tensor batch at each token position."""
         reject_qwen35_multimodal_inputs()
@@ -762,6 +771,7 @@ class Qwen35ForCausalLM(nn.Module):
                 input_ids.index_select(0, active_indices)[:, token_index],
                 [request_states[row] for row in active_rows],
                 hidden_tap_layers=taps,
+                attention_pad_to_length=attention_pad_to_length,
             )
             step_logits = self.compute_logits(hidden)
             for active_row, request_row in enumerate(active_rows):
