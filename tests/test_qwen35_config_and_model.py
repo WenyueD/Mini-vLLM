@@ -532,7 +532,14 @@ def test_qwen35_cached_runner_prefills_requests_independently():
         def forward_with_cache(
             self, input_ids, _cache_manager, request_id, capture_hidden_taps=False
         ):
-            calls.append((request_id, input_ids.tolist(), capture_hidden_taps))
+            calls.append(
+                (
+                    request_id,
+                    input_ids.tolist(),
+                    capture_hidden_taps,
+                    torch.is_inference_mode_enabled(),
+                )
+            )
             logits = torch.zeros(1, len(input_ids), 32)
             logits[:, -1, 7 if request_id == "req0" else 9] = 1
             return SimpleNamespace(logits=logits, hidden_taps={})
@@ -556,8 +563,8 @@ def test_qwen35_cached_runner_prefills_requests_independently():
 
     assert token_ids.tolist() == [7, 9]
     assert calls == [
-        ("req0", [1, 2], False),
-        ("req1", [3, 4], False),
+        ("req0", [1, 2], False, True),
+        ("req1", [3, 4], False, True),
     ]
 
 

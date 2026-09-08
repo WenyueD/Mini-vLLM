@@ -730,6 +730,7 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if getattr(self, "is_qwen35_target", False):
             try:

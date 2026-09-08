@@ -1013,6 +1013,11 @@ def run_variant(
         del engine
         gc.collect()
         if "torch" in sys.modules:
+            if torch.distributed.is_initialized():
+                try:
+                    torch.distributed.destroy_process_group()
+                except Exception:
+                    pass
             torch.cuda.empty_cache()
 
 
@@ -1246,6 +1251,9 @@ def main() -> None:
     write_summary_csv(run_dir / "summary.csv", all_summaries)
     print(f"results_dir={run_dir}", flush=True)
     print(f"logs_dir={log_dir}", flush=True)
+    failures = [summary for summary in all_summaries if summary.get("error")]
+    if failures:
+        raise SystemExit(f"{len(failures)} benchmark cell(s) failed; inspect summary JSON")
 
 
 if __name__ == "__main__":
