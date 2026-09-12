@@ -1,13 +1,16 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from scripts.benchmark_qwen38_dflash2_concurrency import (
     RequestTimeline,
+    WorkloadRequest,
     compare_token_outputs,
     latency_summary,
     percentile,
     reset_runtime_stats,
+    run_closed_loop,
     run_summary_failed,
     summarize_acceptance,
     summarize_monitor,
@@ -215,3 +218,61 @@ def test_run_summary_failed_accepts_clean_summary():
             "failures": {"admission_failures": []},
         }
     )
+
+
+def test_run_closed_loop_honors_soak_time_limit(tmp_path):
+    class BlockingHandle:
+        def __init__(self, request_id):
+            self.request_id = request_id
+            self.cancelled = threading.Event()
+
+        def iter_outputs(self, timeout=None):
+            self.cancelled.wait(timeout=timeout)
+            yield SimpleNamespace(
+                token_ids=(),
+                finished=True,
+                finish_reason="cancelled",
+                error=None,
+            )
+
+        def cancel(self, timeout=None):
+            self.cancelled.set()
+            return True
+
+    class FakeOnline:
+        def submit_requests(self, requests, timeout=None):
+            return [BlockingHandle(request.request_id) for request in requests]
+
+        def stats(self):
+            return {
+                "scheduler": {"waiting": 0, "running": 0},
+                "online_requests": {"active_channels": 0},
+            }
+
+    workload = [
+        WorkloadRequest(
+            request_id=f"req-{index}",
+            prompt="prompt",
+            prompt_token_ids=(1, 2),
+            max_new_tokens=8,
+            bucket="short",
+        )
+        for index in range(3)
+    ]
+
+    timelines, _, failures = run_closed_loop(
+        FakeOnline(),
+        workload,
+        concurrency=2,
+        timeout=1.0,
+        sample_interval_s=0.01,
+        raw_log_path=tmp_path / "requests.jsonl",
+        max_duration_s=0.02,
+    )
+
+    assert failures["soak_time_limit"]["enabled"]
+    assert failures["soak_time_limit"]["reached"]
+    assert failures["soak_time_limit"]["pending_requests"] == 1
+    assert failures["soak_time_limit"]["deadline_cancelled_requests"] == 2
+    assert len(timelines) == 2
+    assert {timeline.finish_reason for timeline in timelines} == {"cancelled"}

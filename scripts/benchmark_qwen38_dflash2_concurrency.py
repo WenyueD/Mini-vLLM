@@ -521,6 +521,7 @@ def run_closed_loop(
     sample_interval_s: float,
     raw_log_path: Path,
     ignore_eos: bool = True,
+    max_duration_s: float | None = None,
 ) -> tuple[list[RequestTimeline], list[dict[str, Any]], dict[str, Any]]:
     pending = list(workload)
     by_id = {spec.request_id: spec for spec in workload}
@@ -528,6 +529,11 @@ def run_closed_loop(
     monitor_samples: list[dict[str, Any]] = []
     stop_monitor = threading.Event()
     origin = time.perf_counter()
+    deadline_s = (
+        origin + max_duration_s
+        if max_duration_s is not None and max_duration_s > 0
+        else None
+    )
     monitor = threading.Thread(
         target=monitor_online,
         args=(online, stop_monitor, monitor_samples, sample_interval_s, origin),
@@ -535,28 +541,58 @@ def run_closed_loop(
     )
     monitor.start()
     failures: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futures = {}
+    deadline_reached = False
+    deadline_cancelled = 0
+    deadline_cancel_failures: list[dict[str, Any]] = []
+    abandoned_futures = False
+    pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
+    futures: dict[Any, dict[str, Any]] = {}
+    try:
+        def collect_completed(done: set[Any]) -> None:
+            for future in done:
+                active = futures.pop(future)
+                try:
+                    timeline = future.result()
+                except Exception as exc:
+                    timeline = active["timeline"]
+                    timeline.finish_time_s = time.perf_counter()
+                    timeline.error = f"{type(exc).__name__}: {exc}"
+                completed.append(timeline)
+                append_jsonl(raw_log_path, [timeline.to_record(origin)])
 
         def admit_next_batch(limit: int) -> None:
-            nonlocal pending
+            nonlocal deadline_reached, pending
             if not pending or limit <= 0:
+                return
+            if deadline_s is not None and time.perf_counter() >= deadline_s:
+                deadline_reached = True
                 return
             batch: list[WorkloadRequest] = []
             now = time.perf_counter()
             while pending and len(batch) < limit:
                 if pending[0].arrival_offset_s > 0:
                     target = origin + pending[0].arrival_offset_s
+                    if deadline_s is not None:
+                        target = min(target, deadline_s)
                     if target > now:
                         time.sleep(target - now)
                         now = time.perf_counter()
+                    if deadline_s is not None and now >= deadline_s:
+                        deadline_reached = True
+                        break
                 batch.append(pending.pop(0))
+            if not batch:
+                return
             try:
                 for handle, timeline in submit_specs(online, batch, timeout, ignore_eos):
                     future = pool.submit(
                         consume_request, handle, by_id[handle.request_id], timeline, timeout
                     )
-                    futures[future] = handle.request_id
+                    futures[future] = {
+                        "handle": handle,
+                        "request_id": handle.request_id,
+                        "timeline": timeline,
+                    }
             except Exception as exc:
                 for spec in batch:
                     failures.append(
@@ -570,19 +606,83 @@ def run_closed_loop(
 
         admit_next_batch(concurrency)
         while futures:
-            done, _ = wait(set(futures), return_when=FIRST_COMPLETED, timeout=timeout)
+            wait_timeout = timeout
+            if deadline_s is not None:
+                remaining_s = deadline_s - time.perf_counter()
+                if remaining_s <= 0:
+                    deadline_reached = True
+                    break
+                wait_timeout = min(wait_timeout, remaining_s)
+            done, _ = wait(
+                set(futures),
+                return_when=FIRST_COMPLETED,
+                timeout=wait_timeout,
+            )
             if not done:
+                if deadline_s is not None and time.perf_counter() >= deadline_s:
+                    deadline_reached = True
+                    break
                 raise TimeoutError(f"no request completed within {timeout:.1f}s")
-            for future in done:
-                futures.pop(future)
-                timeline = future.result()
-                completed.append(timeline)
-                append_jsonl(raw_log_path, [timeline.to_record(origin)])
+            collect_completed(done)
             admit_next_batch(concurrency - len(futures))
 
-    stop_monitor.set()
-    monitor.join(timeout=5.0)
-    failure_record = {"admission_failures": failures}
+        if deadline_reached and futures:
+            cancel_timeout_s = min(max(sample_interval_s * 10.0, 1.0), 5.0)
+            for future, active in list(futures.items()):
+                if future.done():
+                    continue
+                try:
+                    if active["handle"].cancel(timeout=cancel_timeout_s):
+                        active["timeline"].cancelled = True
+                        deadline_cancelled += 1
+                except Exception as exc:
+                    deadline_cancel_failures.append(
+                        {
+                            "request_id": active["request_id"],
+                            "phase": "deadline_cancel",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+            done_after_cancel, _ = wait(
+                set(futures),
+                return_when=FIRST_COMPLETED,
+                timeout=cancel_timeout_s,
+            )
+            collect_completed(done_after_cancel)
+            now = time.perf_counter()
+            for future, active in list(futures.items()):
+                if future.done():
+                    collect_completed({future})
+                    continue
+                timeline = active["timeline"]
+                timeline.finish_time_s = now
+                timeline.cancelled = True
+                timeline.error = (
+                    "SoakDeadlineExceeded: request still active after "
+                    f"{max_duration_s:.1f}s"
+                )
+                completed.append(timeline)
+                append_jsonl(raw_log_path, [timeline.to_record(origin)])
+                futures.pop(future)
+                future.cancel()
+                abandoned_futures = True
+    finally:
+        pool.shutdown(wait=not abandoned_futures and not futures, cancel_futures=True)
+        stop_monitor.set()
+        monitor.join(timeout=5.0)
+    failure_record = {
+        "admission_failures": failures,
+        "soak_time_limit": {
+            "enabled": deadline_s is not None,
+            "limit_s": max_duration_s,
+            "reached": deadline_reached,
+            "pending_requests": len(pending),
+            "deadline_cancelled_requests": deadline_cancelled,
+            "deadline_cancel_failures": deadline_cancel_failures,
+            "elapsed_s": time.perf_counter() - origin,
+        },
+    }
     return completed, monitor_samples, failure_record
 
 
@@ -999,6 +1099,11 @@ def run_variant(
             )
             reset_runtime_stats(engine)
         measured_started = time.perf_counter()
+        soak_time_limit_s = (
+            args.soak_minutes * 60.0
+            if args.soak and args.soak_minutes > 0
+            else None
+        )
         timelines, monitor_samples, failures = run_closed_loop(
             online,
             workload,
@@ -1007,6 +1112,7 @@ def run_variant(
             args.sample_interval,
             raw_requests_path,
             args.ignore_eos,
+            soak_time_limit_s,
         )
         measured_elapsed = time.perf_counter() - measured_started
         append_jsonl(monitor_path, monitor_samples)
@@ -1030,6 +1136,9 @@ def run_variant(
                 "ignore_eos": args.ignore_eos,
                 "cached_batch_pad_to_size": config["max_num_sequences"],
                 "cached_attention_pad_to_length": config["max_model_length"],
+                "soak": args.soak,
+                "soak_requests": args.soak_requests if args.soak else None,
+                "soak_time_limit_s": soak_time_limit_s,
             },
             "timing": summarize_timelines(
                 timelines, args.goodput_ttft_slo, args.goodput_tpot_slo
