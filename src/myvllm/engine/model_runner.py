@@ -3,10 +3,12 @@ import torch
 import torch.nn.functional as F
 import pickle
 import torch.distributed as dist
+from dataclasses import dataclass
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from time import perf_counter
+from typing import Any
 
 from myvllm.engine.sequence import Sequence
 from myvllm.spec_decode.types import (
@@ -16,7 +18,8 @@ from myvllm.spec_decode.types import (
 )
 from myvllm.spec_decode.verification import prepare_verification_input
 from myvllm.utils import *
-from myvllm.engine.hybrid_cache import HybridCacheManager
+from myvllm.engine.hybrid_cache import HybridCacheManager, HybridCacheTransaction
+from myvllm.engine.memory import MemoryTrace, module_parameter_bytes
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
     is_qwen35_config,
@@ -53,6 +56,16 @@ def _dtype_from_config(value) -> torch.dtype | None:
         raise ValueError(f"Unsupported model dtype: {value}") from exc
 
 
+@dataclass(frozen=True)
+class PendingQwen35Verification:
+    transaction: HybridCacheTransaction
+    request_id: str
+    hidden_taps: dict[int, torch.Tensor]
+    target_token_ids: tuple[int, ...]
+    start_position: int
+    query_tokens: tuple[int, ...]
+
+
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         from myvllm.layers.sampler import SamplerLayer
@@ -83,6 +96,12 @@ class ModelRunner:
         self.dflash2_draft_model = None
         self.dflash2_draft_cache = None
         self._dflash2_contexts = {}
+        self.qwen35_text_config = None
+        self._memory_trace = MemoryTrace(
+            enabled=bool(
+                config.get("memory_trace", config.get("memory_trace_enabled", False))
+            )
+        )
         dist.init_process_group(
             "nccl", "tcp://localhost:12345", world_size=config["world_size"], rank=rank
         )
@@ -110,6 +129,7 @@ class ModelRunner:
 
         if qwen35_raw_config is not None:
             qwen35_text_config = normalize_qwen35_text_config(qwen35_raw_config)
+            self.qwen35_text_config = qwen35_text_config
             if self.world_size != 1:
                 raise NotImplementedError(
                     "Qwen3.5/Qwen3.8 text-only target currently supports "
@@ -129,6 +149,22 @@ class ModelRunner:
             )
             self.is_qwen35_target = True
             self.hybrid_cache_manager = HybridCacheManager()
+            # Keep cached decode, verification, and replay on the same CUDA
+            # kernel shapes. BF16 reductions can otherwise vary with the
+            # active batch/context shape and change greedy decisions at ties.
+            self.config.setdefault(
+                "qwen35_cached_attention_pad_to_length",
+                self.config.get("max_model_length"),
+            )
+            self.config.setdefault(
+                "qwen35_cached_batch_pad_to_size",
+                min(
+                    4,
+                    self.config.get(
+                        "max_num_sequences", self.config.get("max_num_seqs", 1)
+                    ),
+                ),
+            )
             print(
                 "[Rank 0] Qwen3.5/Qwen3.8 text target: "
                 f"{qwen35_text_config.num_hidden_layers} layers, "
@@ -183,6 +219,7 @@ class ModelRunner:
             self.model.to_empty(device=f"cuda:{rank}")
         else:
             self.model = self.model.cuda(rank)
+        self._record_memory_stage("target_model_allocated")
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get("model_name_or_path"):
@@ -199,6 +236,7 @@ class ModelRunner:
                 stream_safetensors=bool(config.get("stream_weights", False)),
                 safe_open_device=safe_open_device,
             )
+        self._record_memory_stage("target_load")
 
         self._maybe_load_dflash2_draft(rank)
 
@@ -263,6 +301,54 @@ class ModelRunner:
         value = self.config.get("speculative_config") or {}
         return value if isinstance(value, dict) else getattr(value, "__dict__", {})
 
+    def _memory_device(self):
+        return f"cuda:{self.rank}" if torch.cuda.is_available() else None
+
+    def _memory_estimates(self) -> dict[str, Any]:
+        estimates: dict[str, Any] = {
+            "target_parameter_bytes": module_parameter_bytes(
+                getattr(self, "model", None)
+            ),
+            "draft_parameter_bytes": module_parameter_bytes(
+                getattr(self, "dflash2_draft_model", None)
+            ),
+        }
+        hybrid = getattr(self, "hybrid_cache_manager", None)
+        if hybrid is not None:
+            for key, value in hybrid.estimate_bytes().items():
+                estimates[f"hybrid_{key}"] = value
+        draft_cache = getattr(self, "dflash2_draft_cache", None)
+        if draft_cache is not None:
+            for key, value in draft_cache.estimate_bytes().items():
+                estimates[f"dflash2_cache_{key}"] = value
+        capacity = self.config.get("qwen35_dynamic_cache_capacity")
+        if isinstance(capacity, dict):
+            estimates.update(
+                {f"qwen35_capacity_{key}": value for key, value in capacity.items()}
+            )
+        return estimates
+
+    def _record_memory_stage(self, stage: str, **extra: Any) -> None:
+        trace = getattr(self, "_memory_trace", None)
+        if trace is None:
+            return
+        trace.record(
+            stage,
+            device=self._memory_device(),
+            estimates=self._memory_estimates(),
+            extra=extra,
+        )
+
+    def get_memory_trace(self) -> list[dict[str, Any]]:
+        trace = getattr(self, "_memory_trace", None)
+        return [] if trace is None else trace.snapshot()
+
+    def _model_device_for_replay(self) -> torch.device:
+        try:
+            return next(self.model.parameters()).device
+        except (AttributeError, StopIteration):
+            return torch.device("cpu")
+
     def _maybe_load_dflash2_draft(self, rank: int) -> None:
         spec_config = self._speculative_config_dict()
         if spec_config.get("proposer") != "dflash2":
@@ -273,14 +359,14 @@ class ModelRunner:
             raise NotImplementedError(
                 "DFlash2 integration currently supports world_size=1"
             )
-        draft_path = (
-            spec_config.get("draft_model_name_or_path")
-            or self.config.get("dflash2_model_name_or_path")
+        draft_path = spec_config.get("draft_model_name_or_path") or self.config.get(
+            "dflash2_model_name_or_path"
         )
         if not draft_path:
             raise ValueError(
                 "DFlash2 proposer requires speculative_config.draft_model_name_or_path"
             )
+        self._record_memory_stage("draft_load_start")
         draft_config = DFlash2Config.from_pretrained_path(draft_path)
         draft_config.validate_contract()
         with torch.device("meta"):
@@ -297,6 +383,7 @@ class ModelRunner:
         )
         self.dflash2_draft_model = draft_model
         self.dflash2_draft_cache = DFlash2DraftCache(draft_config.sliding_window)
+        self._record_memory_stage("draft_load")
         print(
             "[Rank 0] DFlash2 draft loaded: "
             f"layers={draft_config.num_sliding_attention_layers}, "
@@ -373,6 +460,7 @@ class ModelRunner:
     # run empty sequence to warm up the model
     # clear memory
     def warmup_model(self):
+        self._record_memory_stage("warmup_prefill_start")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_tokens = self.config["max_num_batch_tokens"]
@@ -396,6 +484,100 @@ class ModelRunner:
                     if self.dflash2_draft_cache is not None:
                         self.dflash2_draft_cache.release(seq.request_id)
         torch.cuda.empty_cache()
+        self._record_memory_stage("warmup_prefill")
+
+    def _generic_kv_cache_modules(self) -> list[Any]:
+        return [
+            module
+            for module in self.model.modules()
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache")
+        ]
+
+    def _qwen35_dynamic_cache_byte_model(self) -> dict[str, int]:
+        qwen_config = self.qwen35_text_config
+        if qwen_config is None:
+            return {}
+        itemsize = self.default_dtype.itemsize
+        full_attention_token_bytes = (
+            len(qwen_config.full_attention_layers)
+            * 2
+            * qwen_config.num_key_value_heads
+            * qwen_config.head_dim
+            * itemsize
+        )
+        recurrent_per_linear_layer = (
+            qwen_config.linear_num_value_heads
+            * qwen_config.linear_key_head_dim
+            * qwen_config.linear_value_head_dim
+            * torch.float32.itemsize
+        )
+        conv_dim = (
+            qwen_config.linear_num_key_heads * qwen_config.linear_key_head_dim * 2
+            + qwen_config.linear_num_value_heads * qwen_config.linear_value_head_dim
+        )
+        conv_per_linear_layer = (
+            conv_dim * max(qwen_config.linear_conv_kernel_dim - 1, 0) * itemsize
+        )
+        linear_request_bytes = len(qwen_config.linear_attention_layers) * (
+            recurrent_per_linear_layer + conv_per_linear_layer
+        )
+        dflash2_token_bytes = 0
+        draft_model = getattr(self, "dflash2_draft_model", None)
+        if draft_model is not None:
+            draft_config = draft_model.config
+            dflash2_token_bytes = (
+                len(draft_config.target_layer_ids) * draft_config.hidden_size * itemsize
+                + torch.int64.itemsize
+                + draft_config.num_sliding_attention_layers
+                * 2
+                * draft_config.num_key_value_heads
+                * draft_config.head_dim
+                * itemsize
+            )
+        return {
+            "full_attention_token_bytes": full_attention_token_bytes,
+            "linear_request_bytes": linear_request_bytes,
+            "linear_recurrent_request_bytes": len(qwen_config.linear_attention_layers)
+            * recurrent_per_linear_layer,
+            "linear_conv_request_bytes": len(qwen_config.linear_attention_layers)
+            * conv_per_linear_layer,
+            "dflash2_token_bytes": dflash2_token_bytes,
+            "token_bytes": full_attention_token_bytes + dflash2_token_bytes,
+        }
+
+    def _configure_qwen35_dynamic_cache_capacity(self, available_mem: float) -> None:
+        byte_model = self._qwen35_dynamic_cache_byte_model()
+        configured_blocks = max(
+            1,
+            int(self.config.get("max_num_sequences", 1))
+            * math.ceil(self.config["max_model_length"] / self.block_size),
+        )
+        max_sequences = int(self.config.get("max_num_sequences", 1))
+        request_state_bytes = max_sequences * byte_model["linear_request_bytes"]
+        token_bytes = max(1, byte_model["token_bytes"])
+        block_bytes = token_bytes * self.block_size
+        available_for_token_cache = max(0.0, available_mem - request_state_bytes)
+        capacity_blocks = max(1, int(available_for_token_cache // block_bytes))
+        max_cached_blocks = min(configured_blocks, capacity_blocks)
+        self.config["max_cached_blocks"] = max_cached_blocks
+        self.config["qwen35_uses_generic_kv_cache"] = False
+        self.config["qwen35_dynamic_cache_capacity"] = {
+            **byte_model,
+            "configured_blocks": configured_blocks,
+            "max_cached_blocks": max_cached_blocks,
+            "available_bytes": int(max(0.0, available_mem)),
+            "available_for_token_cache_bytes": int(available_for_token_cache),
+            "reserved_request_state_bytes": int(request_state_bytes),
+            "block_bytes": int(block_bytes),
+            "generic_kv_pool_bytes": 0,
+            "generic_kv_cache_layers": 0,
+        }
+        if self.rank == 0:
+            print(
+                "[Rank 0] Qwen3.5/Qwen3.8 dynamic cache capacity: "
+                f"blocks={max_cached_blocks}/{configured_blocks}, "
+                f"block_size={self.block_size}, generic_kv_pool=0"
+            )
 
     # allocate kv cache memory blocks for model
     def allocate_kv_cache(self):
@@ -416,12 +598,24 @@ class ModelRunner:
             target_cache_fraction = min(
                 target_cache_fraction, max(0.0, 1.0 - draft_reservation_fraction)
             )
+
+        if self.is_qwen35_target:
+            qwen35_fraction = float(
+                self.config.get("qwen35_dynamic_cache_memory_fraction", 1.0)
+            )
+            self._configure_qwen35_dynamic_cache_capacity(
+                available_mem * qwen35_fraction
+            )
+            self._record_memory_stage("target_cache_allocation")
+            return
+
         available_mem *= target_cache_fraction
 
         # find parameters to compute kv cache size
-        num_layers = self.config.get(
-            "num_full_attention_layers", self.config["num_layers"]
-        )
+        cache_modules = self._generic_kv_cache_modules()
+        num_layers = len(cache_modules)
+        if num_layers <= 0:
+            raise RuntimeError("model exposes no paged-attention KV cache modules")
         num_kv_heads = self.config["num_kv_heads"] // self.world_size
         head_dim = (
             self.config["head_dim"]
@@ -478,25 +672,27 @@ class ModelRunner:
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
         allocated_kv_cache = torch.zeros(
             2,
-            self.config["num_layers"],
+            num_layers,
             self.config["max_cached_blocks"],
             self.block_size,
             num_kv_heads,
             head_dim,
             device=f"cuda:{self.rank}",
+            dtype=self.default_dtype,
         )
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = allocated_kv_cache[0, layer_id]
-                module.v_cache = allocated_kv_cache[1, layer_id]
-                layer_id += 1
+        for layer_id, module in enumerate(cache_modules):
+            module.k_cache = allocated_kv_cache[0, layer_id]
+            module.v_cache = allocated_kv_cache[1, layer_id]
         if self.rank == 0:
             print(
-                f"[Rank 0] KV cache attached to {layer_id} full-attention layers; "
+                f"[Rank 0] KV cache attached to {num_layers} full-attention layers; "
                 f"blocks={self.config['max_cached_blocks']}, block_size={self.block_size}, "
                 f"target_cache_fraction={target_cache_fraction:.3f}"
             )
+        self._record_memory_stage(
+            "target_cache_allocation",
+            generic_kv_cache_layers=num_layers,
+        )
 
     # given seqs
     # prepare the data needed for a prefill forward pass
@@ -736,6 +932,11 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if getattr(self, "is_qwen35_target", False):
+            stage_name = "prefill" if is_prefill else "target_decode"
+            self._record_memory_stage(
+                f"{stage_name}_start",
+                batch_size=len(seqs),
+            )
             try:
                 if not is_prefill:
                     input_ids = self.prepare_decode(seqs).reshape(len(seqs), 1)
@@ -745,8 +946,12 @@ class ModelRunner:
                         self.hybrid_cache_manager,
                         [seq.request_id for seq in seqs],
                         capture_hidden_taps=self.dflash2_draft_model is not None,
-                        attention_pad_to_length=self.config.get("max_model_length"),
-                        batch_pad_to_size=self.config.get("max_num_sequences"),
+                        attention_pad_to_length=self.config.get(
+                            "qwen35_cached_attention_pad_to_length"
+                        ),
+                        batch_pad_to_size=self.config.get(
+                            "qwen35_cached_batch_pad_to_size"
+                        ),
                     )
                     if self.rank != 0:
                         return None
@@ -836,6 +1041,10 @@ class ModelRunner:
                     return None
                 return torch.cat(sampled_tokens) if sampled_tokens else None
             finally:
+                self._record_memory_stage(
+                    stage_name,
+                    batch_size=len(seqs),
+                )
                 reset_context()
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
@@ -861,7 +1070,7 @@ class ModelRunner:
         if hidden_states is None or not torch.all(temperatures == 0):
             return self.sampler(logits, temperatures)
         token_ids = greedy_token_ids(logits)
-        if not self.config.get("resolve_greedy_ties_with_fp32_lm_head", True):
+        if not self.config.get("resolve_greedy_ties_with_fp32_lm_head", False):
             return token_ids
         flat_logits = logits.reshape(-1, logits.shape[-1])
         flat_hidden = hidden_states.reshape(flat_logits.shape[0], -1)
@@ -929,7 +1138,7 @@ class ModelRunner:
             ),
             "exact_tie_break_policy": (
                 "bf16_max_then_fp32_lm_head_tied_tokens"
-                if config.get("resolve_greedy_ties_with_fp32_lm_head", True)
+                if config.get("resolve_greedy_ties_with_fp32_lm_head", False)
                 else "highest_token_id"
             ),
             "max_tie_count": int(tied_token_ids.numel()),
@@ -943,9 +1152,7 @@ class ModelRunner:
             "top1_logit": float(values[0]),
             "top2_token_id": int(token_ids[1]) if top_count > 1 else None,
             "top2_logit": float(values[1]) if top_count > 1 else None,
-            "top2_margin": (
-                float(values[0] - values[1]) if top_count > 1 else None
-            ),
+            "top2_margin": (float(values[0] - values[1]) if top_count > 1 else None),
         }
         history = getattr(self, "_target_decision_diagnostics", None)
         if history is None:
@@ -992,7 +1199,9 @@ class ModelRunner:
             "request_id": seq.request_id,
             "anchor_token_id": int(anchor_token_id),
             "anchor_position": int(
-                self.hybrid_cache_manager.get_request_state(seq.request_id).logical_length
+                self.hybrid_cache_manager.get_request_state(
+                    seq.request_id
+                ).logical_length
                 - output.logits.shape[1]
                 + decision_index
                 + 1
@@ -1078,8 +1287,9 @@ class ModelRunner:
         previous = self._dflash2_contexts.get(sequence_id, {})
         old_taps = previous.get("hidden_taps", {})
         window = self.dflash2_draft_model.config.sliding_window
+        hidden_taps = getattr(output, "hidden_taps", output)
         merged = {}
-        for layer_id, value in output.hidden_taps.items():
+        for layer_id, value in hidden_taps.items():
             new_value = value[:, :token_count, :].detach()
             old_value = old_taps.get(layer_id)
             if old_value is not None:
@@ -1131,6 +1341,11 @@ class ModelRunner:
         )
         device = next(self.dflash2_draft_model.parameters()).device
         begun_request_ids = []
+        self._record_memory_stage(
+            "proposal_start",
+            batch_size=len(active_sequences),
+            max_budget=max(budgets),
+        )
         try:
             for request_id in request_ids:
                 self.dflash2_draft_cache.begin_proposal(request_id)
@@ -1164,7 +1379,9 @@ class ModelRunner:
             if proposal_batch.token_ids.shape[0] != len(active_sequences):
                 raise ValueError("DFlash2 draft model returned the wrong batch size")
             if proposal_batch.valid_lengths.shape[0] != len(active_sequences):
-                raise ValueError("DFlash2 draft valid lengths have the wrong batch size")
+                raise ValueError(
+                    "DFlash2 draft valid lengths have the wrong batch size"
+                )
             for row, index in enumerate(active_indices):
                 seq = sequences[index]
                 valid_length = min(
@@ -1186,10 +1403,19 @@ class ModelRunner:
                 self.dflash2_draft_cache.advance(seq.request_id, valid_length)
             if any(proposal is None for proposal in proposals):
                 raise RuntimeError("DFlash2 proposal batching lost a request row")
+            self._record_memory_stage(
+                "proposal",
+                batch_size=len(active_sequences),
+                proposed_tokens=sum(len(proposal.token_ids) for proposal in proposals),
+            )
             return [proposal for proposal in proposals if proposal is not None]
         except Exception:
             for request_id in begun_request_ids:
                 self.dflash2_draft_cache.rollback_proposal(request_id)
+            self._record_memory_stage(
+                "proposal_rollback",
+                batch_size=len(active_sequences),
+            )
             raise
 
     def _record_dflash2_proposal_batch(
@@ -1280,6 +1506,7 @@ class ModelRunner:
             return []
         sequence_ids = [seq.seq_id for seq in batch.sequences]
         self.rollback_verified_cache(sequence_ids)
+        self._record_memory_stage("verify_start", batch_size=len(batch.sequences))
         query_tokens_by_request = []
         for seq, proposal in zip(batch.sequences, batch.proposals):
             if seq.num_tokens - seq.num_computed_tokens != 1:
@@ -1323,8 +1550,10 @@ class ModelRunner:
                     self.config.get("capture_verification_hidden_taps", False)
                     or self.dflash2_draft_model is not None
                 ),
-                attention_pad_to_length=self.config.get("max_model_length"),
-                batch_pad_to_size=self.config.get("max_num_sequences"),
+                attention_pad_to_length=self.config.get(
+                    "qwen35_cached_attention_pad_to_length"
+                ),
+                batch_pad_to_size=self.config.get("qwen35_cached_batch_pad_to_size"),
             )
             if self.rank != 0:
                 raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")
@@ -1383,11 +1612,19 @@ class ModelRunner:
                 token_ids = tuple(flat_token_ids[offset : offset + len(query_tokens)])
                 offset += len(query_tokens)
                 self._pending_verified_cache_transactions[seq.seq_id] = (
-                    transaction,
-                    seq.request_id,
-                    output,
-                    token_ids,
-                    int(transaction.original_states[seq.request_id].logical_length),
+                    PendingQwen35Verification(
+                        transaction=transaction,
+                        request_id=seq.request_id,
+                        hidden_taps={
+                            layer_id: value.detach()
+                            for layer_id, value in output.hidden_taps.items()
+                        },
+                        target_token_ids=token_ids,
+                        start_position=int(
+                            transaction.original_states[seq.request_id].logical_length
+                        ),
+                        query_tokens=tuple(query_tokens),
+                    )
                 )
                 results.append(
                     VerificationResult(
@@ -1404,12 +1641,20 @@ class ModelRunner:
                     )
                 )
             self._record_qwen35_verification_batch(query_lengths)
+            self._record_memory_stage(
+                "verify",
+                batch_size=len(batch.sequences),
+                verified_tokens=sum(query_lengths),
+            )
             return results
         except Exception:
             for transaction in transactions.values():
                 if transaction.state.name == "ACTIVE":
                     self.hybrid_cache_manager.rollback(transaction)
             self.rollback_verified_cache(sequence_ids)
+            self._record_memory_stage(
+                "verify_rollback", batch_size=len(batch.sequences)
+            )
             raise
 
     def _record_qwen35_verification_batch(self, query_lengths: list[int]) -> None:
@@ -1450,69 +1695,205 @@ class ModelRunner:
             }
         return dict(stats)
 
-    def commit_verified_cache(self, accepted_lengths_by_sequence: dict[int, int]) -> None:
+    def _coerce_pending_qwen35_verification(
+        self, entry: Any
+    ) -> PendingQwen35Verification:
+        if isinstance(entry, PendingQwen35Verification):
+            return entry
+        if len(entry) == 6:
+            (
+                transaction,
+                request_id,
+                output,
+                target_token_ids,
+                start_position,
+                query_tokens,
+            ) = entry
+            return PendingQwen35Verification(
+                transaction=transaction,
+                request_id=request_id,
+                hidden_taps=dict(getattr(output, "hidden_taps", {})),
+                target_token_ids=tuple(target_token_ids),
+                start_position=int(start_position),
+                query_tokens=tuple(query_tokens),
+            )
+        if len(entry) == 5:
+            transaction, request_id, output, target_token_ids, start_position = entry
+            return PendingQwen35Verification(
+                transaction=transaction,
+                request_id=request_id,
+                hidden_taps=dict(getattr(output, "hidden_taps", {})),
+                target_token_ids=tuple(target_token_ids),
+                start_position=int(start_position),
+                query_tokens=(),
+            )
+        transaction, request_id = entry
+        return PendingQwen35Verification(
+            transaction=transaction,
+            request_id=request_id,
+            hidden_taps={},
+            target_token_ids=(),
+            start_position=0,
+            query_tokens=(),
+        )
+
+    def _replay_qwen35_accepted_prefixes(
+        self,
+        plans: list[tuple[int, PendingQwen35Verification, int]],
+        replay_device: torch.device,
+    ) -> None:
+        replay_plans = [
+            (plan, accepted_length)
+            for _sequence_id, plan, accepted_length in plans
+            if plan.query_tokens and accepted_length > 0
+        ]
+        if not replay_plans:
+            return
+        max_length = max(accepted_length for _plan, accepted_length in replay_plans)
+        input_ids = torch.zeros(
+            len(replay_plans),
+            max_length,
+            dtype=torch.long,
+            device=replay_device,
+        )
+        query_lengths = []
+        request_ids = []
+        for row, (plan, accepted_length) in enumerate(replay_plans):
+            accepted_tokens = plan.query_tokens[:accepted_length]
+            input_ids[row, :accepted_length] = torch.tensor(
+                accepted_tokens,
+                dtype=torch.long,
+                device=replay_device,
+            )
+            query_lengths.append(accepted_length)
+            request_ids.append(plan.request_id)
+        self.model.forward_with_cache_batch(
+            input_ids,
+            query_lengths,
+            self.hybrid_cache_manager,
+            request_ids,
+            capture_hidden_taps=False,
+            attention_pad_to_length=self.config.get(
+                "qwen35_cached_attention_pad_to_length"
+            ),
+            batch_pad_to_size=self.config.get("qwen35_cached_batch_pad_to_size"),
+            return_logits=False,
+        )
+
+    def commit_verified_cache(
+        self, accepted_lengths_by_sequence: dict[int, int]
+    ) -> None:
         if self.hybrid_cache_manager is None:
             return
         pending = getattr(self, "_pending_verified_cache_transactions", {})
+        plans: list[tuple[int, PendingQwen35Verification, int]] = []
         for sequence_id, accepted_length in accepted_lengths_by_sequence.items():
             entry = pending.get(sequence_id)
             if entry is None:
                 continue
-            if len(entry) == 5:
-                transaction, request_id, output, target_token_ids, start_position = entry
-                decision_index = max(0, accepted_length - 1)
+            plan = self._coerce_pending_qwen35_verification(entry)
+            if accepted_length < 0:
+                raise ValueError("accepted verification length cannot be negative")
+            if plan.query_tokens and accepted_length > len(plan.query_tokens):
+                raise ValueError("accepted verification length exceeds query tokens")
+            plans.append((sequence_id, plan, accepted_length))
+        if not plans:
+            return
+        self._record_memory_stage("commit_start", batch_size=len(plans))
+        try:
+            replay_device = self._model_device_for_replay()
+            for _sequence_id, plan, _accepted_length in plans:
+                if plan.query_tokens and hasattr(
+                    self.hybrid_cache_manager, "restore_original"
+                ):
+                    self.hybrid_cache_manager.restore_original(
+                        plan.transaction,
+                        [plan.request_id],
+                    )
+            self._replay_qwen35_accepted_prefixes(plans, replay_device)
+
+            for _sequence_id, plan, accepted_length in plans:
+                decision_index = accepted_length - 1
                 if (
-                    getattr(self, "dflash2_draft_model", None) is not None
-                    and output.hidden_taps
-                    and decision_index < len(target_token_ids)
+                    accepted_length > 0
+                    and getattr(self, "dflash2_draft_model", None) is not None
+                    and plan.hidden_taps
+                    and decision_index < len(plan.target_token_ids)
                 ):
                     if not hasattr(self, "_dflash2_contexts"):
                         self._dflash2_contexts = {}
                     hidden_taps = self._append_dflash2_hidden_history(
-                        sequence_id,
-                        request_id,
-                        output,
-                        decision_index + 1,
+                        _sequence_id,
+                        plan.request_id,
+                        plan,
+                        accepted_length,
                     )
-                    self._dflash2_contexts[sequence_id] = {
-                        "request_id": request_id,
-                        "anchor_token_id": int(target_token_ids[decision_index]),
-                        "anchor_position": start_position + decision_index + 1,
+                    self._dflash2_contexts[_sequence_id] = {
+                        "request_id": plan.request_id,
+                        "anchor_token_id": int(plan.target_token_ids[decision_index]),
+                        "anchor_position": plan.start_position + decision_index + 1,
                         "hidden_taps": hidden_taps,
                     }
                     if self.dflash2_draft_cache is not None:
                         self.dflash2_draft_cache.update_target_context(
-                            request_id,
+                            plan.request_id,
                             hidden_taps,
-                            int(target_token_ids[decision_index]),
-                            start_position + decision_index + 1,
+                            int(plan.target_token_ids[decision_index]),
+                            plan.start_position + decision_index + 1,
                         )
                         new_hidden_taps = {
-                            layer_id: value[:, : decision_index + 1, :].detach()
-                            for layer_id, value in output.hidden_taps.items()
+                            layer_id: value[:, :accepted_length, :].detach()
+                            for layer_id, value in plan.hidden_taps.items()
                         }
                         self._install_dflash2_projected_context(
-                            request_id,
+                            plan.request_id,
                             new_hidden_taps,
-                            start_position,
+                            plan.start_position,
                             append=(
-                                request_id
+                                plan.request_id
                                 in self.dflash2_draft_cache.context_kv_by_request
                             ),
                         )
-                        self.dflash2_draft_cache.commit_proposal(request_id)
-            else:
-                transaction, request_id = entry
-            self.hybrid_cache_manager.commit(
-                transaction,
-                {request_id: accepted_length},
+                        self.dflash2_draft_cache.commit_proposal(plan.request_id)
+                else:
+                    draft_cache = getattr(self, "dflash2_draft_cache", None)
+                    if draft_cache is not None:
+                        draft_cache.rollback_proposal(plan.request_id)
+
+            for sequence_id, plan, accepted_length in plans:
+                if plan.query_tokens and hasattr(
+                    self.hybrid_cache_manager, "finalize_replayed_commit"
+                ):
+                    self.hybrid_cache_manager.finalize_replayed_commit(
+                        plan.transaction,
+                        {plan.request_id: accepted_length},
+                    )
+                else:
+                    self.hybrid_cache_manager.commit(
+                        plan.transaction,
+                        {plan.request_id: accepted_length},
+                    )
+                pending.pop(sequence_id, None)
+            self._record_memory_stage(
+                "commit",
+                batch_size=len(plans),
+                accepted_tokens=sum(length for _sid, _plan, length in plans),
             )
-            pending.pop(sequence_id, None)
+        except Exception:
+            for _sequence_id, plan, _accepted_length in plans:
+                if plan.transaction.state.name == "ACTIVE":
+                    self.hybrid_cache_manager.rollback(plan.transaction)
+                draft_cache = getattr(self, "dflash2_draft_cache", None)
+                if draft_cache is not None:
+                    draft_cache.rollback_proposal(plan.request_id)
+            self._record_memory_stage("commit_rollback", batch_size=len(plans))
+            raise
 
     def rollback_verified_cache(self, sequence_ids: list[int]) -> None:
         if self.hybrid_cache_manager is None:
             return
         pending = getattr(self, "_pending_verified_cache_transactions", {})
+        self._record_memory_stage("rollback_start", batch_size=len(sequence_ids))
         for sequence_id in sequence_ids:
             entry = pending.pop(sequence_id, None)
             if entry is None:
@@ -1521,16 +1902,19 @@ class ModelRunner:
                 if context is not None and draft_cache is not None:
                     draft_cache.rollback_proposal(context["request_id"])
                 continue
-            transaction = entry[0]
+            plan = self._coerce_pending_qwen35_verification(entry)
+            transaction = plan.transaction
             if transaction.state.name == "ACTIVE":
                 self.hybrid_cache_manager.rollback(transaction)
             draft_cache = getattr(self, "dflash2_draft_cache", None)
             if draft_cache is not None:
-                draft_cache.rollback_proposal(entry[1])
+                draft_cache.rollback_proposal(plan.request_id)
+        self._record_memory_stage("rollback", batch_size=len(sequence_ids))
 
     def release_hybrid_requests(self, request_ids: list[str]) -> None:
         if self.hybrid_cache_manager is None:
             return
+        self._record_memory_stage("release_start", request_count=len(request_ids))
         for request_id in request_ids:
             self.hybrid_cache_manager.release_request(request_id)
             if self.dflash2_draft_cache is not None:
@@ -1540,6 +1924,7 @@ class ModelRunner:
             for seq_id, context in self._dflash2_contexts.items()
             if context.get("request_id") not in set(request_ids)
         }
+        self._record_memory_stage("release", request_count=len(request_ids))
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs

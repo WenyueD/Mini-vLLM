@@ -6,6 +6,7 @@ import pytest
 from scripts.benchmark_qwen38_dflash2_concurrency import (
     RequestTimeline,
     WorkloadRequest,
+    build_config,
     compare_token_outputs,
     latency_summary,
     percentile,
@@ -18,6 +19,54 @@ from scripts.benchmark_qwen38_dflash2_concurrency import (
     summarize_timelines,
     validate_run_summary,
 )
+
+
+def test_build_config_pins_cached_target_shapes_for_exact_bf16_comparison(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "myvllm.models.qwen3_8_config.load_qwen35_config_dict",
+        lambda _path: {"text_config": {}},
+    )
+    args = SimpleNamespace(
+        target_model="target",
+        draft_model="draft",
+        block_size=256,
+        max_metrics_history=100,
+        gpu_memory_utilization=0.9,
+        target_cache_memory_fraction=0.05,
+        draft_memory_reservation_fraction=0.0,
+        cached_target_micro_batch_size=4,
+        dtype="bfloat16",
+        safe_open_device="cuda",
+        dflash2_safe_open_device=None,
+        debug_metadata=False,
+        profile_dflash2_stages=False,
+        memory_trace=True,
+        num_speculative_tokens=7,
+    )
+
+    config = build_config(
+        args,
+        speculative=True,
+        eos=0,
+        max_prompt_tokens=128,
+        max_new_tokens=64,
+        concurrency=2,
+    )
+
+    assert config["qwen35_cached_batch_pad_to_size"] == 2
+    assert config["qwen35_cached_attention_pad_to_length"] == 194
+
+    c8_config = build_config(
+        args,
+        speculative=True,
+        eos=0,
+        max_prompt_tokens=128,
+        max_new_tokens=64,
+        concurrency=8,
+    )
+    assert c8_config["qwen35_cached_batch_pad_to_size"] == 4
 
 
 def test_percentile_uses_linear_interpolation():
@@ -161,6 +210,22 @@ def test_schema_validation_and_token_comparison_diagnostics():
     assert diagnostic["candidate_decision"]["argmax_token_id"] == 9
     assert diagnostic["top2_margin"] == 0.0
     assert not diagnostic_comparison["exact_token_match"]
+
+
+def test_token_comparison_checks_all_requests_and_only_caps_mismatch_details():
+    target = {f"request-{index}": [index] for index in range(10)}
+    candidate = dict(target)
+    candidate["request-9"] = [999]
+
+    comparison = compare_token_outputs(target, candidate, sample_limit=1)
+
+    assert comparison["compared_requests"] == 10
+    assert comparison["sampled_requests"] == 10
+    assert comparison["mismatch_count"] == 1
+    assert not comparison["exact_token_match"]
+    assert [item["request_id"] for item in comparison["mismatches"]] == [
+        "request-9"
+    ]
 
 
 def test_reset_runtime_stats_preserves_and_zeros_all_counter_keys():

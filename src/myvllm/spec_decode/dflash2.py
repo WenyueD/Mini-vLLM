@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from myvllm.engine.sequence import Sequence
+from myvllm.engine.memory import tensor_nbytes
 from myvllm.models.qwen3_8 import rotate_half
 from myvllm.spec_decode.proposer import Proposer
 from myvllm.spec_decode.types import Proposal
@@ -71,8 +72,7 @@ class DFlash2Config:
         if not isinstance(dflash, Mapping):
             raise ValueError("DFlash2 config must be a mapping")
         target_layer_ids = tuple(
-            int(value)
-            for value in dflash.get("target_layer_ids", cls.target_layer_ids)
+            int(value) for value in dflash.get("target_layer_ids", cls.target_layer_ids)
         )
         rope_parameters = raw.get("rope_parameters") or {}
         return cls(
@@ -87,17 +87,23 @@ class DFlash2Config:
                 )
             ),
             conv_group_size=int(dflash.get("conv_group_size", cls.conv_group_size)),
-            vocab_size=int(raw.get("vocab_size", dflash.get("vocab_size", cls.vocab_size))),
+            vocab_size=int(
+                raw.get("vocab_size", dflash.get("vocab_size", cls.vocab_size))
+            ),
             hidden_size=int(raw.get("hidden_size", cls.hidden_size)),
             intermediate_size=int(raw.get("intermediate_size", cls.intermediate_size)),
-            num_attention_heads=int(raw.get("num_attention_heads", cls.num_attention_heads)),
-            num_key_value_heads=int(raw.get("num_key_value_heads", cls.num_key_value_heads)),
+            num_attention_heads=int(
+                raw.get("num_attention_heads", cls.num_attention_heads)
+            ),
+            num_key_value_heads=int(
+                raw.get("num_key_value_heads", cls.num_key_value_heads)
+            ),
             head_dim=int(raw.get("head_dim", cls.head_dim)),
             num_sliding_attention_layers=int(
                 raw.get(
                     "num_hidden_layers",
                     dflash.get(
-                    "num_sliding_attention_layers",
+                        "num_sliding_attention_layers",
                         dflash.get(
                             "sliding_attention_layers",
                             cls.num_sliding_attention_layers,
@@ -105,7 +111,11 @@ class DFlash2Config:
                     ),
                 )
             ),
-            sliding_window=int(raw.get("sliding_window", dflash.get("sliding_window", cls.sliding_window))),
+            sliding_window=int(
+                raw.get(
+                    "sliding_window", dflash.get("sliding_window", cls.sliding_window)
+                )
+            ),
             rms_norm_eps=float(raw.get("rms_norm_eps", cls.rms_norm_eps)),
             rope_theta=float(
                 rope_parameters.get("rope_theta", raw.get("rope_theta", cls.rope_theta))
@@ -486,7 +496,9 @@ class DFlash2Attention(nn.Module):
         sin = sin.unsqueeze(1)
         return states * cos + rotate_half(states) * sin
 
-    def _project_kv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_kv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
         key = self.k_proj(hidden_states).view(
             batch_size,
@@ -758,7 +770,9 @@ class DFlash2DraftModel(nn.Module):
         input_ids = torch.cat([anchor_token_ids.reshape(-1, 1), mask], dim=1)
         return token_embedding(input_ids) * self.config.input_embedding_scale
 
-    def compute_unary_logits(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
+    def compute_unary_logits(
+        self, hidden_states: torch.Tensor, lm_head
+    ) -> torch.Tensor:
         logits = lm_head(hidden_states)
         if self.config.output_multiplier != 1.0:
             logits = logits * self.config.output_multiplier
@@ -776,10 +790,9 @@ class DFlash2DraftModel(nn.Module):
         lm_head,
         *,
         context_positions: torch.Tensor | None = None,
-        context_kv_by_layer: Mapping[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ]
-        | None = None,
+        context_kv_by_layer: (
+            Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None
+        ) = None,
         context_valid_mask: torch.Tensor | None = None,
         profile_stages: bool = False,
         return_debug: bool = False,
@@ -923,7 +936,9 @@ class DFlash2DraftModel(nn.Module):
                 proposal_hidden,
                 anchor_token_ids,
             )
-            batch_indices = torch.arange(candidate_ids.shape[0], device=candidate_ids.device)
+            batch_indices = torch.arange(
+                candidate_ids.shape[0], device=candidate_ids.device
+            )
             previous_indices = torch.zeros(
                 candidate_ids.shape[0],
                 dtype=torch.long,
@@ -1180,7 +1195,9 @@ class ProposalBatch:
         if torch.any(self.valid_lengths < 0) or torch.any(self.valid_lengths > max_k):
             raise ValueError("ProposalBatch valid_lengths are outside [0, K]")
 
-    def proposal_for(self, sequence: Sequence, row: int, include_metadata: bool) -> Proposal:
+    def proposal_for(
+        self, sequence: Sequence, row: int, include_metadata: bool
+    ) -> Proposal:
         valid_length = int(self.valid_lengths[row].item())
         tokens = tuple(int(v) for v in self.token_ids[row, :valid_length].tolist())
         metadata = dict(self.metadata) if include_metadata else {}
@@ -1227,20 +1244,18 @@ class DFlash2DraftCache:
     _proposal_length_snapshots_by_request: dict[str, int | None] = field(
         default_factory=dict
     )
-    _proposal_context_snapshots_by_request: dict[
-        str, DFlash2DraftCacheSnapshot
-    ] = field(default_factory=dict)
+    _proposal_context_snapshots_by_request: dict[str, DFlash2DraftCacheSnapshot] = (
+        field(default_factory=dict)
+    )
     hidden_taps_by_request: dict[str, dict[int, torch.Tensor]] = field(
         default_factory=dict
     )
     anchor_token_ids_by_request: dict[str, int] = field(default_factory=dict)
     anchor_positions_by_request: dict[str, int] = field(default_factory=dict)
-    context_positions_by_request: dict[str, torch.Tensor] = field(
-        default_factory=dict
+    context_positions_by_request: dict[str, torch.Tensor] = field(default_factory=dict)
+    context_kv_by_request: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = (
+        field(default_factory=dict)
     )
-    context_kv_by_request: dict[
-        str, dict[int, tuple[torch.Tensor, torch.Tensor]]
-    ] = field(default_factory=dict)
 
     def begin_proposal(self, request_id: str) -> None:
         if request_id in self._proposal_length_snapshots_by_request:
@@ -1311,9 +1326,7 @@ class DFlash2DraftCache:
         self,
         request_id: str,
         context_positions: torch.Tensor,
-        context_kv_by_layer: Mapping[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ],
+        context_kv_by_layer: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
         *,
         append: bool = False,
     ) -> None:
@@ -1322,8 +1335,10 @@ class DFlash2DraftCache:
         if not context_kv_by_layer:
             raise ValueError("DFlash2 projected context must include draft layers")
         previous_layers = self.context_kv_by_request.get(request_id)
-        if append and previous_layers is not None and set(context_kv_by_layer) != set(
-            previous_layers
+        if (
+            append
+            and previous_layers is not None
+            and set(context_kv_by_layer) != set(previous_layers)
         ):
             raise ValueError("DFlash2 projected context layer set changed on append")
         new_length = context_positions.shape[1]
@@ -1462,6 +1477,33 @@ class DFlash2DraftCache:
         self.context_positions_by_request.pop(request_id, None)
         self.context_kv_by_request.pop(request_id, None)
 
+    def estimate_bytes(self) -> dict[str, int]:
+        hidden_tap_bytes = sum(
+            tensor_nbytes(value)
+            for hidden_taps in self.hidden_taps_by_request.values()
+            for value in hidden_taps.values()
+        )
+        position_bytes = sum(
+            tensor_nbytes(value) for value in self.context_positions_by_request.values()
+        )
+        projected_kv_bytes = sum(
+            tensor_nbytes(key) + tensor_nbytes(value)
+            for context_kv in self.context_kv_by_request.values()
+            for key, value in context_kv.values()
+        )
+        return {
+            "active_requests": len(self.lengths_by_request),
+            "logical_tokens": sum(self.lengths_by_request.values()),
+            "hidden_tap_bytes": hidden_tap_bytes,
+            "context_position_bytes": position_bytes,
+            "projected_kv_bytes": projected_kv_bytes,
+            "active_proposal_snapshots": len(
+                self._proposal_context_snapshots_by_request
+            ),
+            "proposal_snapshot_reference_bytes": 0,
+            "total_bytes": hidden_tap_bytes + position_bytes + projected_kv_bytes,
+        }
+
 
 @dataclass(frozen=True)
 class DFlash2TargetContext:
@@ -1480,8 +1522,7 @@ class BlockParallelDFlash2Model(Protocol):
         sequences: list[Sequence],
         max_tokens: list[int],
         draft_cache: DFlash2DraftCache,
-    ) -> ProposalBatch:
-        ...
+    ) -> ProposalBatch: ...
 
 
 class DFlash2StandaloneProposer(Proposer):

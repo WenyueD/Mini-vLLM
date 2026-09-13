@@ -307,6 +307,8 @@ class LLMEngine:
                 result["target_decision_diagnostics"] = model_runner.call(
                     "get_target_decision_diagnostics"
                 )
+            if hasattr(model_runner, "get_memory_trace"):
+                result["memory_trace"] = model_runner.call("get_memory_trace")
         if model_runner is not None and getattr(
             model_runner, "dflash2_draft_model", None
         ) is not None:

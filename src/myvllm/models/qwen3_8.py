@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from myvllm.engine.hybrid_cache import (
+    FullAttentionLayerState,
     HybridCacheManager,
     HybridCacheTransaction,
     HybridRequestState,
@@ -253,12 +254,13 @@ class Qwen35Attention(nn.Module):
             row_key = key_states[row : row + 1]
             row_value = value_states[row : row + 1]
             if previous is not None:
-                row_key = torch.cat([previous[0], row_key], dim=1)
-                row_value = torch.cat([previous[1], row_value], dim=1)
-            request_state.full_attention_layers[self.layer_idx] = (
-                row_key.detach().clone(),
-                row_value.detach().clone(),
-            )
+                if not isinstance(previous, FullAttentionLayerState):
+                    previous = FullAttentionLayerState.from_tensors(*previous)
+                    request_state.full_attention_layers[self.layer_idx] = previous
+                row_key, row_value = previous.append(row_key, row_value)
+            else:
+                previous = FullAttentionLayerState.from_tensors(row_key, row_value)
+                request_state.full_attention_layers[self.layer_idx] = previous
             cached_rows.append((row_key, row_value))
             context_lengths.append(row_key.shape[1])
 
@@ -665,6 +667,7 @@ class Qwen35ForCausalLM(nn.Module):
         transaction=None,
         capture_hidden_taps: bool = False,
         hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
+        return_logits: bool = True,
     ) -> Qwen35ForwardOutput:
         """Run B=1 text target tokens through the hybrid cache contract.
 
@@ -693,18 +696,18 @@ class Qwen35ForCausalLM(nn.Module):
                 hidden_tap_layers=tap_layers,
             )
             hidden_states.append(hidden)
-            logits.append(self.compute_logits(hidden))
+            if return_logits:
+                logits.append(self.compute_logits(hidden))
             for layer_id, value in taps.items():
                 merged_taps[layer_id].append(value)
             if transaction is not None:
-                cache_manager.record_snapshot(
+                cache_manager.record_step(
                     transaction,
                     request_id,
                     tokens_executed=index + 1,
-                    state=request_state,
                 )
         hidden_tensor = torch.cat(hidden_states, dim=1)
-        logits_tensor = torch.cat(logits, dim=1)
+        logits_tensor = torch.cat(logits, dim=1) if return_logits else None
         hidden_taps = {
             layer_id: torch.cat(values, dim=1)
             for layer_id, values in merged_taps.items()
@@ -731,6 +734,7 @@ class Qwen35ForCausalLM(nn.Module):
         hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
         attention_pad_to_length: int | None = None,
         batch_pad_to_size: int | None = None,
+        return_logits: bool = True,
     ) -> list[Qwen35ForwardOutput]:
         """Run ragged request queries with a tensor batch at each token position."""
         reject_qwen35_multimodal_inputs()
@@ -749,8 +753,35 @@ class Qwen35ForCausalLM(nn.Module):
             request_id not in transactions for request_id in request_ids
         ):
             raise ValueError("batched cached target is missing a request transaction")
-        if batch_pad_to_size is not None and batch_pad_to_size < batch_size:
-            raise ValueError("batch padding size cannot be smaller than the input batch")
+        if batch_pad_to_size is not None and batch_pad_to_size <= 0:
+            raise ValueError("batch padding size must be positive")
+        if batch_pad_to_size is not None and batch_size > batch_pad_to_size:
+            outputs = []
+            for start in range(0, batch_size, batch_pad_to_size):
+                end = min(start + batch_pad_to_size, batch_size)
+                chunk_request_ids = request_ids[start:end]
+                outputs.extend(
+                    self.forward_with_cache_batch(
+                        input_ids[start:end],
+                        query_lengths[start:end],
+                        cache_manager,
+                        chunk_request_ids,
+                        transactions=(
+                            None
+                            if transactions is None
+                            else {
+                                request_id: transactions[request_id]
+                                for request_id in chunk_request_ids
+                            }
+                        ),
+                        capture_hidden_taps=capture_hidden_taps,
+                        hidden_tap_layers=hidden_tap_layers,
+                        attention_pad_to_length=attention_pad_to_length,
+                        batch_pad_to_size=batch_pad_to_size,
+                        return_logits=return_logits,
+                    )
+                )
+            return outputs
 
         request_states = [cache_manager.ensure_request(rid) for rid in request_ids]
         taps = hidden_tap_layers if capture_hidden_taps else ()
@@ -795,25 +826,25 @@ class Qwen35ForCausalLM(nn.Module):
                 layer_id: value[: len(active_rows)]
                 for layer_id, value in hidden_taps.items()
             }
-            step_logits = self.compute_logits(hidden)
+            step_logits = self.compute_logits(hidden) if return_logits else None
             for active_row, request_row in enumerate(active_rows):
                 hidden_by_request[request_row].append(
                     hidden[active_row : active_row + 1]
                 )
-                logits_by_request[request_row].append(
-                    step_logits[active_row : active_row + 1]
-                )
+                if step_logits is not None:
+                    logits_by_request[request_row].append(
+                        step_logits[active_row : active_row + 1]
+                    )
                 for layer_id, value in hidden_taps.items():
                     taps_by_request[request_row][layer_id].append(
                         value[active_row : active_row + 1]
                     )
                 if transactions is not None:
                     transaction = transactions[request_ids[request_row]]
-                    cache_manager.record_snapshot(
+                    cache_manager.record_step(
                         transaction,
                         request_ids[request_row],
                         tokens_executed=token_index + 1,
-                        state=request_states[request_row],
                     )
 
         outputs = []
@@ -821,7 +852,11 @@ class Qwen35ForCausalLM(nn.Module):
             transaction = None if transactions is None else transactions[request_id]
             outputs.append(
                 Qwen35ForwardOutput(
-                    logits=torch.cat(logits_by_request[row], dim=1),
+                    logits=(
+                        torch.cat(logits_by_request[row], dim=1)
+                        if return_logits
+                        else None
+                    ),
                     hidden_states=torch.cat(hidden_by_request[row], dim=1),
                     hidden_taps={
                         layer_id: torch.cat(values, dim=1)

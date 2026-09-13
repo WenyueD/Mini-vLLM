@@ -16,6 +16,95 @@ class HybridTransactionState(Enum):
     ROLLED_BACK = auto()
 
 
+def tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+@dataclass
+class FullAttentionLayerState:
+    key: torch.Tensor
+    value: torch.Tensor
+    logical_length: int
+
+    @classmethod
+    def from_tensors(
+        cls,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        capacity: int | None = None,
+    ) -> "FullAttentionLayerState":
+        if key.shape != value.shape or key.dim() != 4 or key.shape[0] != 1:
+            raise ValueError(
+                "full-attention K/V must be equal 4D [1, length, heads, dim]"
+            )
+        length = int(key.shape[1])
+        capacity = max(length, length if capacity is None else int(capacity))
+        stored_key = key.new_empty((key.shape[0], capacity, *key.shape[2:]))
+        stored_value = value.new_empty((value.shape[0], capacity, *value.shape[2:]))
+        if length:
+            stored_key[:, :length].copy_(key.detach())
+            stored_value[:, :length].copy_(value.detach())
+        return cls(stored_key, stored_value, length)
+
+    def clone(self) -> "FullAttentionLayerState":
+        return FullAttentionLayerState.from_tensors(*self.tensors())
+
+    def tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.key[:, : self.logical_length],
+            self.value[:, : self.logical_length],
+        )
+
+    def append(
+        self, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if key.shape != value.shape or key.dim() != 4 or key.shape[0] != 1:
+            raise ValueError(
+                "full-attention append K/V must be equal 4D [1, length, heads, dim]"
+            )
+        if key.shape[2:] != self.key.shape[2:]:
+            raise ValueError("full-attention append K/V head shape changed")
+        append_length = int(key.shape[1])
+        new_length = self.logical_length + append_length
+        self._ensure_capacity(new_length)
+        if append_length:
+            self.key[:, self.logical_length : new_length].copy_(key.detach())
+            self.value[:, self.logical_length : new_length].copy_(value.detach())
+        self.logical_length = new_length
+        return self.tensors()
+
+    def _ensure_capacity(self, needed: int) -> None:
+        current = int(self.key.shape[1])
+        if current >= needed:
+            return
+        new_capacity = max(needed, max(1, current * 2))
+        new_key = self.key.new_empty(
+            (self.key.shape[0], new_capacity, *self.key.shape[2:])
+        )
+        new_value = self.value.new_empty(
+            (self.value.shape[0], new_capacity, *self.value.shape[2:])
+        )
+        if self.logical_length:
+            new_key[:, : self.logical_length].copy_(self.key[:, : self.logical_length])
+            new_value[:, : self.logical_length].copy_(
+                self.value[:, : self.logical_length]
+            )
+        self.key = new_key
+        self.value = new_value
+
+    def nbytes(self, *, allocated_capacity: bool = True) -> int:
+        if allocated_capacity:
+            return tensor_nbytes(self.key) + tensor_nbytes(self.value)
+        key, value = self.tensors()
+        return tensor_nbytes(key) + tensor_nbytes(value)
+
+    def __iter__(self):
+        return iter(self.tensors())
+
+
 @dataclass
 class LinearLayerState:
     recurrent_state: torch.Tensor
@@ -27,12 +116,15 @@ class LinearLayerState:
             conv_state=self.conv_state.clone(),
         )
 
+    def nbytes(self) -> int:
+        return tensor_nbytes(self.recurrent_state) + tensor_nbytes(self.conv_state)
+
 
 @dataclass
 class HybridRequestState:
     request_id: RequestId
     logical_length: int = 0
-    full_attention_layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(
+    full_attention_layers: dict[int, FullAttentionLayerState] = field(
         default_factory=dict
     )
     linear_layers: dict[int, LinearLayerState] = field(default_factory=dict)
@@ -42,14 +134,53 @@ class HybridRequestState:
             request_id=self.request_id,
             logical_length=self.logical_length,
             full_attention_layers={
-                layer_id: (key.clone(), value.clone())
-                for layer_id, (key, value) in self.full_attention_layers.items()
+                layer_id: _clone_full_attention_state(state)
+                for layer_id, state in self.full_attention_layers.items()
             },
             linear_layers={
                 layer_id: state.clone()
                 for layer_id, state in self.linear_layers.items()
             },
         )
+
+    def nbytes(self, *, allocated_capacity: bool = True) -> dict[str, int]:
+        full_attention = sum(
+            _full_attention_state_nbytes(state, allocated_capacity=allocated_capacity)
+            for state in self.full_attention_layers.values()
+        )
+        linear_recurrent = sum(
+            tensor_nbytes(state.recurrent_state)
+            for state in self.linear_layers.values()
+        )
+        linear_conv = sum(
+            tensor_nbytes(state.conv_state) for state in self.linear_layers.values()
+        )
+        return {
+            "full_attention_kv_bytes": full_attention,
+            "linear_recurrent_bytes": linear_recurrent,
+            "linear_conv_bytes": linear_conv,
+            "total_bytes": full_attention + linear_recurrent + linear_conv,
+        }
+
+
+def _clone_full_attention_state(
+    state: FullAttentionLayerState | tuple[torch.Tensor, torch.Tensor],
+) -> FullAttentionLayerState:
+    if isinstance(state, FullAttentionLayerState):
+        return state.clone()
+    key, value = state
+    return FullAttentionLayerState.from_tensors(key, value)
+
+
+def _full_attention_state_nbytes(
+    state: FullAttentionLayerState | tuple[torch.Tensor, torch.Tensor],
+    *,
+    allocated_capacity: bool,
+) -> int:
+    if isinstance(state, FullAttentionLayerState):
+        return state.nbytes(allocated_capacity=allocated_capacity)
+    key, value = state
+    return tensor_nbytes(key) + tensor_nbytes(value)
 
 
 @dataclass
@@ -61,6 +192,7 @@ class HybridCacheTransaction:
     snapshots: dict[RequestId, dict[int, HybridRequestState]] = field(
         default_factory=dict
     )
+    recorded_steps: dict[RequestId, set[int]] = field(default_factory=dict)
     state: HybridTransactionState = HybridTransactionState.ACTIVE
 
 
@@ -131,9 +263,23 @@ class HybridCacheManager:
                 for request_id in request_ids
             },
             snapshots={request_id: {} for request_id in request_ids},
+            recorded_steps={request_id: set() for request_id in request_ids},
         )
         self._active[transaction_id] = transaction
         return transaction
+
+    def record_step(
+        self,
+        transaction: HybridCacheTransaction,
+        request_id: RequestId,
+        tokens_executed: int,
+    ) -> None:
+        self._require_active(transaction)
+        if request_id not in transaction.request_ids:
+            raise ValueError("request does not belong to this transaction")
+        if not 1 <= tokens_executed <= transaction.reserve_tokens[request_id]:
+            raise ValueError("snapshot token index is outside the reservation")
+        transaction.recorded_steps[request_id].add(tokens_executed)
 
     def record_snapshot(
         self,
@@ -147,11 +293,49 @@ class HybridCacheManager:
             raise ValueError("request does not belong to this transaction")
         if not 1 <= tokens_executed <= transaction.reserve_tokens[request_id]:
             raise ValueError("snapshot token index is outside the reservation")
+        transaction.recorded_steps[request_id].add(tokens_executed)
         snapshot = (state or self.ensure_request(request_id)).clone()
         snapshot.logical_length = (
             transaction.original_states[request_id].logical_length + tokens_executed
         )
         transaction.snapshots[request_id][tokens_executed] = snapshot
+
+    def restore_original(
+        self,
+        transaction: HybridCacheTransaction,
+        request_ids: list[RequestId] | tuple[RequestId, ...] | None = None,
+    ) -> None:
+        self._require_active(transaction)
+        selected = (
+            transaction.request_ids if request_ids is None else tuple(request_ids)
+        )
+        for request_id in selected:
+            if request_id not in transaction.original_states:
+                raise ValueError("request does not belong to this transaction")
+            self._states[request_id] = transaction.original_states[request_id].clone()
+
+    def finalize_replayed_commit(
+        self,
+        transaction: HybridCacheTransaction,
+        accepted_lengths_per_request: dict[RequestId, int],
+    ) -> None:
+        self._require_active(transaction)
+        for request_id in transaction.request_ids:
+            if request_id not in accepted_lengths_per_request:
+                raise ValueError(f"missing accepted length for request {request_id}")
+            accepted = accepted_lengths_per_request[request_id]
+            if not 0 <= accepted <= transaction.reserve_tokens[request_id]:
+                raise ValueError("accepted length is outside the reservation")
+            expected_length = (
+                transaction.original_states[request_id].logical_length + accepted
+            )
+            actual_length = self.ensure_request(request_id).logical_length
+            if actual_length != expected_length:
+                raise RuntimeError(
+                    "replayed hybrid cache commit has the wrong logical length"
+                )
+        transaction.state = HybridTransactionState.COMMITTED
+        del self._active[transaction.transaction_id]
 
     def commit(
         self,
@@ -171,13 +355,12 @@ class HybridCacheManager:
                 ].clone()
                 continue
             try:
-                self._states[request_id] = transaction.snapshots[request_id][
-                    accepted
-                ].clone()
+                snapshot = transaction.snapshots[request_id][accepted]
             except KeyError as exc:
                 raise RuntimeError(
                     "cannot commit a linear-attention state that was not recorded"
                 ) from exc
+            self._states[request_id] = snapshot.clone()
         transaction.state = HybridTransactionState.COMMITTED
         del self._active[transaction.transaction_id]
 
@@ -190,6 +373,52 @@ class HybridCacheManager:
 
     def release_request(self, request_id: RequestId) -> None:
         self._states.pop(request_id, None)
+
+    def estimate_bytes(self) -> dict[str, int]:
+        state_totals = {
+            "full_attention_kv_bytes": 0,
+            "linear_recurrent_bytes": 0,
+            "linear_conv_bytes": 0,
+            "total_bytes": 0,
+        }
+        for state in self._states.values():
+            breakdown = state.nbytes()
+            for key, value in breakdown.items():
+                state_totals[key] += value
+
+        original_bytes = 0
+        snapshot_bytes = 0
+        recorded_steps = 0
+        for transaction in self._active.values():
+            original_bytes += sum(
+                state.nbytes()["total_bytes"]
+                for state in transaction.original_states.values()
+            )
+            snapshot_bytes += sum(
+                snapshot.nbytes()["total_bytes"]
+                for snapshots in transaction.snapshots.values()
+                for snapshot in snapshots.values()
+            )
+            recorded_steps += sum(
+                len(steps) for steps in transaction.recorded_steps.values()
+            )
+        return {
+            "active_requests": len(self._states),
+            "logical_tokens": sum(
+                state.logical_length for state in self._states.values()
+            ),
+            "state_full_attention_kv_bytes": state_totals["full_attention_kv_bytes"],
+            "state_linear_recurrent_bytes": state_totals["linear_recurrent_bytes"],
+            "state_linear_conv_bytes": state_totals["linear_conv_bytes"],
+            "state_total_bytes": state_totals["total_bytes"],
+            "active_transactions": len(self._active),
+            "transaction_original_state_bytes": original_bytes,
+            "transaction_snapshot_state_bytes": snapshot_bytes,
+            "transaction_recorded_steps": recorded_steps,
+            "total_bytes": state_totals["total_bytes"]
+            + original_bytes
+            + snapshot_bytes,
+        }
 
     def _require_active(self, transaction: HybridCacheTransaction) -> None:
         if transaction.state is not HybridTransactionState.ACTIVE:

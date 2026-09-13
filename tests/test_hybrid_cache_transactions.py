@@ -83,3 +83,31 @@ def test_hybrid_cache_commit_requires_recorded_snapshot_for_accepted_tail():
     tx = manager.begin_transaction(["r0"], reserve_tokens=7)
     with pytest.raises(RuntimeError, match="not recorded"):
         manager.commit(tx, {"r0": 7})
+
+
+def test_hybrid_cache_replayed_commit_keeps_per_step_records_lightweight():
+    manager = HybridCacheManager()
+    before = seed_state(manager, "r0", 5, logical_length=4)
+    tx = manager.begin_transaction(["r0"], reserve_tokens=7)
+
+    for step in range(1, 8):
+        state = manager.get_request_state("r0")
+        state.logical_length = before.logical_length + step
+        state.linear_layers[0].recurrent_state.fill_(step)
+        manager.record_step(tx, "r0", step)
+
+    estimate = manager.estimate_bytes()
+    assert tx.snapshots["r0"] == {}
+    assert estimate["transaction_recorded_steps"] == 7
+    assert estimate["transaction_snapshot_state_bytes"] == 0
+
+    manager.restore_original(tx)
+    replayed = manager.get_request_state("r0")
+    replayed.logical_length = before.logical_length + 3
+    replayed.linear_layers[0].recurrent_state.fill_(3)
+    manager.finalize_replayed_commit(tx, {"r0": 3})
+
+    after = manager.get_request_state("r0")
+    assert tx.state is HybridTransactionState.COMMITTED
+    assert after.logical_length == 7
+    assert after.linear_layers[0].recurrent_state.unique().item() == 3

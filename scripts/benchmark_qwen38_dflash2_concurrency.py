@@ -78,7 +78,12 @@ class RequestTimeline:
 
     def to_record(self, origin_s: float) -> dict[str, Any]:
         record = asdict(self)
-        for key in ("submit_time_s", "admit_return_time_s", "first_token_time_s", "finish_time_s"):
+        for key in (
+            "submit_time_s",
+            "admit_return_time_s",
+            "first_token_time_s",
+            "finish_time_s",
+        ):
             if record[key] is not None:
                 record[f"{key[:-2]}relative_s"] = record[key] - origin_s
         return record
@@ -91,14 +96,20 @@ def parse_args() -> argparse.Namespace:
             "target-only vs Mini-vLLM DFlash2."
         )
     )
-    parser.add_argument("--target-model", default=os.environ.get("MINIVLLM_QWEN38_PATH"))
-    parser.add_argument("--draft-model", default=os.environ.get("MINIVLLM_DFLASH2_PATH"))
+    parser.add_argument(
+        "--target-model", default=os.environ.get("MINIVLLM_QWEN38_PATH")
+    )
+    parser.add_argument(
+        "--draft-model", default=os.environ.get("MINIVLLM_DFLASH2_PATH")
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--dtype", default="bfloat16", choices=("float16", "bfloat16", "float32")
     )
     parser.add_argument("--safe-open-device", default="cuda", choices=("cuda", "cpu"))
-    parser.add_argument("--dflash2-safe-open-device", default=None, choices=("cuda", "cpu"))
+    parser.add_argument(
+        "--dflash2-safe-open-device", default=None, choices=("cuda", "cpu")
+    )
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument(
@@ -107,19 +118,30 @@ def parse_args() -> argparse.Namespace:
         choices=("short", "medium", "long", "mixed"),
         default=["short", "medium", "mixed"],
     )
-    parser.add_argument("--variants", nargs="+", choices=("target_only", "dflash2"), default=["target_only", "dflash2"])
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=("target_only", "dflash2"),
+        default=["target_only", "dflash2"],
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--requests-per-run", type=int, default=0)
     parser.add_argument("--warmup-requests", type=int, default=1)
-    parser.add_argument("--num-speculative-tokens", type=int, default=1, choices=range(1, 8))
+    parser.add_argument(
+        "--num-speculative-tokens", type=int, default=1, choices=range(1, 8)
+    )
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--target-cache-memory-fraction", type=float, default=0.05)
     parser.add_argument("--draft-memory-reservation-fraction", type=float, default=0.0)
+    parser.add_argument("--cached-target-micro-batch-size", type=int, default=4)
     parser.add_argument("--max-metrics-history", type=int, default=100000)
-    parser.add_argument("--ignore-eos", dest="ignore_eos", action="store_true", default=True)
+    parser.add_argument(
+        "--ignore-eos", dest="ignore_eos", action="store_true", default=True
+    )
     parser.add_argument("--respect-eos", dest="ignore_eos", action="store_false")
     parser.add_argument("--profile-dflash2-stages", action="store_true")
+    parser.add_argument("--memory-trace", action="store_true")
     parser.add_argument("--debug-metadata", action="store_true")
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--sample-interval", type=float, default=0.1)
@@ -216,7 +238,9 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, sort_keys=True, default=json_default) + "\n")
 
 
-def prompt_for_token_count(tokenizer: Any, target_tokens: int, index: int) -> tuple[str, tuple[int, ...]]:
+def prompt_for_token_count(
+    tokenizer: Any, target_tokens: int, index: int
+) -> tuple[str, tuple[int, ...]]:
     seed = DEFAULT_PROMPT_SEEDS[index % len(DEFAULT_PROMPT_SEEDS)]
     text = ""
     while len(tokenizer.encode(text or seed)) < target_tokens:
@@ -258,7 +282,9 @@ def build_workload(
     for index in range(total_requests):
         bucket_name, isl, osl = buckets[index % len(buckets)]
         jitter = rng.randint(-max(1, isl // 16), max(1, isl // 16))
-        prompt, token_ids = prompt_for_token_count(tokenizer, max(1, isl + jitter), index)
+        prompt, token_ids = prompt_for_token_count(
+            tokenizer, max(1, isl + jitter), index
+        )
         if open_loop_rate > 0:
             arrival += rng.expovariate(open_loop_rate)
         elif burst_interval > 0:
@@ -290,9 +316,13 @@ def build_config(
 ) -> dict[str, Any]:
     from myvllm.models.qwen3_8_config import load_qwen35_config_dict
 
+    if args.cached_target_micro_batch_size <= 0:
+        raise ValueError("cached target micro-batch size must be positive")
     config = dict(load_qwen35_config_dict(args.target_model))
     max_model_length = max_prompt_tokens + max_new_tokens + 2
-    max_batch_tokens = max(max_model_length * concurrency, max_prompt_tokens * concurrency)
+    max_batch_tokens = max(
+        max_model_length * concurrency, max_prompt_tokens * concurrency
+    )
     dflash_safe_open = args.dflash2_safe_open_device or args.safe_open_device
     config.update(
         {
@@ -304,6 +334,12 @@ def build_config(
             "max_num_batched_tokens": max_batch_tokens,
             "max_num_batch_tokens": max_batch_tokens,
             "max_model_length": max_model_length,
+            # Exact token comparison requires every cached target path to use
+            # identical BF16 CUDA kernel shapes, including accepted-token replay.
+            "qwen35_cached_batch_pad_to_size": min(
+                concurrency, args.cached_target_micro_batch_size
+            ),
+            "qwen35_cached_attention_pad_to_length": max_model_length,
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
@@ -319,6 +355,7 @@ def build_config(
             "dflash2_debug_metadata": args.debug_metadata,
             "debug_target_decisions": args.debug_metadata,
             "dflash2_profile_stages": args.profile_dflash2_stages,
+            "memory_trace": args.memory_trace,
             "speculative_config": {
                 "enabled": speculative,
                 "proposer": "dflash2" if speculative else "ngram",
@@ -363,9 +400,7 @@ def reset_runtime_stats(engine: Any) -> None:
             runner._qwen35_verification_stats
         )
     if runner is not None and hasattr(runner, "_dflash2_profile_stats"):
-        runner._dflash2_profile_stats = reset_counters(
-            runner._dflash2_profile_stats
-        )
+        runner._dflash2_profile_stats = reset_counters(runner._dflash2_profile_stats)
     if runner is not None and hasattr(runner, "_target_decision_diagnostics"):
         runner._target_decision_diagnostics = []
 
@@ -433,7 +468,9 @@ def monitor_online(
         stop.wait(interval_s)
 
 
-def consume_request(handle: Any, spec: WorkloadRequest, timeline: RequestTimeline, timeout: float) -> RequestTimeline:
+def consume_request(
+    handle: Any, spec: WorkloadRequest, timeline: RequestTimeline, timeout: float
+) -> RequestTimeline:
     cumulative = 0
     cancel_sent = False
     try:
@@ -548,6 +585,7 @@ def run_closed_loop(
     pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
     futures: dict[Any, dict[str, Any]] = {}
     try:
+
         def collect_completed(done: set[Any]) -> None:
             for future in done:
                 active = futures.pop(future)
@@ -584,9 +622,15 @@ def run_closed_loop(
             if not batch:
                 return
             try:
-                for handle, timeline in submit_specs(online, batch, timeout, ignore_eos):
+                for handle, timeline in submit_specs(
+                    online, batch, timeout, ignore_eos
+                ):
                     future = pool.submit(
-                        consume_request, handle, by_id[handle.request_id], timeline, timeout
+                        consume_request,
+                        handle,
+                        by_id[handle.request_id],
+                        timeline,
+                        timeout,
                     )
                     futures[future] = {
                         "handle": handle,
@@ -702,11 +746,17 @@ def summarize_timelines(
     slo_tpot_s: float,
 ) -> dict[str, Any]:
     successful = [
-        item for item in timelines if item.finish_time_s is not None and item.error is None
+        item
+        for item in timelines
+        if item.finish_time_s is not None and item.error is None
     ]
     submit_times = [item.submit_time_s for item in successful]
-    finish_times = [item.finish_time_s for item in successful if item.finish_time_s is not None]
-    wall_s = max(finish_times) - min(submit_times) if submit_times and finish_times else 0.0
+    finish_times = [
+        item.finish_time_s for item in successful if item.finish_time_s is not None
+    ]
+    wall_s = (
+        max(finish_times) - min(submit_times) if submit_times and finish_times else 0.0
+    )
     ttft = [
         item.first_token_time_s - item.submit_time_s
         for item in successful
@@ -727,7 +777,8 @@ def summarize_timelines(
             request_tpot.append(0.0)
         else:
             request_tpot.append(
-                (item.finish_time_s - item.first_token_time_s) / (item.output_tokens - 1)
+                (item.finish_time_s - item.first_token_time_s)
+                / (item.output_tokens - 1)
             )
     output_tokens = sum(item.output_tokens for item in successful)
     prompt_tokens = sum(item.prompt_tokens for item in successful)
@@ -739,7 +790,8 @@ def summarize_timelines(
         item_tpot = (
             0.0
             if item.output_tokens <= 1
-            else (item.finish_time_s - item.first_token_time_s) / (item.output_tokens - 1)
+            else (item.finish_time_s - item.first_token_time_s)
+            / (item.output_tokens - 1)
         )
         good += int(item_ttft <= slo_ttft_s and item_tpot <= slo_tpot_s)
     return {
@@ -749,7 +801,9 @@ def summarize_timelines(
         "wall_time_s": wall_s,
         "request_throughput_rps": len(successful) / wall_s if wall_s > 0 else 0.0,
         "output_token_throughput_tps": output_tokens / wall_s if wall_s > 0 else 0.0,
-        "total_token_throughput_tps": (prompt_tokens + output_tokens) / wall_s if wall_s > 0 else 0.0,
+        "total_token_throughput_tps": (
+            (prompt_tokens + output_tokens) / wall_s if wall_s > 0 else 0.0
+        ),
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "ttft_s": latency_summary(ttft),
@@ -762,7 +816,9 @@ def summarize_timelines(
             "request_goodput_rps": good / wall_s if wall_s > 0 else 0.0,
             "fraction": good / len(successful) if successful else 0.0,
         },
-        "finish_reasons": count_by(item.finish_reason or "unknown" for item in timelines),
+        "finish_reasons": count_by(
+            item.finish_reason or "unknown" for item in timelines
+        ),
         "cancelled_requests": sum(int(item.cancelled) for item in timelines),
     }
 
@@ -776,8 +832,12 @@ def count_by(values: Any) -> dict[str, int]:
 
 
 def summarize_monitor(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    waiting = [int(item["waiting"]) for item in samples if item.get("waiting") is not None]
-    running = [int(item["running"]) for item in samples if item.get("running") is not None]
+    waiting = [
+        int(item["waiting"]) for item in samples if item.get("waiting") is not None
+    ]
+    running = [
+        int(item["running"]) for item in samples if item.get("running") is not None
+    ]
     channels = [
         int(item["active_channels"])
         for item in samples
@@ -785,13 +845,24 @@ def summarize_monitor(samples: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "samples": len(samples),
-        "queue_depth": {"max": max(waiting, default=0), "mean": statistics.fmean(waiting) if waiting else 0.0},
-        "active_batch_proxy": {"max": max(running, default=0), "mean": statistics.fmean(running) if running else 0.0},
-        "active_channels": {"max": max(channels, default=0), "mean": statistics.fmean(channels) if channels else 0.0},
+        "queue_depth": {
+            "max": max(waiting, default=0),
+            "mean": statistics.fmean(waiting) if waiting else 0.0,
+        },
+        "active_batch_proxy": {
+            "max": max(running, default=0),
+            "mean": statistics.fmean(running) if running else 0.0,
+        },
+        "active_channels": {
+            "max": max(channels, default=0),
+            "mean": statistics.fmean(channels) if channels else 0.0,
+        },
     }
 
 
-def summarize_acceptance(stats: dict[str, Any], request_ids: set[str]) -> dict[str, Any]:
+def summarize_acceptance(
+    stats: dict[str, Any], request_ids: set[str]
+) -> dict[str, Any]:
     steps = [
         step
         for step in stats.get("recent_decode_steps", [])
@@ -870,15 +941,15 @@ def summarize_engine_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "decode_steps": stats.get("decode_steps"),
         "estimated_prefill_steps": (
             stats.get("engine_steps", 0) - stats.get("decode_steps", 0)
-            if stats.get("engine_steps") is not None and stats.get("decode_steps") is not None
+            if stats.get("engine_steps") is not None
+            and stats.get("decode_steps") is not None
             else None
         ),
         "target_forward_count_estimate": stats.get("engine_steps"),
         "speculative_stage_seconds": stage_seconds,
         "qwen35_verification": stats.get("qwen35_verification", {}),
-        "target_decision_diagnostics": stats.get(
-            "target_decision_diagnostics", []
-        ),
+        "target_decision_diagnostics": stats.get("target_decision_diagnostics", []),
+        "memory_trace": stats.get("memory_trace", []),
         "dflash2_profile": stats.get("dflash2_profile", {}),
         "requests": stats.get("requests", {}),
         "online_requests": stats.get("online_requests", {}),
@@ -904,11 +975,22 @@ def validate_run_summary(summary: dict[str, Any]) -> list[str]:
         if key not in summary:
             errors.append(f"missing key: {key}")
     timing = summary.get("timing", {})
-    for key in ("request_throughput_rps", "output_token_throughput_tps", "ttft_s", "tpot_s", "e2e_latency_s"):
+    for key in (
+        "request_throughput_rps",
+        "output_token_throughput_tps",
+        "ttft_s",
+        "tpot_s",
+        "e2e_latency_s",
+    ):
         if key not in timing:
             errors.append(f"missing timing key: {key}")
     acceptance = summary.get("acceptance", {})
-    for key in ("proposed_tokens", "accepted_tokens", "per_decode_step", "per_batch_size_bucket"):
+    for key in (
+        "proposed_tokens",
+        "accepted_tokens",
+        "per_decode_step",
+        "per_batch_size_bucket",
+    ):
         if key not in acceptance:
             errors.append(f"missing acceptance key: {key}")
     return errors
@@ -938,12 +1020,16 @@ def compare_token_outputs(
                 return dict(record)
         return None
 
-    sampled = list(target)[:sample_limit]
+    request_ids = list(dict.fromkeys((*target, *candidate)))
     mismatches = []
-    for request_id in sampled:
+    mismatch_count = 0
+    for request_id in request_ids:
         target_tokens = target.get(request_id, [])
         candidate_tokens = candidate.get(request_id, [])
         if target_tokens != candidate_tokens:
+            mismatch_count += 1
+            if len(mismatches) >= sample_limit:
+                continue
             mismatch_at = None
             for index, (left, right) in enumerate(zip(target_tokens, candidate_tokens)):
                 if left != right:
@@ -997,8 +1083,10 @@ def compare_token_outputs(
                     )
             mismatches.append(mismatch)
     return {
-        "sampled_requests": len(sampled),
-        "exact_token_match": not mismatches,
+        "sampled_requests": len(request_ids),
+        "compared_requests": len(request_ids),
+        "mismatch_count": mismatch_count,
+        "exact_token_match": mismatch_count == 0,
         "mismatches": mismatches,
     }
 
@@ -1027,9 +1115,7 @@ def runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "cuda": torch.version.cuda,
                 "cuda_available": torch.cuda.is_available(),
                 "gpu": (
-                    torch.cuda.get_device_name(0)
-                    if torch.cuda.is_available()
-                    else None
+                    torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
                 ),
             }
         )
@@ -1074,9 +1160,15 @@ def run_variant(
         max_new_tokens=max_new,
         concurrency=concurrency,
     )
-    raw_requests_path = log_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_requests.jsonl"
-    monitor_path = log_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_monitor.jsonl"
-    summary_path = run_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_summary.json"
+    raw_requests_path = (
+        log_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_requests.jsonl"
+    )
+    monitor_path = (
+        log_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_monitor.jsonl"
+    )
+    summary_path = (
+        run_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_summary.json"
+    )
     engine = None
     online = None
     load_started = time.perf_counter()
@@ -1084,7 +1176,9 @@ def run_variant(
     try:
         engine = LLMEngine(config)
         load_elapsed = time.perf_counter() - load_started
-        online = OnlineEngine(engine, max_terminal_history=max(args.max_metrics_history, 256))
+        online = OnlineEngine(
+            engine, max_terminal_history=max(args.max_metrics_history, 256)
+        )
         online.start()
         if args.warmup_requests > 0:
             warmup = workload[: min(args.warmup_requests, len(workload))]
@@ -1094,15 +1188,14 @@ def run_variant(
                 min(concurrency, len(warmup)),
                 args.timeout,
                 args.sample_interval,
-                log_dir / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_warmup.jsonl",
+                log_dir
+                / f"{variant}_{workload_name}_c{concurrency}_r{repeat}_warmup.jsonl",
                 args.ignore_eos,
             )
             reset_runtime_stats(engine)
         measured_started = time.perf_counter()
         soak_time_limit_s = (
-            args.soak_minutes * 60.0
-            if args.soak and args.soak_minutes > 0
-            else None
+            args.soak_minutes * 60.0 if args.soak and args.soak_minutes > 0 else None
         )
         timelines, monitor_samples, failures = run_closed_loop(
             online,
@@ -1134,8 +1227,13 @@ def run_variant(
                 "num_speculative_tokens": args.num_speculative_tokens,
                 "temperature": 0.0,
                 "ignore_eos": args.ignore_eos,
-                "cached_batch_pad_to_size": config["max_num_sequences"],
-                "cached_attention_pad_to_length": config["max_model_length"],
+                "cached_batch_pad_to_size": config.get(
+                    "qwen35_cached_batch_pad_to_size"
+                ),
+                "cached_attention_pad_to_length": config.get(
+                    "qwen35_cached_attention_pad_to_length"
+                ),
+                "memory_trace": args.memory_trace,
                 "soak": args.soak,
                 "soak_requests": args.soak_requests if args.soak else None,
                 "soak_time_limit_s": soak_time_limit_s,
@@ -1240,8 +1338,12 @@ def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
                     "repeat": summary.get("repeat"),
                     "requests": timing.get("requests"),
                     "request_throughput_rps": timing.get("request_throughput_rps"),
-                    "output_token_throughput_tps": timing.get("output_token_throughput_tps"),
-                    "total_token_throughput_tps": timing.get("total_token_throughput_tps"),
+                    "output_token_throughput_tps": timing.get(
+                        "output_token_throughput_tps"
+                    ),
+                    "total_token_throughput_tps": timing.get(
+                        "total_token_throughput_tps"
+                    ),
                     "ttft_p50": timing.get("ttft_s", {}).get("p50"),
                     "ttft_p99": timing.get("ttft_s", {}).get("p99"),
                     "tpot_p50": timing.get("tpot_s", {}).get("p50"),
@@ -1283,16 +1385,32 @@ def aggregate_matrix(summaries: list[dict[str, Any]]) -> dict[str, Any]:
                     [row["timing"]["output_token_throughput_tps"] for row in rows]
                 ),
                 "ttft_p50_s": summarize_repeats(
-                    [row["timing"]["ttft_s"]["p50"] for row in rows if row["timing"]["ttft_s"]["p50"] is not None]
+                    [
+                        row["timing"]["ttft_s"]["p50"]
+                        for row in rows
+                        if row["timing"]["ttft_s"]["p50"] is not None
+                    ]
                 ),
                 "ttft_p99_s": summarize_repeats(
-                    [row["timing"]["ttft_s"]["p99"] for row in rows if row["timing"]["ttft_s"]["p99"] is not None]
+                    [
+                        row["timing"]["ttft_s"]["p99"]
+                        for row in rows
+                        if row["timing"]["ttft_s"]["p99"] is not None
+                    ]
                 ),
                 "tpot_p50_s": summarize_repeats(
-                    [row["timing"]["tpot_s"]["p50"] for row in rows if row["timing"]["tpot_s"]["p50"] is not None]
+                    [
+                        row["timing"]["tpot_s"]["p50"]
+                        for row in rows
+                        if row["timing"]["tpot_s"]["p50"] is not None
+                    ]
                 ),
                 "tpot_p99_s": summarize_repeats(
-                    [row["timing"]["tpot_s"]["p99"] for row in rows if row["timing"]["tpot_s"]["p99"] is not None]
+                    [
+                        row["timing"]["tpot_s"]["p99"]
+                        for row in rows
+                        if row["timing"]["tpot_s"]["p99"] is not None
+                    ]
                 ),
                 "acceptance_rate": summarize_repeats(
                     [row["acceptance"]["acceptance_rate"] for row in rows]
@@ -1356,7 +1474,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for the real Qwen3.8 concurrency benchmark")
     tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-    text_config = normalize_qwen35_text_config(load_qwen35_config_dict(args.target_model))
+    text_config = normalize_qwen35_text_config(
+        load_qwen35_config_dict(args.target_model)
+    )
     eos = tokenizer.eos_token_id
     if eos is None:
         eos = normalize_eos(text_config.eos_token_id)
@@ -1417,8 +1537,12 @@ def main() -> None:
                         with Path(raw_path).open(encoding="utf-8") as handle:
                             for line in handle:
                                 record = json.loads(line)
-                                outputs[record["request_id"]] = record.get("token_ids", [])
-                        token_samples[(variant, workload_name, concurrency, repeat)] = outputs
+                                outputs[record["request_id"]] = record.get(
+                                    "token_ids", []
+                                )
+                        token_samples[(variant, workload_name, concurrency, repeat)] = (
+                            outputs
+                        )
                 target_key = ("target_only", workload_name, concurrency, repeat)
                 dflash_key = ("dflash2", workload_name, concurrency, repeat)
                 if target_key in token_samples and dflash_key in token_samples:

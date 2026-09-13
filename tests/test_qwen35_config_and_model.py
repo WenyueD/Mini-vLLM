@@ -9,7 +9,8 @@ from myvllm.models.qwen3_8 import (
     Qwen35RMSNorm,
     Qwen35RMSNormGated,
 )
-from myvllm.engine.hybrid_cache import HybridCacheManager
+from myvllm.engine.hybrid_cache import FullAttentionLayerState, HybridCacheManager
+from myvllm.engine.memory import MemoryTrace
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
@@ -219,6 +220,24 @@ def assert_cache_state_equal(left, right):
         )
 
 
+def test_full_attention_layer_state_appends_inside_existing_capacity():
+    key = torch.tensor([[[[1.0]], [[2.0]]]])
+    value = key + 10
+    state = FullAttentionLayerState.from_tensors(key, value, capacity=4)
+    key_ptr = state.key.untyped_storage().data_ptr()
+    value_ptr = state.value.untyped_storage().data_ptr()
+
+    state.append(torch.tensor([[[[3.0]]]]), torch.tensor([[[[13.0]]]]))
+    state.append(torch.tensor([[[[4.0]]]]), torch.tensor([[[[14.0]]]]))
+
+    current_key, current_value = state.tensors()
+    assert state.logical_length == 4
+    assert state.key.untyped_storage().data_ptr() == key_ptr
+    assert state.value.untyped_storage().data_ptr() == value_ptr
+    assert current_key.reshape(-1).tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert current_value.reshape(-1).tolist() == [11.0, 12.0, 13.0, 14.0]
+
+
 def test_qwen35_cached_target_decode_matches_no_cache_full_recompute():
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
@@ -247,7 +266,14 @@ def test_qwen35_cache_transaction_rollback_and_partial_commit_replay_equivalence
 
     tx = cache.begin_transaction(["req0"], reserve_tokens=7)
     model.forward_with_cache(proposals, cache, "req0", transaction=tx)
-    cache.commit(tx, {"req0": 3})
+    cache.restore_original(tx)
+    model.forward_with_cache(
+        proposals[:3],
+        cache,
+        "req0",
+        return_logits=False,
+    )
+    cache.finalize_replayed_commit(tx, {"req0": 3})
 
     replay_cache = HybridCacheManager()
     model.forward_with_cache(torch.tensor([1, 2, 3, 4, 5, 6]), replay_cache, "req0")
@@ -312,6 +338,56 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
     assert batch_sizes == [4, 4, 4]
     for request_id, serial_output, batch_output in zip(
         prefixes, serial_outputs, batch_outputs
+    ):
+        assert torch.allclose(
+            batch_output.logits,
+            serial_output.logits,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert_cache_state_equal(
+            batch_cache.get_request_state(request_id),
+            serial_cache.get_request_state(request_id),
+        )
+
+
+def test_qwen35_cached_batch_chunks_above_fixed_padding_size():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    serial_cache = HybridCacheManager()
+    batch_cache = HybridCacheManager()
+    request_ids = [f"req{index}" for index in range(5)]
+    prefixes = [[index + 1, index + 2] for index in range(5)]
+    queries = [index + 10 for index in range(5)]
+    for request_id, prefix in zip(request_ids, prefixes):
+        tokens = torch.tensor(prefix)
+        model.forward_with_cache(tokens, serial_cache, request_id)
+        model.forward_with_cache(tokens, batch_cache, request_id)
+    serial_outputs = [
+        model.forward_with_cache(torch.tensor([token]), serial_cache, request_id)
+        for request_id, token in zip(request_ids, queries)
+    ]
+
+    batch_sizes = []
+    original_batch_step = model.model.forward_cached_batch_step
+
+    def tracked_batch_step(*args, **kwargs):
+        batch_sizes.append(len(args[1]))
+        return original_batch_step(*args, **kwargs)
+
+    model.model.forward_cached_batch_step = tracked_batch_step
+    batch_outputs = model.forward_with_cache_batch(
+        torch.tensor(queries).view(5, 1),
+        [1] * 5,
+        batch_cache,
+        request_ids,
+        attention_pad_to_length=16,
+        batch_pad_to_size=4,
+    )
+
+    assert batch_sizes == [4, 4]
+    for request_id, serial_output, batch_output in zip(
+        request_ids, serial_outputs, batch_outputs
     ):
         assert torch.allclose(
             batch_output.logits,
@@ -466,6 +542,81 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
     seq1.rollback(tx1)
 
 
+def test_qwen35_verified_commit_replays_accepted_prefixes_as_one_batch():
+    class FakeReplayModel:
+        def __init__(self):
+            self.param = torch.empty(0)
+            self.calls = []
+
+        def parameters(self):
+            return iter((self.param,))
+
+        def forward_with_cache_batch(
+            self,
+            input_ids,
+            query_lengths,
+            cache_manager,
+            request_ids,
+            **kwargs,
+        ):
+            self.calls.append(
+                {
+                    "input_ids": input_ids.cpu().tolist(),
+                    "query_lengths": tuple(query_lengths),
+                    "request_ids": tuple(request_ids),
+                    "return_logits": kwargs.get("return_logits"),
+                    "capture_hidden_taps": kwargs.get("capture_hidden_taps"),
+                }
+            )
+            for request_id, query_length in zip(request_ids, query_lengths):
+                cache_manager.ensure_request(request_id).logical_length += query_length
+
+    cache = HybridCacheManager()
+    cache.ensure_request("req0").logical_length = 10
+    cache.ensure_request("req1").logical_length = 20
+    tx0 = cache.begin_transaction(["req0"], {"req0": 3})
+    tx1 = cache.begin_transaction(["req1"], {"req1": 2})
+
+    model = FakeReplayModel()
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.hybrid_cache_manager = cache
+    runner.config = {}
+    runner._pending_verified_cache_transactions = {
+        101: (
+            tx0,
+            "req0",
+            SimpleNamespace(hidden_taps={}),
+            (31, 32, 33),
+            10,
+            (11, 12, 13),
+        ),
+        102: (
+            tx1,
+            "req1",
+            SimpleNamespace(hidden_taps={}),
+            (41, 42),
+            20,
+            (21, 22),
+        ),
+    }
+
+    runner.commit_verified_cache({101: 2, 102: 1})
+
+    assert model.calls == [
+        {
+            "input_ids": [[11, 12], [21, 0]],
+            "query_lengths": (2, 1),
+            "request_ids": ("req0", "req1"),
+            "return_logits": False,
+            "capture_hidden_taps": False,
+        }
+    ]
+    assert cache.get_request_state("req0").logical_length == 12
+    assert cache.get_request_state("req1").logical_length == 21
+    assert runner._pending_verified_cache_transactions == {}
+
+
 def test_dflash2_verified_commit_projects_only_new_accepted_context():
     class FakeDraftModel:
         config = SimpleNamespace(sliding_window=4)
@@ -522,9 +673,9 @@ def test_dflash2_verified_commit_projects_only_new_accepted_context():
     runner.commit_verified_cache({17: 2})
 
     assert runner.dflash2_draft_model.projected_positions[0].tolist() == [[7, 8]]
-    assert runner.dflash2_draft_cache.context_positions_by_request[
-        "req"
-    ].tolist() == [[5, 6, 7, 8]]
+    assert runner.dflash2_draft_cache.context_positions_by_request["req"].tolist() == [
+        [5, 6, 7, 8]
+    ]
     assert runner.dflash2_draft_cache.context_kv_by_request["req"][0][0].shape[2] == 4
     assert runner._dflash2_contexts[17]["hidden_taps"][5].shape[1] == 4
     assert runner._dflash2_contexts[17]["anchor_token_id"] == 32
@@ -633,10 +784,63 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             [1, 1],
             ["req0", "req1"],
             False,
-            64,
-            8,
+            None,
+            None,
         )
     ]
+
+
+def test_qwen35_allocate_kv_cache_skips_unused_generic_pool(monkeypatch):
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {
+        "block_size": 4,
+        "max_model_length": 16,
+        "max_num_sequences": 2,
+        "gpu_memory_utilization": 0.9,
+        "target_cache_memory_fraction": 0.05,
+    }
+    runner.block_size = 4
+    runner.rank = 0
+    runner.world_size = 1
+    runner.default_dtype = torch.float16
+    runner.is_qwen35_target = True
+    runner.qwen35_text_config = normalize_qwen35_text_config(tiny_config(num_layers=4))
+    runner.model = SimpleNamespace(
+        modules=lambda: iter(()), parameters=lambda: iter(())
+    )
+    runner.hybrid_cache_manager = HybridCacheManager()
+    runner.dflash2_draft_model = None
+    runner.dflash2_draft_cache = None
+    runner._memory_trace = MemoryTrace(enabled=True)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (8 * 1024**3, 10 * 1024**3))
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_stats",
+        lambda: {
+            "allocated_bytes.all.peak": 2 * 1024**3,
+            "allocated_bytes.all.current": 1 * 1024**3,
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *_args, **_kwargs: 0)
+
+    def fail_zeros(*_args, **_kwargs):
+        raise AssertionError("Qwen3.8 must not allocate the unused generic KV pool")
+
+    monkeypatch.setattr(torch, "zeros", fail_zeros)
+
+    runner.allocate_kv_cache()
+
+    capacity = runner.config["qwen35_dynamic_cache_capacity"]
+    assert runner.config["qwen35_uses_generic_kv_cache"] is False
+    assert capacity["generic_kv_cache_layers"] == 0
+    assert capacity["generic_kv_pool_bytes"] == 0
+    assert runner.config["max_cached_blocks"] == capacity["configured_blocks"]
 
 
 def test_runner_dflash2_b2_proposals_rollback_as_one_batch_on_failure():
@@ -757,7 +961,7 @@ def test_runner_target_decision_diagnostics_capture_top2_and_cap_history():
         "input_token_id": 7,
         "query_offset": 1,
         "argmax_token_id": 1,
-        "exact_tie_break_policy": "bf16_max_then_fp32_lm_head_tied_tokens",
+        "exact_tie_break_policy": "highest_token_id",
         "max_tie_count": 1,
         "max_tie_min_token_id": 1,
         "max_tie_max_token_id": 1,
@@ -811,6 +1015,31 @@ def test_runner_qwen35_resolves_bf16_greedy_ties_with_fp32_lm_head():
     assert token_ids.tolist() == [1]
 
 
+def test_runner_qwen35_default_tie_policy_matches_sampling_documentation():
+    config = tiny_config(num_layers=1)
+    config["text_config"]["vocab_size"] = 4
+    model = Qwen35ForCausalLM.from_config_dict(config)
+    model.lm_head.weight.data.zero_()
+    model.lm_head.weight.data[1, 0] = 1.0
+    model.lm_head.weight.data[2, 0] = 0.5
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.config = {}
+    runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
+
+    logits = torch.tensor([[0.0, 2.0, 2.0, 1.0]])
+    hidden_states = torch.zeros(1, model.config.hidden_size)
+    hidden_states[0, 0] = 1.0
+
+    token_ids = runner._sample_qwen35_logits(
+        logits,
+        torch.zeros(1),
+        hidden_states=hidden_states,
+    )
+
+    assert token_ids.tolist() == [2]
+
+
 def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets():
     class FakeDraft(torch.nn.Module):
         def __init__(self):
@@ -823,9 +1052,7 @@ def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets(
             self.calls.append(kwargs)
             return (
                 ProposalBatch(
-                    token_ids=torch.tensor(
-                        [[20, 21, 22, 23], [30, 31, 32, 33]]
-                    ),
+                    token_ids=torch.tensor([[20, 21, 22, 23], [30, 31, 32, 33]]),
                     valid_lengths=torch.tensor([4, 3]),
                 ),
                 {},
