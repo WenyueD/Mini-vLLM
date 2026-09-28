@@ -580,3 +580,114 @@ target-only 的约 0.789 倍，不能宣称整体加速目标已完成。同机 
 结果与原始输出已保存在服务器和本地同名 results/logs 目录；GPU 已确认
 **0 MiB, 0%**。本轮不启动 C8/TP2。后续应优先研究逐 token verifier 如何减少
 无效后缀计算或实现分块验证，同时继续检查 BF16 计算形状变化对精确输出的影响。
+
+## 2026-09-28 验证器提前停止与性能倒挂归因
+
+本轮首先把 RoPE 修复和缓存恢复整理成可回滚 checkpoint `9f63861`；
+随后在 `e8bf0c8` 实现每个请求在首次 greedy mismatch 后停止后缀验证。
+拒绝位置的目标 token 仍被计算，全接受时仍计算 bonus token；hidden taps、
+GDN 更新记录和缓存事务仅保留实际执行的前缀。固定 batch/context 计算形状
+继续沿用，避免 BF16 greedy 漂移。远端完整回归 **227 passed, 2 skipped**；
+本地 `git diff --check` 通过。服务器 GPU 为 A800-SXM4-80GB。
+
+各结果目录均保存 manifest（目标/草稿模型 snapshot、GPU、依赖、配置、
+源码文件哈希和工作树 diff 哈希）、原始 request JSONL、summary 及日志；
+远端原件保留在 `/root/autodl-tmp/Mini-vLLM`，本地同名 `results/`、`logs/`
+目录保存副本。远端 Git HEAD 仍为 `70239ac` 且工作树含阶段改动，
+因此性能实验必须以 manifest 的源码哈希和 diff 为准，不能只看远端 HEAD。
+
+| K7 单次观测 | C2 target-only | C2 DFlash 关闭提前停止 | C2 DFlash 开启 | C4 target-only | C4 DFlash 关闭 | C4 DFlash 开启 |
+|---|---:|---:|---:|---:|---:|---:|
+| output TPS | 5.4767 | 4.1601 | 4.7136 | 5.8365 | 4.7430 | 5.0616 |
+| measured elapsed s | 93.50 | 123.08 | 108.63 | 175.46 | 215.90 | 202.31 |
+| TTFT p50 s | 17.99 | 9.90 | 9.88 | 37.42 | 19.05 | 19.41 |
+| TPOT p50 s | 0.0837 | 0.3203 | 0.2593 | 0.0907 | 0.4789 | 0.4533 |
+| target verifier model steps | — | 584 | 376 | — | 670 | 502 |
+| verifier request-token steps | — | 932 | 504 | — | 2138 | 1008 |
+| verifier seconds | — | 47.67 | 31.91 | — | 60.72 | 45.82 |
+| proposal + commit seconds | — | 2.82 | 2.37 | — | 4.53 | 3.33 |
+| peak allocated GiB | 50.6043 | 54.5984 | 54.5980 | 50.9314 | 55.4921 | 55.6099 |
+
+C2 的 8 条请求、512 个输出 token，C4 的 16 条请求、1024 个输出 token，
+均从原始 JSONL 独立核对为 target-only、DFlash 开/关逐 token 完全一致。
+C2 接受数保持 382/810，C4 保持 730/1860；拒绝位置直方图也不变。
+提前停止避免了 C2 的 208/584、C4 的 168/670 个目标模型验证步，
+单次 DFlash 吞吐分别提高约 13.3%、6.7%，但仍低于成对 target-only。
+这些只是单轮观察值，尚未证明稳定收益。
+
+### 为什么 DFlash 端到端吞吐仍慢
+
+代码中 `forward_with_cache_batch()` 的验证循环仍按 token 位置调用
+`forward_cached_batch_step()`，即 K7 提案没有让 target 在一次模型前向中
+并行完成 7 个位置。C4 target-only 的 252 次 decode step，每次有 4 个
+有效请求，恰好完成 1008 个非首 token；提前停止后的 DFlash verifier
+也必须验证这 1008 个请求 token，却需要 502 次目标模型 step，平均
+每步约 2.01 个有效请求。C2 对应为 target-only 252 次、DFlash 376 次，
+后者平均每步约 1.34 个有效请求。为保持数值形状，验证器每步仍补足
+到固定 micro-batch 4，因此后期的空行也消耗模型计算。C4 验证阶段
+45.82 秒，约占 verify/proposal/commit 三项之和的 93.2%。
+
+按本轮计时，C4 DFlash 开启提前停止后仍比 target-only 多 26.85 秒。
+若其他阶段和调度完全不变，要追平需要把 verifier 从 45.82 秒降至
+约 18.97 秒（再降约 59%）；C2 对应约 31.91 降至 16.78 秒
+（再降约 47%）。这是基于单次端到端差额的近似 break-even 估算，
+不能当成独立的模块性能测量。后续优化应先降低逐位置 target 前向的
+次数或提高有效行利用率，并重新验证固定形状下的逐 token 一致性。
+
+### 为什么 DFlash 的 TTFT 中位数反而较低
+
+C4 原始 JSONL 中首批 4 条同时提交请求的 TTFT：target-only 均约
+37.42 秒，DFlash 均约 37.19 秒。两者的首批 prefill/首 token 时间接近。
+压测为闭环并发：请求完成后才补交下一条。target-only 的后续请求
+大多 4 条同时完成、再 4 条同时入场；DFlash 请求完成时间更分散，
+后续常以 1–2 条入场，TTFT 多为约 10–20 秒。因此 DFlash 的较低
+总体 TTFT p50 主要反映两组不同的入场批量，而非首批计算更快。
+该归因来自逐请求提交/首 token 时间与调度方式；若要隔离模型本身的
+首 token 成本，还需相同入场时间的开放环路或固定单批测试。
+
+下一步才扩到 RoPE 修复后的 C8，并对 C4/C8 做至少三轮成对统计；
+继续记录接受长度、TTFT、TPOT、显存与波动。TP2 尚未实现或验证。
+
+## 2026-09-28 C8 数值边界回归与 LM head 形状修复
+
+首次开启提前停止的 C8 成对运行
+`qwen38_k7_c8_earlystop_on_20260928` 完成了两组各 32 条请求，
+但 fairness 为 false：`short-000022` 在输出索引 43 处 target-only
+为 `694`、DFlash 为 `321`。这次运行不纳入有效性能结论。
+关闭提前停止并开启决策诊断的 C8 对照
+`qwen38_k7_c8_earlystop_off_debug_20260928` 与原 target-only 的
+32/32 条、2048/2048 个 token 全部一致；开启诊断的运行
+`qwen38_k7_c8_earlystop_on_debug_20260928` 重现相同分歧。
+
+两侧在分歧位置之前的输出和接受过程相同；位置 43 是一次全接受后的
+bonus token。关闭提前停止时，该位置 `321`、`694` 的 BF16 logit
+均为 25.25，greedy 按较大 token id 选 `694`，诊断记录的活跃请求数为 7。
+开启时活跃数仅 3，`321` 的 logit 升至 25.375，`694` 仍为 25.25。
+审计发现目标模型主体仍固定填充到 micro-batch 4，但提前停止后
+LM head 的矩阵乘法按剩余活跃行数执行，改变了 BF16 reduction 形状。
+
+修复方式是在提前停止路径中，LM head 仍按当前位置原计划的请求行数
+计算，再只保留实际活跃请求的 logits；目标模型主体、target-only 路径、
+hidden taps 和缓存提交均未改变。异长 batch 的 tiny-model 测试新增
+LM head 行数一致断言，聚焦测试 **11 passed**，远端全量测试
+**227 passed, 2 skipped**。修复前远端源码与测试原件另存于开启诊断的
+结果目录，所有失败日志和 JSONL 继续保留。
+
+修复后 C8 成对运行目录为
+`qwen38_k7_c8_lmhead_shape_fix_20260928`，原始 JSONL 独立复核
+**32/32 请求、2048/2048 token 完全一致**，benchmark fairness 亦为 true。
+单次观测如下：
+
+| C8 K7 指标 | target-only | DFlash2 提前停止 + LM head 修复 |
+|---|---:|---:|
+| output TPS | 5.8257 | 5.0902 |
+| elapsed s | 351.57 | 402.35 |
+| TTFT p50 s | 76.12 | 19.87 |
+| TPOT p50 s | 0.1776 | 0.8940 |
+| peak allocated GiB | 51.5413 | 57.0286 |
+
+DFlash 接受 1486/3455 个候选；验证实际执行 934 个目标模型步，
+避免 230 个后缀步；验证 88.2061 秒，proposal 1.8193 秒，
+commit 2.7421 秒。DFlash 吞吐为 target-only 的约 0.874 倍，
+仍无端到端加速。这一轮和前述 C2/C4 的源码版本不同，
+且只有单次运行；跨 batch size 的稳定结论须在同一修复版本上配对重复。

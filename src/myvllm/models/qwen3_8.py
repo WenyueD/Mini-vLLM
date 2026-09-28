@@ -875,12 +875,26 @@ class Qwen35ForCausalLM(nn.Module):
                 attention_pad_to_length=attention_pad_to_length,
                 state_update_logs=update_logs,
             )
+            # Early rejection removes rows from the target model call. Keep the
+            # LM-head row count equal to the unshortened query at this position:
+            # BF16 GEMM rounding can otherwise change a greedy tie decision.
+            planned_rows = sum(
+                token_index < query_length for query_length in query_lengths
+            )
+            logits_hidden = (
+                hidden[:planned_rows]
+                if continue_after_step is not None
+                else hidden[: len(active_rows)]
+            )
+            step_logits = (
+                self.compute_logits(logits_hidden)[: len(active_rows)]
+                if return_logits else None
+            )
             hidden = hidden[: len(active_rows)]
             hidden_taps = {
                 layer_id: value[: len(active_rows)]
                 for layer_id, value in hidden_taps.items()
             }
-            step_logits = self.compute_logits(hidden) if return_logits else None
             for active_row, request_row in enumerate(active_rows):
                 hidden_by_request[request_row].append(
                     hidden[active_row : active_row + 1]

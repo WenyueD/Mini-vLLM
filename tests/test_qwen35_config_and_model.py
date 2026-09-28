@@ -702,6 +702,7 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
 
     caches = []
     samples = []
+    logit_row_counts = []
     for stop_early in (False, True):
         cache = HybridCacheManager()
         for request_id, prefix in (("a", [1, 2, 3]), ("b", [5, 6, 7])):
@@ -732,7 +733,17 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
             Proposal(seq.seq_id, draft)
             for seq, draft in zip(sequences, drafts)
         ]
-        results = runner.verify(SpecDecodeBatch(sequences, proposals))
+        rows_this_run = []
+        original_compute_logits = model.compute_logits
+        def record_logits(hidden):
+            rows_this_run.append(hidden.shape[0])
+            return original_compute_logits(hidden)
+        model.compute_logits = record_logits
+        try:
+            results = runner.verify(SpecDecodeBatch(sequences, proposals))
+        finally:
+            model.compute_logits = original_compute_logits
+        logit_row_counts.append(rows_this_run)
         assert [result.metadata["verified_tokens"] for result in results] == (
             [1, 3] if stop_early else [8, 3]
         )
@@ -748,6 +759,7 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
     for baseline, early in zip(*samples):
         assert baseline.emitted_token_ids == early.emitted_token_ids
         assert baseline.per_position_acceptance == early.per_position_acceptance
+    assert logit_row_counts[1] == logit_row_counts[0][:len(logit_row_counts[1])]
     for request_id in ("a", "b"):
         assert_cache_state_equal(
             caches[0].get_request_state(request_id),
