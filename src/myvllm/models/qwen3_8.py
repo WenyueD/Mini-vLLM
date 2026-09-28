@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 import torch
 import torch.nn as nn
@@ -771,6 +771,9 @@ class Qwen35ForCausalLM(nn.Module):
         attention_pad_to_length: int | None = None,
         batch_pad_to_size: int | None = None,
         return_logits: bool = True,
+        continue_after_step: Callable[
+            [list[str], torch.Tensor, torch.Tensor, int], list[bool]
+        ] | None = None,
     ) -> list[Qwen35ForwardOutput]:
         """Run ragged request queries with a tensor batch at each token position."""
         reject_qwen35_multimodal_inputs()
@@ -818,6 +821,7 @@ class Qwen35ForCausalLM(nn.Module):
                         batch_pad_to_size=batch_pad_to_size,
                         return_logits=return_logits,
                         record_linear_updates=record_linear_updates,
+                        continue_after_step=continue_after_step,
                     )
                 )
             return outputs
@@ -829,12 +833,15 @@ class Qwen35ForCausalLM(nn.Module):
         taps_by_request: list[dict[int, list[torch.Tensor]]] = [
             {layer_id: [] for layer_id in taps} for _ in request_ids
         ]
+        continuing = [True] * batch_size
         for token_index in range(max(query_lengths)):
             active_rows = [
                 row
                 for row, query_length in enumerate(query_lengths)
-                if token_index < query_length
+                if continuing[row] and token_index < query_length
             ]
+            if not active_rows:
+                break
             active_indices = torch.tensor(
                 active_rows,
                 dtype=torch.long,
@@ -893,6 +900,19 @@ class Qwen35ForCausalLM(nn.Module):
                         request_ids[request_row],
                         tokens_executed=token_index + 1,
                     )
+            if continue_after_step is not None:
+                if step_logits is None:
+                    raise ValueError("early verification requires logits")
+                keep = continue_after_step(
+                    [request_ids[row] for row in active_rows],
+                    step_logits,
+                    hidden,
+                    token_index,
+                )
+                if len(keep) != len(active_rows):
+                    raise ValueError("early verification returned the wrong row count")
+                for row, should_continue in zip(active_rows, keep):
+                    continuing[row] = bool(should_continue)
 
         outputs = []
         for row, request_id in enumerate(request_ids):

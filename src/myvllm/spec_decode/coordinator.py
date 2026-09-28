@@ -15,6 +15,7 @@ from myvllm.spec_decode.types import (
     SpecDecodeBatch,
     SpecDecodeStepResult,
     VerificationResult,
+    is_complete_greedy_verification,
 )
 
 VerifyFn = Callable[[SpecDecodeBatch], list[VerificationResult]]
@@ -149,7 +150,7 @@ class SpecDecodeCoordinator:
         for proposal, result in zip(batch.proposals, results):
             if result.sequence_id != proposal.sequence_id:
                 raise ValueError("verifier result sequence order/id mismatch")
-            if len(result.target_token_ids) != len(proposal.token_ids) + 1:
+            if not is_complete_greedy_verification(proposal, result):
                 raise ValueError("verifier returned the wrong query length")
 
     def _commit_batch(

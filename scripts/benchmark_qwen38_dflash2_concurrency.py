@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
@@ -139,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         "--replay-state-updates", action=argparse.BooleanOptionalAction,
         default=True,
         help="Restore accepted prefixes from compact state updates instead of model replay.",
+    )
+    parser.add_argument(
+        "--stop-verification-at-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stop verifying each request after its first draft mismatch.",
     )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
@@ -346,6 +353,9 @@ def build_config(
             ),
             "qwen35_cached_attention_pad_to_length": max_model_length,
             "qwen35_replay_state_updates": getattr(args, "replay_state_updates", True),
+            "qwen35_stop_verification_at_mismatch": getattr(
+                args, "stop_verification_at_mismatch", False
+            ),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
@@ -1097,9 +1107,38 @@ def compare_token_outputs(
     }
 
 
-def runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
+def code_provenance(run_dir: Path) -> dict[str, Any]:
+    diff = subprocess.run(
+        ["git", "-c", "core.whitespace=cr-at-eol", "diff",
+         "--ignore-space-at-eol", "--binary", "--no-ext-diff"],
+        cwd=ROOT, check=True, capture_output=True,
+    ).stdout
+    diff_path = run_dir / "code_diff.patch"
+    diff_path.write_bytes(diff)
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1"], cwd=ROOT, text=True
+    ).splitlines()
+    sources = sorted((ROOT / "src").rglob("*.py")) + [Path(__file__)]
+    files = {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sources
+    }
+    source_tree = hashlib.sha256()
+    for name, digest in sorted(files.items()):
+        source_tree.update(f"{name}\0{digest}\n".encode())
+    return {
+        "git_status": status,
+        "code_diff_patch": os.fspath(diff_path),
+        "code_diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "source_tree_sha256": source_tree.hexdigest(),
+        "source_file_sha256": files,
+    }
+
+
+def runtime_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     manifest = {
         "git_commit": git_commit(),
+        **code_provenance(run_dir),
         "python": sys.version,
         "platform": platform.platform(),
         "target_model": args.target_model,
@@ -1240,6 +1279,10 @@ def run_variant(
                     "qwen35_cached_attention_pad_to_length"
                 ),
                 "memory_trace": args.memory_trace,
+                "replay_state_updates": getattr(args, "replay_state_updates", True),
+                "stop_verification_at_mismatch": getattr(
+                    args, "stop_verification_at_mismatch", False
+                ),
                 "soak": args.soak,
                 "soak_requests": args.soak_requests if args.soak else None,
                 "soak_time_limit_s": soak_time_limit_s,
@@ -1450,7 +1493,7 @@ def main() -> None:
     log_dir = Path(args.logs_dir) / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    manifest = runtime_manifest(args)
+    manifest = runtime_manifest(args, run_dir)
     write_json(run_dir / "manifest.json", manifest)
     if args.dry_run:
         write_json(

@@ -91,6 +91,11 @@ class ModelRunner:
             "tensor_batched_token_steps": 0,
             "total_token_steps": 0,
             "last_active_batch_sizes": (),
+            "executed_request_token_steps": 0,
+            "avoided_request_token_steps": 0,
+            "executed_model_steps": 0,
+            "avoided_model_steps": 0,
+            "first_rejection_position_histogram": {},
         }
         self._target_decision_diagnostics = []
         self.dflash2_draft_model = None
@@ -1540,6 +1545,39 @@ class ModelRunner:
                     dtype=torch.long,
                     device=device,
                 )
+            stop_at_mismatch = bool(
+                self.config.get("qwen35_stop_verification_at_mismatch", False)
+            )
+            sampled_by_request = {
+                seq.request_id: [] for seq in batch.sequences
+            }
+            proposals_by_request = {
+                seq.request_id: proposal.token_ids
+                for seq, proposal in zip(batch.sequences, batch.proposals)
+            }
+
+            def continue_after_step(
+                active_request_ids, step_logits, step_hidden, token_index,
+            ):
+                temperatures = torch.zeros(
+                    step_logits.shape[0], dtype=torch.float32,
+                    device=step_logits.device,
+                )
+                selected = self._sample_qwen35_logits(
+                    step_logits.reshape(-1, step_logits.shape[-1]),
+                    temperatures,
+                    hidden_states=step_hidden.reshape(step_hidden.shape[0], -1),
+                ).detach().cpu().tolist()
+                keep = []
+                for request_id, token_id in zip(active_request_ids, selected):
+                    sampled_by_request[request_id].append(int(token_id))
+                    proposal = proposals_by_request[request_id]
+                    keep.append(
+                        token_index < len(proposal)
+                        and int(token_id) == proposal[token_index]
+                    )
+                return keep
+
             outputs = self.model.forward_with_cache_batch(
                 input_ids,
                 query_lengths,
@@ -1555,6 +1593,7 @@ class ModelRunner:
                     "qwen35_cached_attention_pad_to_length"
                 ),
                 batch_pad_to_size=self.config.get("qwen35_cached_batch_pad_to_size"),
+                **({"continue_after_step": continue_after_step} if stop_at_mismatch else {}),
             )
             if self.rank != 0:
                 raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")
@@ -1562,56 +1601,65 @@ class ModelRunner:
                 raise RuntimeError(
                     "batched cached target returned the wrong output count"
                 )
-            flat_logits = torch.cat(
-                [
-                    output.logits.reshape(-1, output.logits.shape[-1])
-                    for output in outputs
-                ],
-                dim=0,
-            )
-            flat_hidden_states = (
-                torch.cat(
+            if stop_at_mismatch:
+                flat_token_ids = [
+                    token_id
+                    for seq in batch.sequences
+                    for token_id in sampled_by_request[seq.request_id]
+                ]
+            else:
+                flat_logits = torch.cat(
                     [
-                        output.hidden_states.reshape(-1, output.hidden_states.shape[-1])
+                        output.logits.reshape(-1, output.logits.shape[-1])
                         for output in outputs
                     ],
                     dim=0,
                 )
-                if all(hasattr(output, "hidden_states") for output in outputs)
-                else None
-            )
-            temperatures = torch.zeros(
-                flat_logits.shape[0],
-                dtype=torch.float32,
-                device=flat_logits.device,
-            )
-            flat_token_ids_tensor = self._sample_qwen35_logits(
-                flat_logits,
-                temperatures,
-                hidden_states=flat_hidden_states,
-            )
-            flat_token_ids = flat_token_ids_tensor.detach().cpu().tolist()
+                flat_hidden_states = (
+                    torch.cat(
+                        [
+                            output.hidden_states.reshape(-1, output.hidden_states.shape[-1])
+                            for output in outputs
+                        ],
+                        dim=0,
+                    )
+                    if all(hasattr(output, "hidden_states") for output in outputs)
+                    else None
+                )
+                temperatures = torch.zeros(
+                    flat_logits.shape[0],
+                    dtype=torch.float32,
+                    device=flat_logits.device,
+                )
+                flat_token_ids_tensor = self._sample_qwen35_logits(
+                    flat_logits,
+                    temperatures,
+                    hidden_states=flat_hidden_states,
+                )
+                flat_token_ids = flat_token_ids_tensor.detach().cpu().tolist()
             results = []
             offset = 0
             for seq, query_tokens, output in zip(
                 batch.sequences, query_tokens_by_request, outputs
             ):
-                for query_offset, input_token_id in enumerate(query_tokens):
+                executed = output.logits.shape[1]
+                for query_offset, input_token_id in enumerate(query_tokens[:executed]):
                     self._record_target_decision(
                         seq,
                         output.logits[0, query_offset, :],
                         output_index=seq.num_completion_tokens + query_offset,
                         source="verify",
                         active_batch_size=sum(
-                            length > query_offset for length in query_lengths
+                            output_item.logits.shape[1] > query_offset
+                            for output_item in outputs
                         ),
                         input_token_id=input_token_id,
                         query_offset=query_offset,
                         selected_token_id=int(flat_token_ids[offset + query_offset]),
                     )
                 transaction = transactions[seq.request_id]
-                token_ids = tuple(flat_token_ids[offset : offset + len(query_tokens)])
-                offset += len(query_tokens)
+                token_ids = tuple(flat_token_ids[offset : offset + executed])
+                offset += executed
                 self._pending_verified_cache_transactions[seq.seq_id] = (
                     PendingQwen35Verification(
                         transaction=transaction,
@@ -1624,7 +1672,7 @@ class ModelRunner:
                         start_position=int(
                             transaction.original_states[seq.request_id].logical_length
                         ),
-                        query_tokens=tuple(query_tokens),
+                        query_tokens=tuple(query_tokens[:executed]),
                     )
                 )
                 results.append(
@@ -1634,18 +1682,24 @@ class ModelRunner:
                         metadata={
                             "hybrid_cache_transaction_id": transaction.transaction_id,
                             "hybrid_cache_request_id": seq.request_id,
-                            "verified_tokens": len(query_tokens),
+                            "verified_tokens": executed,
                             "hidden_tap_layers": tuple(sorted(output.hidden_taps)),
                             "tensor_batched": True,
                             "verification_batch_size": len(batch.sequences),
                         },
                     )
                 )
-            self._record_qwen35_verification_batch(query_lengths)
+            executed_lengths = [output.logits.shape[1] for output in outputs]
+            self._record_qwen35_verification_batch(
+                executed_lengths,
+                planned_lengths=query_lengths,
+                proposal_tokens=[proposal.token_ids for proposal in batch.proposals],
+                target_tokens=[result.target_token_ids for result in results],
+            )
             self._record_memory_stage(
                 "verify",
                 batch_size=len(batch.sequences),
-                verified_tokens=sum(query_lengths),
+                verified_tokens=sum(executed_lengths),
             )
             return results
         except Exception:
@@ -1658,7 +1712,14 @@ class ModelRunner:
             )
             raise
 
-    def _record_qwen35_verification_batch(self, query_lengths: list[int]) -> None:
+    def _record_qwen35_verification_batch(
+        self,
+        query_lengths: list[int],
+        *,
+        planned_lengths: list[int] | None = None,
+        proposal_tokens: list[tuple[int, ...]] | None = None,
+        target_tokens: list[tuple[int, ...]] | None = None,
+    ) -> None:
         stats = getattr(self, "_qwen35_verification_stats", None)
         if stats is None:
             stats = {
@@ -1667,12 +1728,28 @@ class ModelRunner:
                 "tensor_batched_token_steps": 0,
                 "total_token_steps": 0,
                 "last_active_batch_sizes": (),
+                "executed_request_token_steps": 0,
+                "avoided_request_token_steps": 0,
+                "executed_model_steps": 0,
+                "avoided_model_steps": 0,
+                "first_rejection_position_histogram": {},
             }
             self._qwen35_verification_stats = stats
+        planned_lengths = planned_lengths or query_lengths
         active_batch_sizes = tuple(
             sum(query_length > token_index for query_length in query_lengths)
             for token_index in range(max(query_lengths))
         )
+        micro_batch_size = int(
+            self.config.get("qwen35_cached_batch_pad_to_size")
+            or len(query_lengths)
+        )
+        def model_steps(lengths):
+            return sum(
+                max(lengths[start:start + micro_batch_size], default=0)
+                for start in range(0, len(lengths), micro_batch_size)
+            )
+
         stats["calls"] += 1
         stats["max_batch_size"] = max(
             stats["max_batch_size"],
@@ -1683,6 +1760,26 @@ class ModelRunner:
         )
         stats["total_token_steps"] += len(active_batch_sizes)
         stats["last_active_batch_sizes"] = active_batch_sizes
+        stats["executed_request_token_steps"] += sum(query_lengths)
+        stats["avoided_request_token_steps"] += (
+            sum(planned_lengths) - sum(query_lengths)
+        )
+        stats["executed_model_steps"] += model_steps(query_lengths)
+        stats["avoided_model_steps"] += (
+            model_steps(planned_lengths) - model_steps(query_lengths)
+        )
+        if proposal_tokens is not None and target_tokens is not None:
+            histogram = stats["first_rejection_position_histogram"]
+            for proposal, tokens in zip(proposal_tokens, target_tokens):
+                position = next(
+                    (
+                        index for index in range(min(len(proposal), len(tokens)))
+                        if tokens[index] != proposal[index]
+                    ),
+                    None,
+                )
+                key = "all_accepted" if position is None else str(position)
+                histogram[key] = histogram.get(key, 0) + 1
 
     def get_qwen35_verification_stats(self) -> dict:
         stats = getattr(self, "_qwen35_verification_stats", None)
@@ -1693,8 +1790,18 @@ class ModelRunner:
                 "tensor_batched_token_steps": 0,
                 "total_token_steps": 0,
                 "last_active_batch_sizes": (),
+                "executed_request_token_steps": 0,
+                "avoided_request_token_steps": 0,
+                "executed_model_steps": 0,
+                "avoided_model_steps": 0,
+                "first_rejection_position_histogram": {},
             }
-        return dict(stats)
+        return {
+            **stats,
+            "first_rejection_position_histogram": dict(
+                stats["first_rejection_position_histogram"]
+            ),
+        }
 
     def _coerce_pending_qwen35_verification(
         self, entry: Any

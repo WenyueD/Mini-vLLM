@@ -37,6 +37,22 @@ class VerificationResult:
     metadata: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
+def is_complete_greedy_verification(
+    proposal: Proposal, verification: VerificationResult,
+) -> bool:
+    """A short result must end at the first rejected draft position."""
+    tokens = verification.target_token_ids
+    draft = proposal.token_ids
+    if not 1 <= len(tokens) <= len(draft) + 1:
+        return False
+    if len(tokens) == len(draft) + 1:
+        return True
+    return (
+        tokens[:-1] == draft[:len(tokens) - 1]
+        and tokens[-1] != draft[len(tokens) - 1]
+    )
+
+
 @dataclass(frozen=True)
 class SampleResult:
     sequence_id: int

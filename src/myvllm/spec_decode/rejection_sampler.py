@@ -2,6 +2,7 @@ from myvllm.spec_decode.types import (
     Proposal,
     SampleResult,
     VerificationResult,
+    is_complete_greedy_verification,
 )
 
 
@@ -13,8 +14,8 @@ class RejectionSampler:
     ) -> SampleResult:
         if proposal.sequence_id != verification.sequence_id:
             raise ValueError("proposal/verification sequence mismatch")
-        if len(verification.target_token_ids) != len(proposal.token_ids) + 1:
-            raise ValueError("verification must contain K target tokens plus one bonus")
+        if not is_complete_greedy_verification(proposal, verification):
+            raise ValueError("verification must reach the first mismatch or bonus")
 
         accepted = 0
         acceptance = [False] * len(proposal.token_ids)

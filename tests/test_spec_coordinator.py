@@ -1,3 +1,5 @@
+import pytest
+
 from myvllm.engine.block_manager import BlockManager
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.sampling_parameters import SamplingParams
@@ -110,6 +112,43 @@ def test_eos_and_length_limits_truncate_multi_token_commit():
     result = coordinator.execute([seq], manager, fake_verify, eos_token_id=first)[0]
     assert result.emitted_token_ids == (first,)
     assert seq.is_finished
+
+
+def test_short_verification_stops_at_mismatch_and_emits_eos():
+    seq, manager = setup_seq([1, 2])
+    coordinator = SpecDecodeCoordinator(
+        SpeculativeConfig(enabled=True, proposer="mock", num_speculative_tokens=3),
+        MockProposer({seq.seq_id: [99, 98, 97]}),
+    )
+    result = coordinator.execute(
+        [seq], manager,
+        lambda batch: [VerificationResult(batch.sequences[0].seq_id, (17,))],
+        eos_token_id=17,
+    )[0]
+    assert result.emitted_token_ids == (17,)
+    assert result.accepted_proposal_tokens == 0
+    assert seq.is_finished
+    manager.assert_consistent()
+
+
+def test_incomplete_short_verification_rolls_back_sequence_and_blocks():
+    seq, manager = setup_seq([1, 2, 3])
+    original_tokens = list(seq.token_ids)
+    original_blocks = list(seq.block_table)
+    coordinator = SpecDecodeCoordinator(
+        SpeculativeConfig(enabled=True, proposer="mock", num_speculative_tokens=3),
+        MockProposer({seq.seq_id: [4, 5, 6]}),
+    )
+    with pytest.raises(ValueError, match="wrong query length"):
+        coordinator.execute(
+            [seq], manager,
+            lambda batch: [VerificationResult(batch.sequences[0].seq_id, (4,))],
+            eos_token_id=-1,
+        )
+    assert seq.token_ids == original_tokens
+    assert seq.block_table == original_blocks
+    assert seq.active_transaction is None
+    manager.assert_consistent()
 
 
 def run_target_only(prompt, total_completion):
