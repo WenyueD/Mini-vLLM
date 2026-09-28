@@ -21,8 +21,9 @@ from scripts.benchmark_qwen38_dflash2_concurrency import (
 )
 
 
+@pytest.mark.parametrize("replay_state_updates", [False, True])
 def test_build_config_pins_cached_target_shapes_for_exact_bf16_comparison(
-    monkeypatch,
+    monkeypatch, replay_state_updates,
 ):
     monkeypatch.setattr(
         "myvllm.models.qwen3_8_config.load_qwen35_config_dict",
@@ -37,6 +38,7 @@ def test_build_config_pins_cached_target_shapes_for_exact_bf16_comparison(
         target_cache_memory_fraction=0.05,
         draft_memory_reservation_fraction=0.0,
         cached_target_micro_batch_size=4,
+        replay_state_updates=replay_state_updates,
         dtype="bfloat16",
         safe_open_device="cuda",
         dflash2_safe_open_device=None,
@@ -57,6 +59,7 @@ def test_build_config_pins_cached_target_shapes_for_exact_bf16_comparison(
 
     assert config["qwen35_cached_batch_pad_to_size"] == 2
     assert config["qwen35_cached_attention_pad_to_length"] == 194
+    assert config["qwen35_replay_state_updates"] is replay_state_updates
 
     c8_config = build_config(
         args,

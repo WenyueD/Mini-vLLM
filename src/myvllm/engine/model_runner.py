@@ -1546,6 +1546,7 @@ class ModelRunner:
                 self.hybrid_cache_manager,
                 [seq.request_id for seq in batch.sequences],
                 transactions=transactions,
+                record_linear_updates=self.config.get("qwen35_replay_state_updates", True),
                 capture_hidden_taps=bool(
                     self.config.get("capture_verification_hidden_taps", False)
                     or self.dflash2_draft_model is not None
@@ -1802,7 +1803,28 @@ class ModelRunner:
         self._record_memory_stage("commit_start", batch_size=len(plans))
         try:
             replay_device = self._model_device_for_replay()
-            for _sequence_id, plan, _accepted_length in plans:
+            # A fully accepted query already has its final cache from verification.
+            replay_plans = [
+                (sequence_id, plan, accepted_length)
+                for sequence_id, plan, accepted_length in plans
+                if not (
+                    plan.query_tokens
+                    and accepted_length == len(plan.query_tokens)
+                    and self.config.get("qwen35_reuse_verified_cache", True)
+                )
+            ]
+            model_replay_plans = []
+            for _sequence_id, plan, accepted_length in replay_plans:
+                if (
+                    plan.query_tokens
+                    and self.config.get("qwen35_replay_state_updates", True)
+                    and hasattr(self.hybrid_cache_manager, "restore_verified_prefix")
+                    and self.hybrid_cache_manager.restore_verified_prefix(
+                        plan.transaction, plan.request_id, accepted_length,
+                    )
+                ):
+                    continue
+                model_replay_plans.append((_sequence_id, plan, accepted_length))
                 if plan.query_tokens and hasattr(
                     self.hybrid_cache_manager, "restore_original"
                 ):
@@ -1810,7 +1832,7 @@ class ModelRunner:
                         plan.transaction,
                         [plan.request_id],
                     )
-            self._replay_qwen35_accepted_prefixes(plans, replay_device)
+            self._replay_qwen35_accepted_prefixes(model_replay_plans, replay_device)
 
             for _sequence_id, plan, accepted_length in plans:
                 decision_index = accepted_length - 1

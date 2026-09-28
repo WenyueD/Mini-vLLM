@@ -13,6 +13,7 @@ from myvllm.engine.hybrid_cache import (
     HybridCacheTransaction,
     HybridRequestState,
     LinearLayerState,
+    LinearStateUpdate,
 )
 from myvllm.models.qwen3_8_config import (
     QWEN35_DEFAULT_HIDDEN_TAPS,
@@ -85,6 +86,7 @@ class Qwen35RotaryEmbedding(nn.Module):
     def __init__(self, config: Qwen35TextConfig):
         super().__init__()
         self.rotary_dim = config.rotary_dim
+        self.rope_theta = config.rope_theta
         if self.rotary_dim <= 0 or self.rotary_dim % 2:
             raise ValueError(
                 "Qwen3.5 partial rotary dimension must be positive and even"
@@ -97,6 +99,20 @@ class Qwen35RotaryEmbedding(nn.Module):
             )
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # Nonpersistent frequencies are absent from checkpoints after to_empty().
+        self.inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(
+                    0, self.rotary_dim, 2,
+                    dtype=torch.float32, device=self.inv_freq.device,
+                ) / self.rotary_dim
+            )
+        )
+        return self
 
     def forward(
         self, position_ids: torch.Tensor, dtype: torch.dtype
@@ -394,8 +410,11 @@ class Qwen35GatedDeltaNet(nn.Module):
         recurrent_state: torch.Tensor | None = None,
         conv_state: torch.Tensor | None = None,
         return_final_state: bool = False,
+        state_updates: list[LinearStateUpdate] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
+        if state_updates is not None and seq_len != 1:
+            raise ValueError("state update recording requires a single cached token")
         if recurrent_state is None or conv_state is None:
             recurrent_state, conv_state = self.initial_state(
                 batch_size, hidden_states.device, hidden_states.dtype
@@ -428,6 +447,11 @@ class Qwen35GatedDeltaNet(nn.Module):
             beta_t = beta[:, idx].float().unsqueeze(-1)
             kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
             delta = (v_t - kv_mem) * beta_t
+            if state_updates is not None:
+                state_updates.append(LinearStateUpdate(
+                    decay_t.detach(), k_t.detach(), delta.detach(),
+                    final_conv_state.detach(),
+                ))
             state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             out_t = (state * query[:, idx].float().unsqueeze(-1)).sum(dim=-2)
             outputs.append(out_t)
@@ -551,6 +575,7 @@ class Qwen35TextModel(nn.Module):
         request_states: list[HybridRequestState],
         hidden_tap_layers: tuple[int, ...] | None = None,
         attention_pad_to_length: int | None = None,
+        state_update_logs: list[dict[int, list[LinearStateUpdate]] | None] | None = None,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         input_ids = input_ids.reshape(-1, 1)
         batch_size = input_ids.shape[0]
@@ -582,13 +607,23 @@ class Qwen35TextModel(nn.Module):
                         conv = previous.conv_state
                     recurrent_rows.append(recurrent)
                     conv_rows.append(conv)
+                updates = [] if state_update_logs is not None else None
                 attn_out, recurrent, conv = layer.linear_attn(
                     normed,
                     recurrent_state=torch.cat(recurrent_rows, dim=0),
                     conv_state=torch.cat(conv_rows, dim=0),
                     return_final_state=True,
+                    **({"state_updates": updates} if updates is not None else {}),
                 )
                 for row, request_state in enumerate(request_states):
+                    if state_update_logs is not None and state_update_logs[row] is not None:
+                        update = updates[0]
+                        state_update_logs[row].setdefault(layer_idx, []).append(
+                            LinearStateUpdate(*(
+                                value[row : row + 1].clone()
+                                for value in (update.decay, update.key, update.delta, update.conv_state)
+                            ))
+                        )
                     request_state.linear_layers[layer_idx] = LinearLayerState(
                         recurrent[row : row + 1].detach().clone(),
                         conv[row : row + 1].detach().clone(),
@@ -730,6 +765,7 @@ class Qwen35ForCausalLM(nn.Module):
         request_ids: list[str] | tuple[str, ...],
         *,
         transactions: Mapping[str, HybridCacheTransaction] | None = None,
+        record_linear_updates: bool = False,
         capture_hidden_taps: bool = False,
         hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
         attention_pad_to_length: int | None = None,
@@ -755,6 +791,8 @@ class Qwen35ForCausalLM(nn.Module):
             raise ValueError("batched cached target is missing a request transaction")
         if batch_pad_to_size is not None and batch_pad_to_size <= 0:
             raise ValueError("batch padding size must be positive")
+        if record_linear_updates and transactions is None:
+            raise ValueError("state update recording requires cache transactions")
         if batch_pad_to_size is not None and batch_size > batch_pad_to_size:
             outputs = []
             for start in range(0, batch_size, batch_pad_to_size):
@@ -779,6 +817,7 @@ class Qwen35ForCausalLM(nn.Module):
                         attention_pad_to_length=attention_pad_to_length,
                         batch_pad_to_size=batch_pad_to_size,
                         return_logits=return_logits,
+                        record_linear_updates=record_linear_updates,
                     )
                 )
             return outputs
@@ -803,9 +842,16 @@ class Qwen35ForCausalLM(nn.Module):
             )
             step_input_ids = input_ids.index_select(0, active_indices)[:, token_index]
             step_request_states = [request_states[row] for row in active_rows]
+            update_logs = (
+                [transactions[request_ids[row]].linear_updates[request_ids[row]]
+                 for row in active_rows]
+                if record_linear_updates else None
+            )
             if batch_pad_to_size is not None:
                 padding_rows = batch_pad_to_size - len(active_rows)
                 if padding_rows:
+                    if update_logs is not None:
+                        update_logs.extend([None] * padding_rows)
                     step_input_ids = torch.cat(
                         [step_input_ids, step_input_ids.new_zeros(padding_rows)]
                     )
@@ -820,6 +866,7 @@ class Qwen35ForCausalLM(nn.Module):
                 step_request_states,
                 hidden_tap_layers=taps,
                 attention_pad_to_length=attention_pad_to_length,
+                state_update_logs=update_logs,
             )
             hidden = hidden[: len(active_rows)]
             hidden_taps = {

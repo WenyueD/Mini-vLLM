@@ -1,21 +1,21 @@
 # Qwen3.8 + DFlash2 K=7 / TP=2 阶段报告
 
-日期: 2026-09-13
+日期: 2026-09-20
 
 起点: `c911bc4415cd3a63f673860b887e3ae8e8c881a7`
 
-当前状态: 阶段一显存复杂度修复已在 A800 80GB 上完成 before/after 验证。阶段二先修复 cached target 计算 shape 不稳定导致的 BF16 舍入漂移，再用固定 micro-batch 4 解决 C8 batch-8 OOM；修复后 C2 为 8/8、C4 为 16/16、C8 为 32/32 全量逐 token 一致。阶段二已完成，阶段三、阶段四未开始。
+当前状态: RoPE 初始化修复、全接受缓存复用及部分接受状态恢复均已通过 C2/C4 验证。最新 C2 为 8/8、C4 为 16/16 输出一致；DFlash2 吞吐分别为 3.7986 和 4.3530 token/s，仍低于成对 target-only。2026-09-20 已在端口 57195 读取并独立复核完整 C4 结果，GPU 已释放，未启动 C8/TP2。历史数据和最新优化结果在下文分开记录。
 
 ## 阶段边界
 
 本轮严格按阶段推进，没有跳过阶段。
 
 1. 阶段一: 修复 Qwen3.8 + DFlash2 的显存复杂度风险，并补内存 trace。已完成 after C1/C2/C4/C8；before baseline 有 C1/C2/C4，C8 被用户要求暂停后中断，不纳入有效结果。
-2. 阶段二: 单卡 K=7 的 C1/C2/C4/C8 正确性与稳定性。已完成；C1/C2/C4/C8 correctness 均通过。
-3. 阶段三: 接受率和性能方向分析。未开始。
+2. 阶段二: 单卡 K=7 的 C1/C2/C4/C8 正确性与稳定性。旧实现已通过；RoPE 修复后需重新验证。
+3. 阶段三: 接受率和性能方向分析。进行中，已确认 RoPE 加载缺陷并修复。
 4. 阶段四: TP=2 下 C16/C32 验证。未开始。
 
-阶段一 memory 证据已满足进入阶段二的最低条件；阶段二已通过，可进入阶段三接受率和性能方向分析。
+阶段一 memory 证据保留；当前先完成 RoPE 修复后的成对正确性验证，再决定性能优化方向。
 
 ## 已读历史证据
 
@@ -294,4 +294,289 @@ git diff --check: exit 0 (Windows CRLF warnings only)
 
 ## 提交状态
 
-本轮尚未创建 git commit。原因是用户要求的最终提交应发生在阶段四完成后；当前阶段二已完成，阶段三和阶段四仍未完成。
+阶段一和阶段二已固化为 checkpoint `307b174` (`Stabilize Qwen3.8 DFlash2 memory and correctness`)。阶段三诊断工具与结果单独提交，不混入该 checkpoint。
+
+## 阶段三 acceptance 根因定位
+
+先复用阶段二 C2 request 0，未重跑并发矩阵。其 122-token prompt 可由 tokenizer 无损 round-trip；Mini target-only 与 DFlash2 已在阶段二对该请求保持 64/64 token 完全一致。
+
+Oracle 运行时审计:
+
+- vLLM `0.28.0`，实际类为 `vllm.v1.worker.gpu.spec_decode.dflash2.speculator.DFlash2Speculator`。
+- 基类固定 `num_query_per_req = 1 + num_speculative_steps`。
+- `sample_from_anchor=True` 被显式拒绝，运行时 `sample_from_anchor=False`。
+- 缺失 `ninja` 可执行文件会使默认 FlashInfer sampler 在 warmup 失败；设置 `VLLM_USE_FLASHINFER_SAMPLER=0` 后使用 PyTorch sampler，不改变 greedy 语义。
+
+同输入 target-only 对照:
+
+```text
+Mini target:   [1204, 63520, 45543, 72346, ...]
+Oracle target: [1204, 63520, 45543,   271, ...]
+```
+
+两者前三个生成 token 相同，首个 target baseline 差异位于生成位置 3（零基）。因此后续 Oracle 全序列不能直接作为 Mini verifier 的逐 token 数值基准。
+
+首次 proposal 对照仍可比较，因为它们共享相同 prompt、anchor 和 position:
+
+```text
+anchor_token_id=1204
+anchor_position=122
+target_layer_ids=[5, 19, 33, 47, 61]
+Oracle proposal=[63520, 45543, 72346, 54102, 2468, 21106, 13]
+Mini proposal=  [54102,   424, 54102,   424, 54102,   424, 54102]
+```
+
+Oracle proposal 与 Oracle target 前三步一致，fixture 通过正式 target-lossless gate；Mini proposal 在位置 0 即与 Mini target top-1 `63520` 不同。这解释了 K=7 仅约 4% 的总体 token acceptance：根因发生在 draft proposal 路径，早于 verifier rejection/commit。
+
+旧 exporter 在 greedy DFlash2 路径读取 `_cached_candidate_ids`，但该缓冲区只在 probabilistic draft logits 路径写入，因此得到全零占位，不能判断候选 top-k 与 selector 谁先分叉。阶段三工具已改为直接挂钩 `compute_candidates()`，并补充真实 candidate IDs、unary scores、combined context/proposal hidden checksum、selector selected indices；Mini fixture 同时补充 hidden-tap checksum、target top1/top2 和 first rejection index。用户已授权上传并完成远端诊断。
+
+结果目录:
+
+```text
+/root/autodl-tmp/Mini-vLLM/results/qwen38_target/oracle_alignment_stage3/oracle_target_c2_request0.txt
+/root/autodl-tmp/Mini-vLLM/results/qwen38_target/oracle_alignment_stage3/oracle_dflash2_c2_request0.json
+/root/autodl-tmp/Mini-vLLM/results/qwen38_target/oracle_alignment_stage3/minivllm_dflash2_c2_request0.json
+```
+
+阶段三当前结论是继续定位 draft proposal 的首个数值差异，暂不启动 TP2 或正式三重复性能测试。
+
+## 2026-09-17 RoPE 加载缺陷修复
+
+新服务器端口为 `22330`，GPU 为 A800 80GB。原始诊断文件和模型快照均保留。
+
+已确认目标模型 `Qwen35RotaryEmbedding` 和草稿模型 `DFlash2Attention` 的
+`inv_freq` 是非持久化 buffer：在 meta 设备构造后调用 `to_empty()` 会分配未初始化
+存储，而 safetensors 加载仅恢复参数，不会恢复此 buffer。CPU 小模型已复现其值
+不等于配置定义的 RoPE 频率。该问题同时存在于生产 runner 和 standalone smoke 的
+加载流程，此前逐层误差在首个 full attention 后放大与此一致。
+
+两处模块现在在 `_apply()` 后依据配置和目标设备重新生成 FP32 频率，覆盖
+`to_empty()` 以及 dtype/device 转换。回归测试覆盖父模块递归 meta materialization、
+BF16/FP16/FP32 转换和多个位置（含长位置）的 cos/sin，不依赖 checkpoint 保存 buffer。
+
+原 C2 `short-000000` 单样本，未注入 Oracle hidden taps、未启用实验性 GDN 替换：
+
+| 项目 | 修复前 | 修复后 |
+|---|---|---|
+| proposal | `[54102,424,54102,424,54102,424,54102]` | `[63520,45543,72346,54102,2468,21106,13]` |
+| 与 Oracle proposal 一致 | 否 | 7/7 |
+| 首次 rejection index（零基） | 0 | 2 |
+
+相同 anchor 为 token `1204`、position `122`。使用 FP64 dot/norm 比较已有 Oracle
+张量：normalized context cosine 为 `0.99304280`、relative L2 为 `0.11789589`；
+proposal hidden cosine 为 `0.99923154`、relative L2 为 `0.03920015`。
+候选 token 对齐不表示中间浮点数完全一致，也不表示七个候选全被 target 接受。
+
+此前注入 Oracle target taps 仍产生错误交替 proposal，说明不能将草稿错误仅归于
+目标模型数值漂移。RoPE 修复后候选恢复，确认这是本轮定位到的关键加载缺陷。
+所有修复前的 correctness/performance 数据保留作历史记录，不能作为有效 RoPE 下的
+正确性或性能验收依据，需要重新运行成对验证。
+
+本地验证：`pytest -q` 为 **166 passed, 2 skipped**。
+
+单样本结果（远端目录 `results/qwen38_target/oracle_alignment_stage3/`）：
+
+- `minivllm_c2_rope_fixed.json`
+- `minivllm_c2_rope_fixed.txt`
+- `minivllm_c2_rope_fixed_tensors.pt`
+
+C2 八请求、K7、单重复的 target-only / DFlash2 成对复验已完成，结果目录：
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c2_rope_fixed_20260917/`。
+
+| variant | C | requests | output TPS | TTFT p50 s | TPOT p50 s | acceptance | peak allocated GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| target_only | 2 | 8 | 5.2752 | 18.6931 | 0.0863 | 0 | 50.6043 |
+| dflash2 | 2 | 8 | 3.0683 | 10.7807 | 0.4628 | 0.471605 | 63.0080 |
+| target_only | 4 | 16 | 5.7354 | 38.3540 | 0.0916 | 0 | 50.9322 |
+| dflash2 | 4 | 16 | 3.6368 | 19.5539 | 0.6702 | 0.392473 | 72.4169 |
+
+`fairness_short_c2_r0.json` 比较全部 8 条请求：exact token match 为 true，
+mismatch count 为 0；两组均完成 512 个输出 token，未报告运行错误。
+DFlash2 接受 382/810 个候选。接受率从历史 4.3% 提升到 47.2%，但本轮
+吞吐仍仅为成对 target-only 的约 0.582 倍，不能宣称已有性能加速。
+
+C2 speculative 阶段计时：verify 为 47.3840 s（51.72%），commit 为
+42.7176 s（46.63%），proposal 为 1.5067 s（1.64%）。这些比例仅针对
+speculative 阶段，不是总运行时间的比例。后续性能方向应优先审计 verify/commit。
+
+服务器 CPU RoPE 回归测试为 2 passed。C4 使用 16 请求、K7、单重复，
+目录为 `results/qwen38_dflash2_perf/qwen38_dflash2_k7_c4_rope_fixed_20260917/`。
+`fairness_short_c4_r0.json` 全量比较 16 条请求，exact token match 为 true、
+mismatch count 为 0；两组各完成 1024 个输出 token，无 admission failure 或 schema error。
+本地再次从原始 request JSONL 独立复核，C2 和 C4 均为零差异。
+
+C4 接受 730/1860 个候选，接受率 39.25%（修复前历史值约 3.88%）；
+吞吐为成对 target-only 的约 0.634 倍，尚未获得吞吐加速。
+C4 speculative 阶段耗时为 verify 58.4539 s、commit 63.3116 s、proposal
+1.8381 s，仍主要消耗在 verify/commit。
+
+| DFlash2 memory trace | C2 | C4 |
+|---|---:|---:|
+| trace points | 787 | 887 |
+| max snapshot bytes | 0 | 0 |
+| max original state bytes | 330891264 | 663355392 |
+| max recorded steps | 16 | 32 |
+| max generic KV pool bytes | 0 | 0 |
+
+结果已保存在远端；本地工作区保存了 C2 全部指标、C4 汇总/一致性/manifest、
+两组完整 request JSONL 以及单样本 Oracle 对照 JSON。
+对应请求明细位于 `logs/qwen38_dflash2_perf/<run-id>/`。
+全部为单次验证，不作为三重复性能统计结论。
+
+暂停确认：C4 命令退出码为 0，`nvidia-smi` 为 **0 MiB, 0%**；未启动 C8/TP2。
+后续优化方向是减少 target verification 和 accepted-prefix commit/replay 的成本，
+同时保留当前逐 token 一致性与显存约束。本次不继续修改该路径。
+
+## 2026-09-17 全接受缓存复用优化
+
+用户随后授权继续性能优化。`commit_verified_cache()` 原先无论接受长度多少，
+都会恢复事务起始状态并重新执行接受的前缀。现在，当接受长度等于完整验证
+query 长度（包含 pending anchor）时，直接保留验证结束后的缓存；部分接受和
+零接受仍走原来的恢复逻辑。最终提交仍检查缓存 logical length，异常仍可回滚。
+配置 `qwen35_reuse_verified_cache=False` 可以关闭新路径，默认开启。
+
+本地全量测试为 **173 passed, 2 skipped**；新增覆盖全部接受、部分接受、零接受、
+混合 batch、优化关闭和提交异常后的状态恢复。`git diff --check` 通过。
+
+C2 成对测试目录：
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c2_reuse_verified_20260917/`。
+
+| C2 指标 | RoPE 修复后、优化前 | 全接受复用后 |
+|---|---:|---:|
+| target-only TPS | 5.2752 | 5.2459 |
+| DFlash2 TPS | 3.0683 | 3.3764 |
+| DFlash2 acceptance | 47.1605% | 47.1605% |
+| commit 秒 | 42.7176 | 25.6196 |
+| verify 秒 | 47.3840 | 47.9902 |
+| DFlash2 peak allocated GiB | 63.0080 | 61.9437 |
+| 全量逐 token 一致 | 8/8 | 8/8 |
+
+吞吐单次观测提升约 10.0%，commit 下降约 40.0%，显存峰值下降约 1.06 GiB。
+接受数保持 382/810，原始请求 JSONL 对比确认优化前后 8 条输出均相同。
+优化后 memory trace 仍为 787 点、snapshot bytes 为 0、generic KV pool 为 0，
+original state 峰值 330891264 bytes、recorded steps 峰值 16。
+该优化尚未使 DFlash2 超过 target-only。
+
+C4 首次运行 `qwen38_dflash2_k7_c4_reuse_verified_20260917` 因连接断开结束，
+仅保存 12/16 条 target-only 请求，不作为有效结果。保留原目录，使用
+`qwen38_dflash2_k7_c4_reuse_verified_20260917_retry` 独立进程重新验证。
+
+### C4 完整结果与迁移后复核
+
+2026-09-18 在新服务器端口 `57195` 找到完整 retry 结果。此次读取的是迁移保存的
+已完成测试，不是在新服务器上重跑所得的数据。
+
+| C4 指标 | RoPE 修复后、优化前 | 全接受复用后 |
+|---|---:|---:|
+| target-only TPS | 5.7354 | 5.5703 |
+| DFlash2 TPS | 3.6368 | 3.8708 |
+| DFlash2 acceptance | 39.2473% | 39.2473% |
+| commit 秒 | 63.3116 | 42.7575 |
+| verify 秒 | 58.4539 | 59.2265 |
+| DFlash2 peak allocated GiB | 72.4169 | 70.2856 |
+| 全量逐 token 一致 | 16/16 | 16/16 |
+
+C4 单次观测吞吐提升约 6.4%，commit 下降约 32.5%，显存峰值下降约 2.13 GiB。
+接受数保持 730/1860。fairness 全量通过，且本地从原始 request JSONL 独立复核：
+优化前后输出无差异，本轮 target-only 与 DFlash2 的 1024 个 token 也全部一致。
+没有 admission failure 或 schema error。
+
+显存 trace 共 885 点，snapshot bytes 和 generic KV pool 峰值均为 0，
+original state 峰值 663355392 bytes、recorded steps 峰值 32。
+最新 DFlash2 吞吐约为成对 target-only 的 0.695 倍，不能宣称已经解决性能倒挂。
+上述性能改变量来自单次运行比较；target-only 计时也存在波动，尚未做三重复统计。
+
+完整远端目录：
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c4_reuse_verified_20260917_retry/`。
+本地同名 results 目录保存 summary、fairness、manifest；同名 logs 目录保存两组
+原始 request JSONL。原始完整指标和 trace 保留在远端。
+
+缓存复用优化验收完成。下一步应研究部分接受时如何避免整模型重放，以及如何
+降低逐 token verifier 的成本；分块验证需要单独检验 BF16 计算形状变化引起的
+输出差异，不能仅凭理论并行度宣称加速。此次未启动新的性能实验或 C8/TP2。
+迁移后检查 GPU 为 **0 MiB, 0%**。
+
+## 2026-09-18 部分接受状态恢复
+
+验证期间保存每个线性注意力层的 FP32 decay、key、delta，以及较小的卷积状态。
+提交部分接受的前缀时，从事务原始 recurrent state 按验证时相同的两次运算
+`state = state * decay; state = state + key * delta` 恢复状态，不再执行目标模型
+的投影、注意力和 MLP；full-attention KV 保留已验证内容并截断逻辑长度。
+零接受恢复原始状态，全接受继续直接复用验证后状态。没有足够更新记录时回退到
+整模型重放；事务原始状态仍保留供异常回滚。
+
+更新记录由 `transaction_linear_update_bytes` 单独计入显存估算与 total bytes，
+不再仅检查旧 snapshot 指标。配置 `qwen35_replay_state_updates=False` 可关闭优化；
+benchmark 支持 `--replay-state-updates` / `--no-replay-state-updates`，默认开启。
+
+最终本地测试 **214 passed, 2 skipped**。新增精确状态及后续 logits 对照覆盖
+FP32/BF16、空/已有缓存、每种接受长度、ragged batch、micro-batch 1/4；还覆盖
+开关关闭、记录不足回退、异常恢复，以及提交后记录不再计入活跃事务显存。
+
+新服务器仍为 A800-SXM4-80GB，端口 57195。C2 新路径目录：
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c2_state_updates_20260918/`。
+此 run 启动时 benchmark 尚未加入 CLI 开关，实际使用 runner 默认开启的新路径；
+后续对照使用显式 `--no-replay-state-updates`。
+
+C2 新路径 8/8 请求全量逐 token 一致，DFlash2 TPS 为 3.7986，成对 target-only
+为 5.0455，接受数保持 382/810（47.1605%）。commit 为 1.5017 s，verify 为
+52.2540 s，proposal 为 1.5296 s。peak allocated 为 54.5984 GiB，新增状态更新
+记录峰值为 85082112 bytes（约 81.14 MiB），完整 snapshot 和 generic KV pool 均为 0。
+
+同服务器旧路径对照目录：
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c2_state_updates_off_20260918/`。
+该组只跑 DFlash2，沿用相同输入和参数，用于避免把服务器迁移或环境波动当作优化收益。
+
+同机 C2 A/B 已完成，工作负载 JSON 和全部 8 条输出均完全一致：
+
+| 指标 | 更新记录关闭（整模型重放） | 更新记录开启 |
+|---|---:|---:|
+| DFlash2 output TPS | 3.3849 | 3.7986 |
+| commit 秒 | 26.2413 | 1.5017 |
+| verify 秒 | 47.6831 | 52.2540 |
+| proposal 秒 | 1.5291 | 1.5296 |
+| peak allocated GiB | 61.9425 | 54.5984 |
+| accepted/proposed | 382/810 | 382/810 |
+
+单次同机观测吞吐提升约 12.2%，commit 下降约 94.3%，显存峰值下降约 7.34 GiB。
+更新记录使 verify 增加约 4.57 s，但少做的整模型重放仍带来净收益。
+两组均保留上一轮全接受缓存复用；这里只切换部分接受的状态恢复方式。
+新路径仍慢于本轮 target-only 的 5.0455 TPS，整体加速目标尚未达到。
+
+C4 新路径已在相同服务器完成 16 请求成对验证，目录为
+`results/qwen38_dflash2_perf/qwen38_dflash2_k7_c4_state_updates_20260918/`。
+
+### C4 状态恢复验收
+
+2026-09-20 恢复工作后读取到完整结果；上次仅测试文件上传受自动审批的用量限制
+阻止，独立运行的 benchmark 已正常完成。测试文件现已补齐同步。
+服务器聚焦回归（模型、并发基准配置及缓存事务）为 **91 passed**。
+
+| C4 指标 | target-only | DFlash2 状态恢复 |
+|---|---:|---:|
+| requests | 16 | 16 |
+| output tokens | 1024 | 1024 |
+| output TPS | 5.5169 | 4.3530 |
+| TTFT p50 s | 39.5428 | 20.3822 |
+| TPOT p50 s | 0.0973 | 0.5221 |
+| peak allocated GiB | 50.9314 | 55.4921 |
+
+全量 fairness 为 true、mismatch count 为 0。下载两组原始 request JSONL 后再次
+独立复核：与本轮 target-only 及上一轮全接受复用版本相比，16 条请求的所有
+1024 个 token 均一致。接受数仍为 730/1860（39.2473%）。没有 admission failure
+或 schema error。
+
+speculative 阶段耗时：verify 66.1148 s，commit 2.8835 s，proposal 1.8283 s。
+verify 已占这部分耗时约 93.3%，成为下一步的主要性能瓶颈。
+状态更新记录峰值 170164224 bytes（约 162.28 MiB），完整 snapshot 和
+generic KV pool 峰值均为 0。新增记录确实计入显存统计，没有恢复逐 token
+完整 recurrent-state snapshot。
+
+历史 C4 全接受复用版本为 3.8708 TPS、70.2856 GiB，本轮为 4.3530 TPS、
+55.4921 GiB；该历史对比跨服务器迁移，仅作参考。本轮成对 DFlash2 吞吐仍为
+target-only 的约 0.789 倍，不能宣称整体加速目标已完成。同机 C2 A/B 才是此次
+部分接受优化的直接性能证据；所有数据仍为单重复验证。
+
+结果与原始输出已保存在服务器和本地同名 results/logs 目录；GPU 已确认
+**0 MiB, 0%**。本轮不启动 C8/TP2。后续应优先研究逐 token verifier 如何减少
+无效后缀计算或实现分块验证，同时继续检查 BF16 计算形状变化对精确输出的影响。

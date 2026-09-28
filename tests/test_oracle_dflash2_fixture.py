@@ -9,8 +9,10 @@ from scripts.export_oracle_dflash2_fixture import (
     build_llm_kwargs,
     completion_output_token_ids,
     dflash_capture_contract_error,
+    grouped_candidate_rows,
     parse_args,
     qualified_type_name,
+    selected_candidate_indices,
     select_target_bonus_capture,
     tensor_attr_to_list,
     tensor_rows_to_list,
@@ -140,6 +142,26 @@ def test_tensor_attr_selects_sparse_active_slots():
     owner = type("Owner", (), {"cached": [[0], [11], [22]]})()
 
     assert tensor_attr_to_list(owner, "cached", 1, indices=[1]) == [[11]]
+
+
+def test_grouped_candidate_rows_reshapes_flat_dflash2_candidates():
+    candidates = [[10, 11], [20, 21], [30, 31], [40, 41]]
+
+    assert grouped_candidate_rows(candidates, rows=2, steps=2) == [
+        [[10, 11], [20, 21]],
+        [[30, 31], [40, 41]],
+    ]
+
+
+def test_selected_candidate_indices_follow_proposal_tokens():
+    candidates = [[[10, 11], [20, 21]], [[30, 31], [40, 41]]]
+    proposals = [[11, 20], [30, 41]]
+
+    assert selected_candidate_indices(candidates, proposals) == [[1, 0], [0, 1]]
+
+
+def test_selected_candidate_indices_reject_missing_proposal_token():
+    assert selected_candidate_indices([[[10, 11]]], [[12]]) is None
 
 
 def test_oracle_effective_anchor_mismatch_detects_overridden_fixture_anchor():

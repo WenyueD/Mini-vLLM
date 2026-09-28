@@ -444,6 +444,7 @@ class DFlash2Attention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.head_dim
+        self.rope_theta = config.rope_theta
         self.scaling = config.head_dim**-0.5
         self.sliding_window = config.sliding_window
         self.q_proj = nn.Linear(
@@ -476,6 +477,20 @@ class DFlash2Attention(nn.Module):
             )
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # Rebuild in FP32 after meta materialization and dtype/device conversion.
+        self.inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(
+                    0, self.head_dim, 2,
+                    dtype=torch.float32, device=self.inv_freq.device,
+                ) / self.head_dim
+            )
+        )
+        return self
 
     def _position_embedding(
         self,

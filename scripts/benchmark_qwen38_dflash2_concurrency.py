@@ -135,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cache-memory-fraction", type=float, default=0.05)
     parser.add_argument("--draft-memory-reservation-fraction", type=float, default=0.0)
     parser.add_argument("--cached-target-micro-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--replay-state-updates", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore accepted prefixes from compact state updates instead of model replay.",
+    )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
         "--ignore-eos", dest="ignore_eos", action="store_true", default=True
@@ -340,6 +345,7 @@ def build_config(
                 concurrency, args.cached_target_micro_batch_size
             ),
             "qwen35_cached_attention_pad_to_length": max_model_length,
+            "qwen35_replay_state_updates": getattr(args, "replay_state_updates", True),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,

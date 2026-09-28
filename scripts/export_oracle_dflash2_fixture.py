@@ -11,6 +11,10 @@ from typing import Any
 CAPTURES: list[dict[str, Any]] = []
 SPECULATOR_DEBUG_PRINTED = False
 CAPTURE_ENABLED = False
+TARGET_LAYER_TRACES: list[list[dict[str, Any]]] = []
+TARGET_LAYER_TENSOR_TRACES: list[list[tuple[int, Any]]] = []
+DRAFT_LAYER_TENSOR_TRACES: list[list[dict[str, Any]]] = []
+CAPTURE_TENSOR_DUMPS: list[dict[str, Any]] = []
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +31,22 @@ def parse_args() -> argparse.Namespace:
         "--draft-model", default=os.environ.get("MINIVLLM_DFLASH2_PATH")
     )
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--tensor-dump",
+        default=None,
+        help="Optional torch.save path for captured hidden-state tensors.",
+    )
     parser.add_argument("--prompt", default="Hello")
+    parser.add_argument(
+        "--workload-json",
+        default=None,
+        help="Optional benchmark workload JSON containing prompt_token_ids.",
+    )
+    parser.add_argument(
+        "--request-id",
+        default="short-000000",
+        help="Request key to load from --workload-json.",
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--num-speculative-tokens", type=int, default=7)
     parser.add_argument("--method", default="dflash")
@@ -156,6 +175,57 @@ def tensor_to_list(value: Any) -> Any:
     if hasattr(value, "tolist"):
         return value.tolist()
     return value
+
+
+def tensor_checksum(value: Any) -> float | None:
+    if value is None or not hasattr(value, "detach"):
+        return None
+    return float(value.detach().float().sum().item())
+
+
+def tensor_fingerprint(value: Any) -> dict[str, Any] | None:
+    if value is None or not hasattr(value, "detach"):
+        return None
+    tensor = value.detach().float()
+    flat_tokens = tensor.reshape(-1, tensor.shape[-1])
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(value.dtype),
+        "checksum": float(tensor.sum().item()),
+        "l2_norm": float(tensor.norm().item()),
+        "abs_max": float(tensor.abs().max().item()),
+        "first_token_checksum": float(flat_tokens[0].sum().item()),
+        "last_token_checksum": float(flat_tokens[-1].sum().item()),
+    }
+
+
+def grouped_candidate_rows(value: Any, rows: int, steps: int) -> Any:
+    copied = tensor_to_list(value)
+    if copied is None:
+        return None
+    try:
+        if len(copied) == rows and len(copied[0]) == steps:
+            return copied
+        if len(copied) == rows * steps:
+            return [copied[row * steps : (row + 1) * steps] for row in range(rows)]
+    except (IndexError, TypeError):
+        pass
+    return copied
+
+
+def selected_candidate_indices(candidate_rows: Any, proposal_rows: Any) -> Any:
+    if candidate_rows is None or proposal_rows is None:
+        return None
+    selected: list[list[int]] = []
+    try:
+        for candidates_by_step, proposals in zip(candidate_rows, proposal_rows):
+            row: list[int] = []
+            for candidates, proposal in zip(candidates_by_step, proposals):
+                row.append([int(value) for value in candidates].index(int(proposal)))
+            selected.append(row)
+    except (TypeError, ValueError):
+        return None
+    return selected
 
 
 def tensor_attr_to_list(
@@ -414,6 +484,88 @@ def install_dflash_capture_hook(
             "Oracle/vLLM environment that can serve DFlash2."
         ) from exc
 
+    from vllm.model_executor.models.interfaces import EagleModelMixin
+
+    original_maybe_add_hidden_state = EagleModelMixin._maybe_add_hidden_state
+
+    def wrapped_maybe_add_hidden_state(
+        self, aux_hidden_states, layer_idx, hidden_states, residual
+    ):
+        global TARGET_LAYER_TRACES, TARGET_LAYER_TENSOR_TRACES
+        result = original_maybe_add_hidden_state(
+            self, aux_hidden_states, layer_idx, hidden_states, residual
+        )
+        if CAPTURE_ENABLED:
+            value = hidden_states + residual if residual is not None else hidden_states
+            if layer_idx == 0 or not TARGET_LAYER_TRACES:
+                TARGET_LAYER_TRACES.append([])
+                TARGET_LAYER_TENSOR_TRACES.append([])
+            fingerprint = tensor_fingerprint(value)
+            if fingerprint is not None:
+                fingerprint["boundary_index"] = int(layer_idx)
+                TARGET_LAYER_TRACES[-1].append(fingerprint)
+                TARGET_LAYER_TENSOR_TRACES[-1].append(
+                    (int(layer_idx), value.detach().cpu())
+                )
+        return result
+
+    EagleModelMixin._maybe_add_hidden_state = wrapped_maybe_add_hidden_state
+
+    try:
+        from vllm.model_executor.models.qwen3_dflash2 import (
+            DFlash2Qwen3DecoderLayer,
+            DFlash2Qwen3ForCausalLM,
+        )
+    except Exception:  # pragma: no cover - version-specific Oracle path.
+        DFlash2Qwen3DecoderLayer = None
+        DFlash2Qwen3ForCausalLM = None
+
+    if DFlash2Qwen3DecoderLayer is not None:
+        original_draft_layer_forward = DFlash2Qwen3DecoderLayer.forward
+
+        def wrapped_draft_layer_forward(
+            self, positions, hidden_states, residual
+        ):
+            global DRAFT_LAYER_TENSOR_TRACES
+            if CAPTURE_ENABLED and residual is None:
+                DRAFT_LAYER_TENSOR_TRACES.append([])
+            combined_input = (
+                hidden_states
+                if residual is None
+                else hidden_states + residual
+            )
+            result = original_draft_layer_forward(
+                self, positions, hidden_states, residual
+            )
+            if CAPTURE_ENABLED:
+                if not DRAFT_LAYER_TENSOR_TRACES:
+                    DRAFT_LAYER_TENSOR_TRACES.append([])
+                DRAFT_LAYER_TENSOR_TRACES[-1].append(
+                    {
+                        "positions": positions.detach().cpu(),
+                        "input": combined_input.detach().cpu(),
+                        "output": (result[0] + result[1]).detach().cpu(),
+                    }
+                )
+            return result
+
+        DFlash2Qwen3DecoderLayer.forward = wrapped_draft_layer_forward
+
+    if DFlash2Qwen3ForCausalLM is not None:
+        original_compute_candidates = DFlash2Qwen3ForCausalLM.compute_candidates
+
+        def wrapped_compute_candidates(self, hidden_states):
+            result = original_compute_candidates(self, hidden_states)
+            if CAPTURE_ENABLED:
+                self._oracle_capture_candidate_ids = result[0].detach().clone()
+                self._oracle_capture_candidate_unary_scores = (
+                    result[1].detach().clone()
+                )
+                self._oracle_capture_proposal_hidden = hidden_states.detach().clone()
+            return result
+
+        DFlash2Qwen3ForCausalLM.compute_candidates = wrapped_compute_candidates
+
     original_propose = DFlashSpeculator.propose
     propose_signature = inspect.signature(original_propose)
     if dump_speculator_debug:
@@ -491,6 +643,71 @@ def install_dflash_capture_hook(
             proposal_first_token_id = int(proposal_rows[0][0])
         except Exception:
             pass
+        num_steps = int(getattr(self, "num_speculative_steps", 0))
+        draft_model = getattr(self, "model", None)
+        candidate_ids = grouped_candidate_rows(
+            getattr(draft_model, "_oracle_capture_candidate_ids", None),
+            rows,
+            num_steps,
+        )
+        candidate_unary_scores = grouped_candidate_rows(
+            getattr(draft_model, "_oracle_capture_candidate_unary_scores", None),
+            rows,
+            num_steps,
+        )
+        proposal_hidden = getattr(
+            draft_model, "_oracle_capture_proposal_hidden", None
+        )
+        num_target_tokens = int(getattr(input_batch, "num_tokens", 0) or 0)
+        combined_context = getattr(self, "hidden_states", None)
+        if combined_context is not None and num_target_tokens > 0:
+            combined_context = combined_context[:num_target_tokens]
+        normalized_context = None
+        hidden_norm = getattr(getattr(draft_model, "model", None), "hidden_norm", None)
+        if combined_context is not None and callable(hidden_norm):
+            normalized_context = hidden_norm(combined_context)
+        aux_hidden_states = argument_value(
+            bound, args, kwargs, "aux_hidden_states", 4
+        )
+        hidden_tap_checksums = (
+            [tensor_checksum(value) for value in aux_hidden_states]
+            if aux_hidden_states
+            else None
+        )
+        CAPTURE_TENSOR_DUMPS.append(
+            {
+                "hidden_taps": (
+                    [value.detach().cpu() for value in aux_hidden_states]
+                    if aux_hidden_states
+                    else None
+                ),
+                "pre_norm_context": (
+                    combined_context.detach().cpu()
+                    if combined_context is not None
+                    else None
+                ),
+                "normalized_context": (
+                    normalized_context.detach().cpu()
+                    if normalized_context is not None
+                    else None
+                ),
+                "proposal_hidden": (
+                    proposal_hidden.detach().cpu()
+                    if proposal_hidden is not None
+                    else None
+                ),
+                "target_layer_boundaries": (
+                    TARGET_LAYER_TENSOR_TRACES[-1]
+                    if TARGET_LAYER_TENSOR_TRACES
+                    else None
+                ),
+                "draft_layer_trace": (
+                    DRAFT_LAYER_TENSOR_TRACES[-1]
+                    if DRAFT_LAYER_TENSOR_TRACES
+                    else None
+                ),
+            }
+        )
         CAPTURES.append(
             {
                 "speculator_class": qualified_type_name(self),
@@ -509,21 +726,16 @@ def install_dflash_capture_hook(
                 "last_sampled": last_sampled_rows,
                 "next_prefill_tokens": next_prefill_rows,
                 "anchor_token_id": anchor_token_id,
-                "num_speculative_steps": int(self.num_speculative_steps),
+                "num_speculative_steps": num_steps,
                 "num_query_per_req": int(getattr(self, "num_query_per_req", 0)),
                 "sample_pos": sample_pos,
                 "sample_indices": sample_indices,
                 "sample_from_anchor": getattr(self, "sample_from_anchor", None),
                 "sample_from_anchor_attr_present": hasattr(self, "sample_from_anchor"),
-                "candidate_token_ids": tensor_attr_to_list(
-                    self,
-                    "_cached_candidate_ids",
-                    rows,
-                ),
-                "selector_selected_indices": tensor_attr_to_list(
-                    self,
-                    "_cached_sample_indices",
-                    rows,
+                "candidate_token_ids": candidate_ids,
+                "candidate_unary_scores": candidate_unary_scores,
+                "selector_selected_indices": selected_candidate_indices(
+                    candidate_ids, proposal_rows
                 ),
                 "selector_realized_scores": tensor_attr_to_list(
                     self,
@@ -535,6 +747,13 @@ def install_dflash_capture_hook(
                     "draft_tokens",
                     rows,
                 ),
+                "hidden_tap_checksums": hidden_tap_checksums,
+                "target_layer_boundary_trace": (
+                    TARGET_LAYER_TRACES[-1] if TARGET_LAYER_TRACES else None
+                ),
+                "pre_norm_context_checksum": tensor_checksum(combined_context),
+                "context_checksum": tensor_checksum(normalized_context),
+                "proposal_hidden_checksum": tensor_checksum(proposal_hidden),
             }
         )
         if dump_speculator_debug and not SPECULATOR_DEBUG_PRINTED:
@@ -673,6 +892,7 @@ def main() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
 
+    import torch
     import vllm
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
@@ -681,7 +901,23 @@ def main() -> None:
         args.target_model,
         trust_remote_code=args.trust_remote_code,
     )
-    prompt_token_ids = [int(value) for value in tokenizer.encode(args.prompt)]
+    prompt = args.prompt
+    if args.workload_json is not None:
+        workload = json.loads(Path(args.workload_json).read_text(encoding="utf-8"))
+        try:
+            request = workload[args.request_id]
+            prompt_token_ids = [
+                int(value) for value in request["prompt_token_ids"]
+            ]
+        except (KeyError, TypeError) as exc:
+            raise SystemExit(
+                f"Invalid workload request {args.request_id!r}: {exc}"
+            ) from exc
+        prompt = tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+        if [int(value) for value in tokenizer.encode(prompt)] != prompt_token_ids:
+            raise SystemExit("Decoded workload prompt does not round-trip to token IDs")
+    else:
+        prompt_token_ids = [int(value) for value in tokenizer.encode(prompt)]
     if not prompt_token_ids:
         raise SystemExit("prompt encoded to zero tokens")
 
@@ -700,7 +936,7 @@ def main() -> None:
         )
     elif not args.skip_target_preflight:
         target_llm = LLM(**build_llm_kwargs(args, speculative=False))
-        target_outputs = target_llm.generate([args.prompt], sampling_params)
+        target_outputs = target_llm.generate([prompt], sampling_params)
         target_only_token_ids = (
             completion_output_token_ids(target_outputs[0], prompt_token_ids)
             if target_outputs
@@ -724,7 +960,7 @@ def main() -> None:
     llm = LLM(**build_llm_kwargs(args, speculative=True))
     CAPTURE_ENABLED = True
     try:
-        outputs = llm.generate([args.prompt], sampling_params)
+        outputs = llm.generate([prompt], sampling_params)
     finally:
         CAPTURE_ENABLED = False
     if not CAPTURES:
@@ -836,7 +1072,7 @@ def main() -> None:
         "fixture_schema_version": 2,
         "anchor_semantics": "target_bonus_token",
         "source": "oracle-vllm",
-        "prompt": args.prompt,
+        "prompt": prompt,
         "prompt_token_ids": prompt_token_ids,
         "anchor_token_id": int(anchor_token_id),
         "anchor_token_mode": args.anchor_token_mode,
@@ -876,12 +1112,22 @@ def main() -> None:
     }
     if capture.get("candidate_token_ids") is not None:
         fixture["candidate_token_ids"] = capture["candidate_token_ids"]
+    if capture.get("candidate_unary_scores") is not None:
+        fixture["candidate_unary_scores"] = capture["candidate_unary_scores"]
     if capture.get("selector_selected_indices") is not None:
         fixture["selector_selected_indices"] = capture["selector_selected_indices"]
     if capture.get("selector_realized_scores") is not None:
         fixture["selector_realized_scores"] = capture["selector_realized_scores"]
     if capture.get("draft_token_ids") is not None:
         fixture["draft_token_ids"] = capture["draft_token_ids"]
+    for key in (
+        "hidden_tap_checksums",
+        "pre_norm_context_checksum",
+        "context_checksum",
+        "proposal_hidden_checksum",
+    ):
+        if capture.get(key) is not None:
+            fixture[key] = capture[key]
 
     release_llm(llm)
 
@@ -891,6 +1137,11 @@ def main() -> None:
         json.dumps(fixture, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    if args.tensor_dump:
+        tensor_dump_path = Path(args.tensor_dump)
+        tensor_dump_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(CAPTURE_TENSOR_DUMPS[selected_index], tensor_dump_path)
+        print(f"tensor_dump={tensor_dump_path}", flush=True)
     print(f"prompt_token_ids={prompt_token_ids}", flush=True)
     print(f"oracle_target_only_token_ids={target_only_token_ids}", flush=True)
     print(f"selected_capture_index={selected_index}", flush=True)

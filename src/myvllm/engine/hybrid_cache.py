@@ -184,6 +184,19 @@ def _full_attention_state_nbytes(
 
 
 @dataclass
+class LinearStateUpdate:
+    decay: torch.Tensor
+    key: torch.Tensor
+    delta: torch.Tensor
+    conv_state: torch.Tensor
+
+    def nbytes(self) -> int:
+        return sum(tensor_nbytes(value) for value in (
+            self.decay, self.key, self.delta, self.conv_state,
+        ))
+
+
+@dataclass
 class HybridCacheTransaction:
     transaction_id: int
     request_ids: tuple[RequestId, ...]
@@ -194,16 +207,17 @@ class HybridCacheTransaction:
     )
     recorded_steps: dict[RequestId, set[int]] = field(default_factory=dict)
     state: HybridTransactionState = HybridTransactionState.ACTIVE
+    linear_updates: dict[RequestId, dict[int, list[LinearStateUpdate]]] = field(
+        default_factory=dict
+    )
 
 
 class HybridCacheManager:
     """Owns recurrent/conv cache state for Qwen3.5 hybrid text layers.
 
-    The existing BlockManager already handles paged full-attention KV slots.  This
-    manager covers the part that cannot be repaired by trimming sequence length:
-    linear-attention state after each proposed token.  During verification callers
-    record a snapshot after every provisional token, then commit a different
-    accepted length for each request or roll the whole batch back.
+    Transactions keep the original state for rollback. Verification can record
+    compact linear-state updates to restore an accepted prefix while truncating
+    full-attention KV. Snapshot-based commit remains available to legacy callers.
     """
 
     def __init__(self) -> None:
@@ -264,6 +278,7 @@ class HybridCacheManager:
             },
             snapshots={request_id: {} for request_id in request_ids},
             recorded_steps={request_id: set() for request_id in request_ids},
+            linear_updates={request_id: {} for request_id in request_ids},
         )
         self._active[transaction_id] = transaction
         return transaction
@@ -313,6 +328,56 @@ class HybridCacheManager:
             if request_id not in transaction.original_states:
                 raise ValueError("request does not belong to this transaction")
             self._states[request_id] = transaction.original_states[request_id].clone()
+
+    def restore_verified_prefix(
+        self,
+        transaction: HybridCacheTransaction,
+        request_id: RequestId,
+        accepted: int,
+    ) -> bool:
+        """Restore a prefix using recorded rank-one updates, without model replay."""
+        self._require_active(transaction)
+        if request_id not in transaction.request_ids:
+            raise ValueError("request does not belong to this transaction")
+        if not 0 <= accepted <= transaction.reserve_tokens[request_id]:
+            raise ValueError("accepted length is outside the reservation")
+        if accepted == 0:
+            self.restore_original(transaction, [request_id])
+            return True
+        state = self.ensure_request(request_id)
+        original = transaction.original_states[request_id]
+        updates = transaction.linear_updates.get(request_id, {})
+        if any(len(updates.get(layer_id, ())) < accepted for layer_id in state.linear_layers):
+            return False
+        if accepted not in transaction.recorded_steps[request_id]:
+            raise RuntimeError("cannot restore an unverified cache prefix")
+        length = original.logical_length + accepted
+        if state.logical_length < length:
+            raise RuntimeError("verified cache is shorter than the accepted prefix")
+        restored_linear = {}
+        for layer_id, current in state.linear_layers.items():
+            previous = original.linear_layers.get(layer_id)
+            recurrent = (
+                torch.zeros_like(current.recurrent_state)
+                if previous is None else previous.recurrent_state
+            )
+            for update in updates[layer_id][:accepted]:
+                # Preserve the two FP32 operations used during verification.
+                recurrent = recurrent * update.decay
+                recurrent = recurrent + update.key.unsqueeze(-1) * update.delta.unsqueeze(-2)
+            restored_linear[layer_id] = LinearLayerState(
+                recurrent, updates[layer_id][accepted - 1].conv_state.clone(),
+            )
+        for layer_id, kv in state.full_attention_layers.items():
+            if not isinstance(kv, FullAttentionLayerState):
+                kv = FullAttentionLayerState.from_tensors(*kv)
+                state.full_attention_layers[layer_id] = kv
+            if kv.logical_length < length:
+                raise RuntimeError("verified KV cache is shorter than the accepted prefix")
+            kv.logical_length = length
+        state.linear_layers = restored_linear
+        state.logical_length = length
+        return True
 
     def finalize_replayed_commit(
         self,
@@ -388,8 +453,15 @@ class HybridCacheManager:
 
         original_bytes = 0
         snapshot_bytes = 0
+        update_bytes = 0
         recorded_steps = 0
         for transaction in self._active.values():
+            update_bytes += sum(
+                update.nbytes()
+                for layers in transaction.linear_updates.values()
+                for updates in layers.values()
+                for update in updates
+            )
             original_bytes += sum(
                 state.nbytes()["total_bytes"]
                 for state in transaction.original_states.values()
@@ -414,10 +486,12 @@ class HybridCacheManager:
             "active_transactions": len(self._active),
             "transaction_original_state_bytes": original_bytes,
             "transaction_snapshot_state_bytes": snapshot_bytes,
+            "transaction_linear_update_bytes": update_bytes,
             "transaction_recorded_steps": recorded_steps,
             "total_bytes": state_totals["total_bytes"]
             + original_bytes
-            + snapshot_bytes,
+            + snapshot_bytes
+            + update_bytes,
         }
 
     def _require_active(self, transaction: HybridCacheTransaction) -> None:

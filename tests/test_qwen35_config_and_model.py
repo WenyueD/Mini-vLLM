@@ -315,6 +315,7 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
         request_states,
         hidden_tap_layers=None,
         attention_pad_to_length=None,
+        state_update_logs=None,
     ):
         batch_sizes.append(len(request_states))
         assert attention_pad_to_length == 16
@@ -323,6 +324,7 @@ def test_qwen35_ragged_cached_batch_matches_independent_serial_forwards():
             request_states,
             hidden_tap_layers=hidden_tap_layers,
             attention_pad_to_length=attention_pad_to_length,
+            state_update_logs=state_update_logs,
         )
 
     model.model.forward_cached_batch_step = tracked_batch_step
@@ -452,7 +454,12 @@ def test_qwen35_spec_verifier_records_transaction_and_commits_accepted_prefix():
     seq.rollback(tx)
 
 
-def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
+@pytest.mark.parametrize("accepted_lengths", [(2, 1), (3, 2), (3, 1), (0, 1)])
+@pytest.mark.parametrize("reuse_verified_cache", [True, False])
+@pytest.mark.parametrize("replay_state_updates", [True, False])
+def test_qwen35_spec_verifier_isolates_two_request_cache_transactions(
+    accepted_lengths, reuse_verified_cache, replay_state_updates, monkeypatch,
+):
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
     cache = HybridCacheManager()
@@ -472,7 +479,11 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
     runner.hybrid_cache_manager = cache
     runner.is_qwen35_target = True
     runner.rank = 0
-    runner.config = {"capture_verification_hidden_taps": True}
+    runner.config = {
+        "capture_verification_hidden_taps": True,
+        "qwen35_reuse_verified_cache": reuse_verified_cache,
+        "qwen35_replay_state_updates": replay_state_updates,
+    }
     runner.sampler = lambda logits, _temperature: logits.argmax(dim=-1)
     runner._pending_verified_cache_transactions = {}
 
@@ -523,10 +534,42 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
 
     results = runner.verify(batch)
     assert runner.get_qwen35_verification_stats()["calls"] == 2
-    runner.commit_verified_cache({seq0.seq_id: 2, seq1.seq_id: 1})
+    with monkeypatch.context() as failure_patch:
+        def fail_replay(*args):
+            raise RuntimeError("injected commit failure")
+
+        failure_patch.setattr(runner, "_replay_qwen35_accepted_prefixes", fail_replay)
+        with pytest.raises(RuntimeError, match="injected commit failure"):
+            runner.commit_verified_cache(
+                {seq0.seq_id: accepted_lengths[0], seq1.seq_id: accepted_lengths[1]}
+            )
+    for request_id in prefixes:
+        assert_cache_state_equal(cache.get_request_state(request_id), before[request_id])
+    runner.verify(batch)
+    replay_calls = []
+    original_forward = model.forward_with_cache_batch
+
+    def record_replay(*args, **kwargs):
+        replay_calls.append(tuple(args[3]))
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_with_cache_batch", record_replay)
+    runner.commit_verified_cache(
+        {seq0.seq_id: accepted_lengths[0], seq1.seq_id: accepted_lengths[1]}
+    )
+    expected_replay = tuple(
+        request_id
+        for request_id, accepted, verified in zip(
+            ("req0", "req1"), accepted_lengths, (3, 2)
+        )
+        if accepted > 0 and (accepted < verified or not reuse_verified_cache)
+        and not replay_state_updates
+    )
+    assert replay_calls == ([expected_replay] if expected_replay else [])
+    assert not runner._pending_verified_cache_transactions
     expected_prefixes = {
-        "req0": [1, 2, 3, 4, 5],
-        "req1": [10, 11, 12, 13],
+        "req0": [1, 2, 3, 4, 5, 6][:3 + accepted_lengths[0]],
+        "req1": [10, 11, 12, 13, 14][:3 + accepted_lengths[1]],
     }
     for request_id, expected_prefix in expected_prefixes.items():
         replay_cache = HybridCacheManager()
@@ -540,6 +583,87 @@ def test_qwen35_spec_verifier_isolates_two_request_cache_transactions():
 
     seq0.rollback(tx0)
     seq1.rollback(tx1)
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("micro_batch", [1, 4])
+def test_rank_one_restore_matches_verified_prefix_exactly(
+    accepted, prefill, dtype, micro_batch, monkeypatch,
+):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    model.to(dtype=dtype)
+    cache = HybridCacheManager()
+    ids = ["r0", "r1"]
+    if prefill:
+        for rid in ids:
+            model.forward_with_cache(torch.tensor([1, 2, 3]), cache, rid)
+    transactions = {
+        rid: cache.begin_transaction([rid], {rid: length})
+        for rid, length in zip(ids, [3, 2])
+    }
+    reference_states = {
+        (rid, 0): cache.ensure_request(rid).clone() for rid in ids
+    }
+    record_step = cache.record_step
+
+    def capture_step(tx, rid, tokens_executed):
+        record_step(tx, rid, tokens_executed)
+        reference_states[rid, tokens_executed] = cache.ensure_request(rid).clone()
+
+    monkeypatch.setattr(cache, "record_step", capture_step)
+    model.forward_with_cache_batch(
+        torch.tensor([[4, 5, 6], [7, 8, 0]]), [3, 2], cache, ids,
+        transactions=transactions, record_linear_updates=True,
+        attention_pad_to_length=16, batch_pad_to_size=micro_batch,
+    )
+    stats = cache.estimate_bytes()
+    assert stats["transaction_linear_update_bytes"] > 0
+    assert stats["transaction_snapshot_state_bytes"] == 0
+    if accepted:
+        saved = transactions["r0"].linear_updates["r0"].pop(0)
+        before_fallback = cache.ensure_request("r0").clone()
+        assert not cache.restore_verified_prefix(transactions["r0"], "r0", accepted)
+        assert_cache_state_equal(cache.ensure_request("r0"), before_fallback)
+        transactions["r0"].linear_updates["r0"][0] = saved
+    expected_cache = HybridCacheManager()
+    for rid, length in zip(ids, [3, 2]):
+        count = min(accepted, length)
+        assert cache.restore_verified_prefix(transactions[rid], rid, count)
+        actual = cache.ensure_request(rid)
+        expected = reference_states[rid, count]
+        assert actual.logical_length == expected.logical_length
+        assert actual.linear_layers.keys() == expected.linear_layers.keys()
+        for layer_id, state in actual.linear_layers.items():
+            torch.testing.assert_close(
+                state.recurrent_state, expected.linear_layers[layer_id].recurrent_state,
+                rtol=0, atol=0,
+            )
+            torch.testing.assert_close(
+                state.conv_state, expected.linear_layers[layer_id].conv_state,
+                rtol=0, atol=0,
+            )
+        for layer_id, state in actual.full_attention_layers.items():
+            for value, wanted in zip(state, expected.full_attention_layers[layer_id]):
+                torch.testing.assert_close(value, wanted, rtol=0, atol=0)
+        reference = expected_cache.ensure_request(rid)
+        reference.logical_length = expected.logical_length
+        reference.linear_layers = expected.linear_layers
+        reference.full_attention_layers = expected.full_attention_layers
+        cache.finalize_replayed_commit(transactions[rid], {rid: count})
+    assert cache.estimate_bytes()["transaction_linear_update_bytes"] == 0
+    actual_outputs = model.forward_with_cache_batch(
+        torch.tensor([[9], [10]]), [1, 1], cache, ids,
+        attention_pad_to_length=16, batch_pad_to_size=micro_batch,
+    )
+    expected_outputs = model.forward_with_cache_batch(
+        torch.tensor([[9], [10]]), [1, 1], expected_cache, ids,
+        attention_pad_to_length=16, batch_pad_to_size=micro_batch,
+    )
+    for actual, expected in zip(actual_outputs, expected_outputs):
+        torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
 
 
 def test_qwen35_verified_commit_replays_accepted_prefixes_as_one_batch():
@@ -581,7 +705,7 @@ def test_qwen35_verified_commit_replays_accepted_prefixes_as_one_batch():
     runner = ModelRunner.__new__(ModelRunner)
     runner.model = model
     runner.hybrid_cache_manager = cache
-    runner.config = {}
+    runner.config = {"qwen35_replay_state_updates": False}
     runner._pending_verified_cache_transactions = {
         101: (
             tx0,
