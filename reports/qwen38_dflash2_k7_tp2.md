@@ -888,3 +888,18 @@ verify 30.44 秒。与旧 target-only C2 基线相比，仅 3/8 请求
 输出保持相同，证明这会改变原有 greedy 数值路径，却没有形成
 吞吐收益。因此实验核不纳入阶段三代码检查点；保留原始日志、
 源码 patch 和结果供后续分析。
+
+### C8 micro-batch 8 对照
+
+`qwen38_k7_c8_parallel_b8_microbatch_probe_20260928` 使用与上方
+C8 micro-batch 4 相同的源码树 SHA256，仅把固定 target
+micro-batch 由 4 改为 8。单轮配对运行的原始 JSONL 独立比对
+为 **32/32 请求、2048/2048 token 一致**。target-only 为
+6.2827 tok/s、325.98 秒，DFlash2 为 5.5366 tok/s、
+369.90 秒，吞吐比 **0.8812**；DFlash2 接受 1466/3573，
+verify 60.40 秒，峰值 57.665 GiB。micro-batch 8 相对
+micro-batch 4 提高了两种模式的绝对吞吐，但 target-only 提高
+更多，投机解码的相对收益下降。两次 batch 形状不同，BF16
+输出及接受数也不同；每次都必须与同轮的 target-only 做公平
+逐 token 对照。单次结果不证明稳定性，也不能用扩批替代
+对昂贵逐 token 投影的优化。
