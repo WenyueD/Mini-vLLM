@@ -147,6 +147,22 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Stop verifying each request after its first draft mismatch.",
     )
+    parser.add_argument(
+        "--parallel-target-verification", action="store_true",
+        help="Verify the K+1 token block in one causal target forward.",
+    )
+    parser.add_argument(
+        "--parallel-batched-mlp", action="store_true",
+        help="Experimentally batch B=2 Qwen MLP gate/up projections.",
+    )
+    parser.add_argument(
+        "--parallel-batched-safe-linears", action="store_true",
+        help="Experimentally batch A800-observed B=2 projection shapes.",
+    )
+    parser.add_argument(
+        "--parallel-verification-chunk-size", type=int, default=0,
+        help="Verify causal blocks in chunks and skip suffix chunks after rejection.",
+    )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
         "--ignore-eos", dest="ignore_eos", action="store_true", default=True
@@ -355,6 +371,18 @@ def build_config(
             "qwen35_replay_state_updates": getattr(args, "replay_state_updates", True),
             "qwen35_stop_verification_at_mismatch": getattr(
                 args, "stop_verification_at_mismatch", False
+            ),
+            "qwen35_parallel_verification": getattr(
+                args, "parallel_target_verification", False
+            ),
+            "qwen35_parallel_batched_mlp": getattr(
+                args, "parallel_batched_mlp", False
+            ),
+            "qwen35_parallel_batched_safe_linears": getattr(
+                args, "parallel_batched_safe_linears", False
+            ),
+            "qwen35_parallel_verification_chunk_size": getattr(
+                args, "parallel_verification_chunk_size", 0
             ),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -1282,6 +1310,9 @@ def run_variant(
                 "replay_state_updates": getattr(args, "replay_state_updates", True),
                 "stop_verification_at_mismatch": getattr(
                     args, "stop_verification_at_mismatch", False
+                ),
+                "parallel_target_verification": getattr(
+                    args, "parallel_target_verification", False
                 ),
                 "soak": args.soak,
                 "soak_requests": args.soak_requests if args.soak else None,

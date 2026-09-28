@@ -64,6 +64,7 @@ class PendingQwen35Verification:
     target_token_ids: tuple[int, ...]
     start_position: int
     query_tokens: tuple[int, ...]
+    executed_tokens: int = 0
 
 
 class ModelRunner:
@@ -145,6 +146,12 @@ class ModelRunner:
                     self.model = Qwen35ForCausalLM(qwen35_text_config)
             else:
                 self.model = Qwen35ForCausalLM(qwen35_text_config)
+            self.model.enable_experimental_batched_linears(
+                mlp=bool(config.get("qwen35_parallel_batched_mlp", False)),
+                safe_shapes=bool(config.get(
+                    "qwen35_parallel_batched_safe_linears", False
+                )),
+            )
             self.config["num_layers"] = qwen35_text_config.num_hidden_layers
             self.config["num_kv_heads"] = qwen35_text_config.num_key_value_heads
             self.config["head_dim"] = qwen35_text_config.head_dim
@@ -1545,7 +1552,10 @@ class ModelRunner:
                     dtype=torch.long,
                     device=device,
                 )
-            stop_at_mismatch = bool(
+            parallel_verification = bool(
+                self.config.get("qwen35_parallel_verification", False)
+            )
+            stop_at_mismatch = not parallel_verification and bool(
                 self.config.get("qwen35_stop_verification_at_mismatch", False)
             )
             sampled_by_request = {
@@ -1578,11 +1588,7 @@ class ModelRunner:
                     )
                 return keep
 
-            outputs = self.model.forward_with_cache_batch(
-                input_ids,
-                query_lengths,
-                self.hybrid_cache_manager,
-                [seq.request_id for seq in batch.sequences],
+            common_forward_kwargs = dict(
                 transactions=transactions,
                 record_linear_updates=self.config.get("qwen35_replay_state_updates", True),
                 capture_hidden_taps=bool(
@@ -1593,8 +1599,116 @@ class ModelRunner:
                     "qwen35_cached_attention_pad_to_length"
                 ),
                 batch_pad_to_size=self.config.get("qwen35_cached_batch_pad_to_size"),
-                **({"continue_after_step": continue_after_step} if stop_at_mismatch else {}),
             )
+            parallel_chunk_size = int(
+                self.config.get("qwen35_parallel_verification_chunk_size", 0) or 0
+            )
+            parallel_model_calls = None
+            if parallel_verification and parallel_chunk_size > 0:
+                parts = [[] for _ in batch.sequences]
+                reported_lengths = [None for _ in batch.sequences]
+                actual_lengths = [0 for _ in batch.sequences]
+                active_rows = list(range(len(batch.sequences)))
+                parallel_model_calls = 0
+                for chunk_start in range(0, max(query_lengths), parallel_chunk_size):
+                    active_rows = [
+                        row for row in active_rows if query_lengths[row] > chunk_start
+                    ]
+                    if not active_rows:
+                        break
+                    active_indices = torch.tensor(active_rows, device=device)
+                    chunk_ids = input_ids.index_select(0, active_indices)[
+                        :, chunk_start : chunk_start + parallel_chunk_size
+                    ]
+                    chunk_lengths = [
+                        min(parallel_chunk_size, query_lengths[row] - chunk_start)
+                        for row in active_rows
+                    ]
+                    chunk_outputs = self.model.forward_with_cache_parallel_batch(
+                        chunk_ids,
+                        chunk_lengths,
+                        self.hybrid_cache_manager,
+                        [batch.sequences[row].request_id for row in active_rows],
+                        logit_batch_size=min(
+                            len(batch.sequences),
+                            common_forward_kwargs["batch_pad_to_size"]
+                            or len(batch.sequences),
+                        ),
+                        **common_forward_kwargs,
+                    )
+                    micro_batch_size = (
+                        common_forward_kwargs["batch_pad_to_size"]
+                        or len(active_rows)
+                    )
+                    parallel_model_calls += sum(
+                        len(set(chunk_lengths[start:start + micro_batch_size]))
+                        for start in range(0, len(chunk_lengths), micro_batch_size)
+                    )
+                    continuing_rows = []
+                    for row, chunk_output in zip(active_rows, chunk_outputs):
+                        parts[row].append(chunk_output)
+                        actual_lengths[row] += chunk_output.logits.shape[1]
+                        tokens = self._sample_qwen35_logits(
+                            chunk_output.logits.reshape(
+                                -1, chunk_output.logits.shape[-1]
+                            ),
+                            torch.zeros(
+                                chunk_output.logits.shape[1],
+                                dtype=torch.float32,
+                                device=chunk_output.logits.device,
+                            ),
+                            hidden_states=chunk_output.hidden_states.reshape(
+                                -1, chunk_output.hidden_states.shape[-1]
+                            ),
+                        ).detach().cpu().tolist()
+                        proposal = batch.proposals[row].token_ids
+                        first_rejection = next((
+                            position for position, token in enumerate(
+                                tokens, chunk_start
+                            )
+                            if position < len(proposal)
+                            and int(token) != proposal[position]
+                        ), None)
+                        if first_rejection is not None:
+                            reported_lengths[row] = first_rejection + 1
+                        else:
+                            continuing_rows.append(row)
+                    active_rows = continuing_rows
+                outputs = []
+                for row, request_parts in enumerate(parts):
+                    if not request_parts:
+                        raise RuntimeError("chunked verifier omitted a request")
+                    output_class = type(request_parts[0])
+                    reported_length = reported_lengths[row] or actual_lengths[row]
+                    outputs.append(output_class(
+                        logits=torch.cat(
+                            [part.logits for part in request_parts], dim=1
+                        )[:, :reported_length],
+                        hidden_states=torch.cat(
+                            [part.hidden_states for part in request_parts], dim=1
+                        )[:, :reported_length],
+                        hidden_taps={
+                            layer_id: torch.cat(
+                                [part.hidden_taps[layer_id] for part in request_parts],
+                                dim=1,
+                            )[:, :reported_length]
+                            for layer_id in request_parts[0].hidden_taps
+                        },
+                        cache_transaction_id=request_parts[0].cache_transaction_id,
+                    ))
+            else:
+                forward_fn = (
+                    self.model.forward_with_cache_parallel_batch
+                    if parallel_verification else self.model.forward_with_cache_batch
+                )
+                outputs = forward_fn(
+                    input_ids,
+                    query_lengths,
+                    self.hybrid_cache_manager,
+                    [seq.request_id for seq in batch.sequences],
+                    **common_forward_kwargs,
+                    **({"continue_after_step": continue_after_step} if stop_at_mismatch else {}),
+                )
             if self.rank != 0:
                 raise RuntimeError("Qwen3.5/Qwen3.8 cached verifier requires rank 0")
             if len(outputs) != len(batch.sequences):
@@ -1639,9 +1753,9 @@ class ModelRunner:
                 flat_token_ids = flat_token_ids_tensor.detach().cpu().tolist()
             results = []
             offset = 0
-            for seq, query_tokens, output in zip(
+            for row, (seq, query_tokens, output) in enumerate(zip(
                 batch.sequences, query_tokens_by_request, outputs
-            ):
+            )):
                 executed = output.logits.shape[1]
                 for query_offset, input_token_id in enumerate(query_tokens[:executed]):
                     self._record_target_decision(
@@ -1673,6 +1787,11 @@ class ModelRunner:
                             transaction.original_states[seq.request_id].logical_length
                         ),
                         query_tokens=tuple(query_tokens[:executed]),
+                        executed_tokens=(
+                            actual_lengths[row]
+                            if parallel_verification and parallel_chunk_size > 0
+                            else executed
+                        ),
                     )
                 )
                 results.append(
@@ -1690,11 +1809,15 @@ class ModelRunner:
                     )
                 )
             executed_lengths = [output.logits.shape[1] for output in outputs]
+            if parallel_verification and parallel_chunk_size > 0:
+                executed_lengths = actual_lengths
             self._record_qwen35_verification_batch(
                 executed_lengths,
                 planned_lengths=query_lengths,
                 proposal_tokens=[proposal.token_ids for proposal in batch.proposals],
                 target_tokens=[result.target_token_ids for result in results],
+                parallel_verification=parallel_verification,
+                parallel_model_calls=parallel_model_calls,
             )
             self._record_memory_stage(
                 "verify",
@@ -1719,6 +1842,8 @@ class ModelRunner:
         planned_lengths: list[int] | None = None,
         proposal_tokens: list[tuple[int, ...]] | None = None,
         target_tokens: list[tuple[int, ...]] | None = None,
+        parallel_verification: bool = False,
+        parallel_model_calls: int | None = None,
     ) -> None:
         stats = getattr(self, "_qwen35_verification_stats", None)
         if stats is None:
@@ -1764,10 +1889,19 @@ class ModelRunner:
         stats["avoided_request_token_steps"] += (
             sum(planned_lengths) - sum(query_lengths)
         )
-        stats["executed_model_steps"] += model_steps(query_lengths)
-        stats["avoided_model_steps"] += (
-            model_steps(planned_lengths) - model_steps(query_lengths)
-        )
+        if parallel_verification:
+            stats["executed_model_steps"] += (
+                parallel_model_calls if parallel_model_calls is not None else sum(
+                    len(set(query_lengths[start:start + micro_batch_size]))
+                    for start in range(0, len(query_lengths), micro_batch_size)
+                )
+            )
+            stats["avoided_model_steps"] += 0
+        else:
+            stats["executed_model_steps"] += model_steps(query_lengths)
+            stats["avoided_model_steps"] += (
+                model_steps(planned_lengths) - model_steps(query_lengths)
+            )
         if proposal_tokens is not None and target_tokens is not None:
             histogram = stats["first_rejection_position_histogram"]
             for proposal, tokens in zip(proposal_tokens, target_tokens):
@@ -1824,6 +1958,7 @@ class ModelRunner:
                 target_token_ids=tuple(target_token_ids),
                 start_position=int(start_position),
                 query_tokens=tuple(query_tokens),
+                executed_tokens=len(query_tokens),
             )
         if len(entry) == 5:
             transaction, request_id, output, target_token_ids, start_position = entry
@@ -1917,6 +2052,7 @@ class ModelRunner:
                 if not (
                     plan.query_tokens
                     and accepted_length == len(plan.query_tokens)
+                    and accepted_length == plan.executed_tokens
                     and self.config.get("qwen35_reuse_verified_cache", True)
                 )
             ]

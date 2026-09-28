@@ -405,6 +405,54 @@ def test_qwen35_cached_batch_chunks_above_fixed_padding_size():
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen35_parallel_cached_block_matches_causal_serial_prefix(dtype):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    model.to(dtype=dtype)
+    serial_cache = HybridCacheManager()
+    parallel_cache = HybridCacheManager()
+    prefixes = {"a": [1, 2, 3], "b": [8, 9, 10, 11]}
+    for request_id, prefix in prefixes.items():
+        tokens = torch.tensor(prefix)
+        model.forward_with_cache(tokens, serial_cache, request_id)
+        model.forward_with_cache(tokens, parallel_cache, request_id)
+    query = torch.tensor([[4, 5, 6], [12, 13, 0]])
+    reference = model.forward_with_cache_batch(
+        query, [3, 2], serial_cache, list(prefixes),
+        attention_pad_to_length=16, batch_pad_to_size=4,
+    )
+    transactions = {
+        rid: parallel_cache.begin_transaction([rid], {rid: length})
+        for rid, length in zip(prefixes, [3, 2])
+    }
+    actual = model.forward_with_cache_parallel_batch(
+        query, [3, 2], parallel_cache, list(prefixes),
+        transactions=transactions, record_linear_updates=True,
+        capture_hidden_taps=True, hidden_tap_layers=(0, 3),
+        attention_pad_to_length=16, batch_pad_to_size=4,
+    )
+    tolerance = 0.03 if dtype == torch.bfloat16 else 1e-5
+    for request_id, expected, output, length in zip(
+        prefixes, reference, actual, [3, 2]
+    ):
+        torch.testing.assert_close(
+            output.logits, expected.logits, atol=tolerance, rtol=tolerance,
+        )
+        assert torch.equal(
+            greedy_token_ids(output.logits), greedy_token_ids(expected.logits)
+        )
+        assert all(value.shape[1] == length for value in output.hidden_taps.values())
+        assert all(
+            len(updates) == length
+            for updates in transactions[request_id].linear_updates[request_id].values()
+        )
+        assert_cache_state_equal(
+            parallel_cache.get_request_state(request_id),
+            serial_cache.get_request_state(request_id),
+        )
+
+
 def test_qwen35_spec_verifier_records_transaction_and_commits_accepted_prefix():
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
@@ -610,7 +658,8 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         draft[accepted] = (draft[accepted] + 1) % 32
 
     runs = []
-    for stop_early in (False, True):
+    for mode in ("full", "early", "parallel", "chunked"):
+        stop_early = mode == "early"
         cache = HybridCacheManager()
         model.forward_with_cache(torch.tensor([1, 2, 3]), cache, "request")
         runner = ModelRunner.__new__(ModelRunner)
@@ -622,6 +671,8 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
             "capture_verification_hidden_taps": True,
             "qwen35_replay_state_updates": True,
             "qwen35_stop_verification_at_mismatch": stop_early,
+            "qwen35_parallel_verification": mode in {"parallel", "chunked"},
+            "qwen35_parallel_verification_chunk_size": 4 if mode == "chunked" else 0,
             "qwen35_cached_batch_pad_to_size": 4,
             "qwen35_cached_attention_pad_to_length": 32,
         }
@@ -637,11 +688,18 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         proposal = Proposal(seq.seq_id, tuple(draft))
         result = runner.verify(SpecDecodeBatch([seq], [proposal]))[0]
         sample = RejectionSampler().sample(proposal, result)
-        expected_steps = accepted + 1 if stop_early else 8
-        assert result.metadata["verified_tokens"] == expected_steps
+        expected_steps = (
+            accepted + 1 if stop_early else
+            4 if mode == "chunked" and accepted < 4 else 8
+        )
+        reported_steps = (
+            accepted + 1 if mode == "chunked" and accepted < 7
+            else expected_steps
+        )
+        assert result.metadata["verified_tokens"] == reported_steps
         plan = runner._pending_verified_cache_transactions[seq.seq_id]
-        assert len(plan.query_tokens) == expected_steps
-        assert all(tap.shape[1] == expected_steps for tap in plan.hidden_taps.values())
+        assert len(plan.query_tokens) == reported_steps
+        assert all(tap.shape[1] == reported_steps for tap in plan.hidden_taps.values())
         assert all(
             len(updates) == expected_steps
             for updates in plan.transaction.linear_updates["request"].values()
@@ -652,20 +710,27 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         stats = runner.get_qwen35_verification_stats()
         assert stats["executed_request_token_steps"] == expected_steps
         assert stats["avoided_request_token_steps"] == 8 - expected_steps
-        assert stats["executed_model_steps"] == expected_steps
-        assert stats["avoided_model_steps"] == 8 - expected_steps
+        assert stats["executed_model_steps"] == (
+            1 if mode == "parallel" else
+            (1 if accepted < 4 else 2) if mode == "chunked" else
+            expected_steps
+        )
+        assert stats["avoided_model_steps"] == (
+            0 if mode in {"parallel", "chunked"} else 8 - expected_steps
+        )
         histogram_key = "all_accepted" if accepted == 7 else str(accepted)
         assert stats["first_rejection_position_histogram"] == {histogram_key: 1}
         runs.append((cache, sample))
 
-    assert runs[0][1].emitted_token_ids == runs[1][1].emitted_token_ids
-    assert runs[0][1].accepted_proposal_tokens == runs[1][1].accepted_proposal_tokens
-    assert runs[0][1].per_position_acceptance == runs[1][1].per_position_acceptance
-    assert runs[0][1].used_bonus_token == runs[1][1].used_bonus_token
-    assert_cache_state_equal(
-        runs[0][0].get_request_state("request"),
-        runs[1][0].get_request_state("request"),
-    )
+    for cache, sample in runs[1:]:
+        assert runs[0][1].emitted_token_ids == sample.emitted_token_ids
+        assert runs[0][1].accepted_proposal_tokens == sample.accepted_proposal_tokens
+        assert runs[0][1].per_position_acceptance == sample.per_position_acceptance
+        assert runs[0][1].used_bonus_token == sample.used_bonus_token
+        assert_cache_state_equal(
+            runs[0][0].get_request_state("request"),
+            cache.get_request_state("request"),
+        )
     with torch.inference_mode():
         next_outputs = [
             model.forward_with_cache_batch(
@@ -674,7 +739,8 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
             )[0].logits
             for cache, _sample in runs
         ]
-    torch.testing.assert_close(next_outputs[0], next_outputs[1], rtol=0, atol=0)
+    for output in next_outputs[1:]:
+        torch.testing.assert_close(next_outputs[0], output, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -703,7 +769,8 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
     caches = []
     samples = []
     logit_row_counts = []
-    for stop_early in (False, True):
+    for mode in ("full", "early", "chunked"):
+        stop_early = mode == "early"
         cache = HybridCacheManager()
         for request_id, prefix in (("a", [1, 2, 3]), ("b", [5, 6, 7])):
             model.forward_with_cache(torch.tensor(prefix), cache, request_id)
@@ -715,6 +782,8 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
         runner.config = {
             "capture_verification_hidden_taps": True,
             "qwen35_stop_verification_at_mismatch": stop_early,
+            "qwen35_parallel_verification": mode == "chunked",
+            "qwen35_parallel_verification_chunk_size": 4 if mode == "chunked" else 0,
             "qwen35_replay_state_updates": True,
             "qwen35_cached_batch_pad_to_size": 4,
             "qwen35_cached_attention_pad_to_length": 32,
@@ -745,7 +814,7 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
             model.compute_logits = original_compute_logits
         logit_row_counts.append(rows_this_run)
         assert [result.metadata["verified_tokens"] for result in results] == (
-            [1, 3] if stop_early else [8, 3]
+            [1, 3] if mode in {"early", "chunked"} else [8, 3]
         )
         sampled = [
             RejectionSampler().sample(proposal, result)
@@ -756,18 +825,21 @@ def test_qwen35_early_stop_ragged_batch_preserves_other_request(dtype):
                                       sequences[1].seq_id: 3})
         caches.append(cache)
         samples.append(sampled)
-    for baseline, early in zip(*samples):
-        assert baseline.emitted_token_ids == early.emitted_token_ids
-        assert baseline.per_position_acceptance == early.per_position_acceptance
+    for candidate_samples in samples[1:]:
+        for baseline, candidate in zip(samples[0], candidate_samples):
+            assert baseline.emitted_token_ids == candidate.emitted_token_ids
+            assert baseline.per_position_acceptance == candidate.per_position_acceptance
     assert logit_row_counts[1] == logit_row_counts[0][:len(logit_row_counts[1])]
-    for request_id in ("a", "b"):
-        assert_cache_state_equal(
-            caches[0].get_request_state(request_id),
-            caches[1].get_request_state(request_id),
-        )
+    for candidate_cache in caches[1:]:
+        for request_id in ("a", "b"):
+            assert_cache_state_equal(
+                caches[0].get_request_state(request_id),
+                candidate_cache.get_request_state(request_id),
+            )
 
 
-def test_qwen35_early_stop_sampling_error_rolls_back_cache():
+@pytest.mark.parametrize("mode", ["early", "chunked"])
+def test_qwen35_early_stop_sampling_error_rolls_back_cache(mode):
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
     cache = HybridCacheManager()
@@ -780,7 +852,9 @@ def test_qwen35_early_stop_sampling_error_rolls_back_cache():
     runner.rank = 0
     runner.config = {
         "capture_verification_hidden_taps": True,
-        "qwen35_stop_verification_at_mismatch": True,
+        "qwen35_stop_verification_at_mismatch": mode == "early",
+        "qwen35_parallel_verification": mode == "chunked",
+        "qwen35_parallel_verification_chunk_size": 2 if mode == "chunked" else 0,
         "qwen35_replay_state_updates": True,
         "qwen35_cached_batch_pad_to_size": 4,
         "qwen35_cached_attention_pad_to_length": 32,
@@ -800,15 +874,17 @@ def test_qwen35_early_stop_sampling_error_rolls_back_cache():
     model.forward_with_cache(torch.tensor([1, 2, 3]), probe, "probe")
     first_output = model.forward_with_cache(torch.tensor([4]), probe, "probe")
     first_draft = int(greedy_token_ids(first_output.logits.reshape(1, -1)).item())
+    second_output = model.forward_with_cache(torch.tensor([first_draft]), probe, "probe")
+    second_draft = int(greedy_token_ids(second_output.logits.reshape(1, -1)).item())
     seq = Sequence(
         [1, 2, 3, 4], 4, SamplingParams(temperature=0, max_tokens=16),
         request_id="request",
     )
     seq.mark_computed(3)
-    transaction = seq.begin_speculation([first_draft, 5])
+    transaction = seq.begin_speculation([first_draft, second_draft])
     with pytest.raises(RuntimeError, match="injected sampling failure"):
         runner.verify(SpecDecodeBatch(
-            [seq], [Proposal(seq.seq_id, (first_draft, 5))]
+            [seq], [Proposal(seq.seq_id, (first_draft, second_draft))]
         ))
     assert calls == 2
     assert_cache_state_equal(cache.get_request_state("request"), before)

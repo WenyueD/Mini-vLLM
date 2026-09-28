@@ -748,3 +748,127 @@ C8 还需从 87.01 秒减少约 51.72 秒（约 59.5%）才能追平。
 吞吐收益**。下一步性能工作应减少目标模型逐位置前向次数或提高
 每次前向的有效请求数，并在相同形状下重新做严格逐 token 验证。
 TP2 尚未实现或验证，不能据此推断 C16/C32 表现。
+
+## 2026-09-28 官方整块验证机制与并行原型诊断
+
+核对官方 SGLang DFlash2 worker：候选 token 块在因果掩码下交给 target
+一次 forward 验证。Mini-vLLM 此前的 `forward_with_cache_batch` 则逐候选
+位置循环调用 target。该串行验证是本项目漏掉的关键实现，不是 A800
+显存不足：先前有效 C8 峰值约 57.03/79.25 GiB；框架需要补上
+Qwen3.8 hybrid KV/GDN 的多 token 缓存接口。
+
+新增默认关闭的 `qwen35_parallel_verification` 实验路径：full attention
+使用显式因果掩码，GDN 在整块输入中保持顺序递推并记录每个前缀的
+状态更新，事务按接受前缀提交。tiny-model 覆盖接受长度 0..7、异长
+请求、hidden taps 和提交后缓存；远端正式 tests 目录全量测试在
+首版原型为 **229 passed, 2 skipped**，修复 LM head 形状后的聚焦测试
+为 **10 passed**。这些测试无法替代真实 BF16 模型逐 token 对照。
+
+首轮 C2 原型 `qwen38_k7_c2_parallel_target_probe_20260928`：target-only
+5.3697 tok/s，并行 DFlash2 5.8264 tok/s；估计 target forward 次数
+257 对 77，DFlash2 verify 12.4157 秒，峰值 54.5898 GiB。但原始
+JSONL 为 **6/8 请求一致**，因此吞吐数据仅是失效原型的诊断观测。
+修复并行 LM head 以与串行逐位置保持相同行数后，第二轮
+`qwen38_k7_c2_parallel_headshape_probe_20260928` 为 5.3416 对
+5.6677 tok/s，估计 forward 257 对 79，verify 13.8237 秒，峰值
+54.5995 GiB，接受 382/810 与串行 C2 旧结果相同；独立读取
+原始 request JSONL 后仍有 **1/8 请求不一致**：`short-000003`
+输出索引 4 的 target-only 为 271，并行结果为 1622。这轮同样
+**不能计为有效加速**。两个运行的 manifest、源码 patch、原始 JSONL、
+fairness、memory trace 和结果均保留在远端同名 logs/results 目录。
+
+真实模型逐层对照显示，多 token 块在第 0 层已经有约 1e-3 的
+BF16 差异，后续层放大；`short-000003` 的输入 token 26 在末层
+隐藏状态最大差异达数十，导致 greedy 选择改变。单 token 对照的
+末层 hidden taps 完全相同，只有 LM head 的矩阵行数产生 0.0625
+的 logit 差异，已按原串行行数修复。将线性层、卷积和注意力乘法
+单独提高到 FP32 仍未稳定保持原 BF16 greedy；把整个验证段激活
+改为 FP32 能缩小串并行 logit 差异，但串行结果本身也发生改变
+（上述 token 位置从 271 变成 2574），不满足保持现有 target-only
+输出的要求。原型仍默认关闭，未形成可发布 checkpoint。
+
+下一步必须先解决跨计算形状的严格数值一致性，再做 C4/C8 的并行
+性能统计；目前没有证据声称官方整块验证路径已在 Mini-vLLM 中
+合格实现，也不能以单次、且不一致的 C2 吞吐作为加速结论。
+
+## 2026-09-28 严格一致的整块验证与分块优化
+
+继续追踪 BF16 数值差异后，确认归一化归约、线性层 GEMM、GDN
+卷积与注意力乘法都可能因 query 维度变动改变舍入。整块验证现保留
+一次 target 模型层遍历和因果缓存接口，但在敏感算子内部按单 token
+形状计算；真实 Qwen3.8 固定前缀的全部 logits 与原串行路径位级
+相同。C2 端到端 `qwen38_k7_c2_parallel_exactops_20260928` 的原始
+JSONL 独立对比 **8/8 请求、512/512 token 一致**，接受 382/810，
+峰值 54.5982 GiB。此路径解决了正确性，但许多权重 GEMM 仍逐
+token 执行，单次吞吐低于 target-only。
+
+在 A800 上逐形状比较 BF16 GEMM 后，增加默认关闭的 B=2 实验开关：
+部分 MLP、full-attention 和 GDN 投影可整块计算且在探针中位级
+一致；MLP down 的两 token 小块也位级一致。另增加 2/4 token
+分块验证：首次拒绝后跳过后续块，已执行的多余缓存用记录的紧凑
+GDN 更新恢复到接受前缀。tiny-model 覆盖接受长度 0..7、异长
+请求和采样异常回滚，正式测试 **230 passed、2 skipped**。
+
+下表均为单轮 C2 K7 成对观测。每轮原始 request JSONL 独立比较
+都是 **8/8 请求、512/512 token 完全一致**，接受均为 382/810；
+所有结果目录前缀为远端 `results/qwen38_dflash2_perf/`，原始 JSONL
+在同名 `logs/qwen38_dflash2_perf/` 下，manifest 保存各轮源码 hash、
+模型 snapshot 和配置。不同源码版本及单轮波动不能合并声称稳定收益。
+
+| 实验目录（省略日期后缀） | target-only TPS | DFlash2 TPS | DFlash/target | verify 秒 | DFlash 峰值 GiB |
+|---|---:|---:|---:|---:|---:|
+| `qwen38_k7_c2_parallel_exactops` | 5.1066 | 4.1586 | 0.8144 | 41.85 | 54.598 |
+| `qwen38_k7_c2_parallel_batchedmlp` | 5.1935 | 4.3404 | 0.8357 | 38.71 | 54.598 |
+| `qwen38_k7_c2_parallel_safe_linears` | 5.2498 | 4.5350 | 0.8638 | 34.98 | 54.598 |
+| `qwen38_k7_c2_parallel_chunk4_exact` | 5.1913 | 4.4670 | 0.8605 | 35.12 | 54.589 |
+| `qwen38_k7_c2_parallel_chunk4_safe` | 5.1885 | 4.7563 | 0.9167 | 29.97 | 54.589 |
+| `qwen38_k7_c2_parallel_chunk2_safe` | 5.2186 | 4.6380 | 0.8887 | 32.41 | 54.597 |
+
+4-token 分块执行 677 个请求验证位置，避免 255 个后缀位置；
+2-token 分块执行 554、避免 378，但额外块调用使单次耗时更长。
+4-token 分块加 B=2 精确投影是目前有效 C2 中吞吐最高的版本，
+仍比同轮 target-only 慢约 8.3%。Triton 批量 GEMM 的常规 tile
+设置未复现旧版单 token cuBLAS 结果，因此不能直接用来替换
+仍昂贵的 GDN qkv 和 MLP down 算子。
+
+当前分块与精确批量投影均为默认关闭的实验配置。以下 C4/C8
+结果更新了当时尚未完成的回归结论。
+
+## 2026-09-28 C4/C8 并行验证回归
+
+采用相同的 4-token 分块、micro-batch 4 和经过逐位探针筛选的
+B=4 安全合批投影。C4、C8 两次运行的 manifest 记录了相同的
+模型 snapshot、源码树 SHA256
+`f71091e487c01bf144c132fedbc1b9f2c7cf86786e04573d73dbbca78037a418`
+及源码 patch SHA256
+`311311bd7bdbfcf1282b4d70d3cda406881ac60c41b74cc271440ed278307797`。
+远端实验目录分别为
+`qwen38_k7_c4_parallel_b4_safe_20260928` 和
+`qwen38_k7_c8_parallel_b4_safe_20260928`，位于
+`results/qwen38_dflash2_perf/`；原始 JSONL 位于对应的
+`logs/qwen38_dflash2_perf/`，保留 manifest、fairness 和显存记录。
+独立按 request ID 比较原始 target-only/DFlash2 JSONL：C4 为
+**16/16 请求、1024/1024 token 一致**，C8 为
+**32/32 请求、2048/2048 token 一致**。远端全量测试
+**230 passed、2 skipped**，`git diff --check` 通过。
+
+| 并发 | target-only tok/s | DFlash2 tok/s | 比值 | 接受数/提议数 | verify 秒 | DFlash2 峰值 GiB |
+|---|---:|---:|---:|---:|---:|---:|
+| C4 | 5.5974 | 4.9012 | 0.8756 | 730/1860 | 42.27 | 55.604 |
+| C8 | 5.6483 | 5.3062 | 0.9394 | 1486/3455 | 67.76 | 57.054 |
+
+C4 的接受率为 39.25%，C8 为 43.01%。C8 的首次拒绝位置
+直方图为位置 0..6 分别 117、90、69、46、39、24、18，
+全接受 127；执行了 2788 个请求验证位置，避免了 1197 个
+原计划位置。分块 verifier 的模型步数为 252，不能把这个统计
+等同于 252 次完整 target 前向，也不能只据调用次数推断速度。
+
+C4 的配对总耗时为 182.94/208.93 秒，C8 为 362.58/385.96 秒
+（前者 target-only，后者 DFlash2）。假设其他耗时不变，C4 的
+verify 还需由 42.27 降至约 16.28 秒，C8 由 67.76 降至
+约 44.38 秒才能追平；这分别要求约 61.5% 和 34.5% 的下降。
+尽管整块接口解决了因果验证与 hybrid cache 提交的正确性，
+旧 target-only BF16 greedy 对矩阵行数敏感，当前仍有昂贵的
+逐 token 投影。C4/C8 都只有单轮，尚无稳定加速证据，也没有
+完成 TP2。下一步应优先降低这些投影的实际耗时，并以相同源码
+做至少三轮配对测试；不能用不一致的全合批原型充当收益。

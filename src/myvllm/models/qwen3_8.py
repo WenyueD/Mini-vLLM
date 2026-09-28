@@ -31,6 +31,49 @@ class Qwen35ForwardOutput:
     cache_transaction_id: int | None = None
 
 
+class Qwen35TokenwiseLinear(nn.Linear):
+    """Retain the BF16 cached-decode GEMM shape for each query position."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim == 3 and input.shape[1] > 1:
+            if getattr(self, "verified_batch_two", False) and input.shape[0] == 2:
+                return F.linear(input, self.weight, self.bias)
+            if (
+                getattr(self, "experimental_batch_four", False)
+                and input.shape[0] == 4
+                and input.shape[1] in (2, 4)
+            ):
+                return F.linear(input, self.weight, self.bias)
+            if getattr(self, "experimental_qkv_pair", False) and input.shape[0] == 4:
+                return torch.cat(
+                    [F.linear(input[:, index : index + 2].contiguous(), self.weight, self.bias)
+                     for index in range(0, input.shape[1], 2)],
+                    dim=1,
+                )
+            if getattr(self, "experimental_chunk_two", False) and input.shape[0] == 2:
+                return torch.cat(
+                    [F.linear(input[:, index : index + 2].contiguous(), self.weight, self.bias)
+                     for index in range(0, input.shape[1], 2)],
+                    dim=1,
+                )
+            return torch.cat(
+                [F.linear(input[:, index : index + 1].contiguous(), self.weight, self.bias)
+                 for index in range(input.shape[1])],
+                dim=1,
+            )
+        return F.linear(input, self.weight, self.bias)
+
+
+def _qwen35_tokenwise_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.ndim == 4 and left.shape[-2] > 1:
+        return torch.cat(
+            [torch.matmul(left[..., index : index + 1, :].contiguous(), right)
+             for index in range(left.shape[-2])],
+            dim=-2,
+        )
+    return torch.matmul(left, right)
+
+
 class Qwen35RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -42,6 +85,13 @@ class Qwen35RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim >= 3 and x.shape[1] > 1:
+            # Keep BF16 reductions on the cached one-token kernel shape.
+            return torch.cat(
+                [self.forward(x[:, index : index + 1].contiguous())
+                 for index in range(x.shape[1])],
+                dim=1,
+            )
         dtype = x.dtype
         return (self._norm(x) * (1.0 + self.weight.float())).to(dtype)
 
@@ -60,6 +110,12 @@ class Qwen35RMSNormGated(nn.Module):
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    if x.ndim >= 3 and x.shape[1] > 1:
+        return torch.cat(
+            [l2norm(x[:, index : index + 1].contiguous(), dim=dim, eps=eps)
+             for index in range(x.shape[1])],
+            dim=1,
+        )
     return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
 
@@ -125,13 +181,13 @@ class Qwen35RotaryEmbedding(nn.Module):
 class Qwen35MLP(nn.Module):
     def __init__(self, config: Qwen35TextConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(
+        self.gate_proj = Qwen35TokenwiseLinear(
             config.hidden_size, config.intermediate_size, bias=False
         )
-        self.up_proj = nn.Linear(
+        self.up_proj = Qwen35TokenwiseLinear(
             config.hidden_size, config.intermediate_size, bias=False
         )
-        self.down_proj = nn.Linear(
+        self.down_proj = Qwen35TokenwiseLinear(
             config.intermediate_size, config.hidden_size, bias=False
         )
 
@@ -149,22 +205,22 @@ class Qwen35Attention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.head_dim
         self.scaling = self.head_dim**-0.5
-        self.q_proj = nn.Linear(
+        self.q_proj = Qwen35TokenwiseLinear(
             config.hidden_size,
             config.num_attention_heads * config.head_dim * 2,
             bias=config.attention_bias,
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = Qwen35TokenwiseLinear(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attention_bias,
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = Qwen35TokenwiseLinear(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attention_bias,
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = Qwen35TokenwiseLinear(
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
@@ -254,10 +310,8 @@ class Qwen35Attention(nn.Module):
         attention_pad_to_length: int | None = None,
     ) -> torch.Tensor:
         batch_size, query_length, _ = hidden_states.shape
-        if query_length != 1:
-            raise ValueError(
-                "cached Qwen3.5 attention batch expects one token per request"
-            )
+        if query_length < 1:
+            raise ValueError("cached Qwen3.5 attention query must be nonempty")
         if len(request_states) != batch_size:
             raise ValueError("cached attention state count must match batch size")
         query_states, key_states, value_states, gate = self._project(
@@ -265,6 +319,7 @@ class Qwen35Attention(nn.Module):
         )
         cached_rows = []
         context_lengths = []
+        prefix_lengths = []
         for row, request_state in enumerate(request_states):
             previous = request_state.full_attention_layers.get(self.layer_idx)
             row_key = key_states[row : row + 1]
@@ -273,8 +328,10 @@ class Qwen35Attention(nn.Module):
                 if not isinstance(previous, FullAttentionLayerState):
                     previous = FullAttentionLayerState.from_tensors(*previous)
                     request_state.full_attention_layers[self.layer_idx] = previous
+                prefix_lengths.append(previous.logical_length)
                 row_key, row_value = previous.append(row_key, row_value)
             else:
+                prefix_lengths.append(0)
                 previous = FullAttentionLayerState.from_tensors(row_key, row_value)
                 request_state.full_attention_layers[self.layer_idx] = previous
             cached_rows.append((row_key, row_value))
@@ -317,14 +374,36 @@ class Qwen35Attention(nn.Module):
             padded_value = padded_value.repeat_interleave(
                 self.num_key_value_groups, dim=1
             )
-        scores = torch.matmul(query_states, padded_key.transpose(2, 3)) * self.scaling
+        scores = _qwen35_tokenwise_matmul(
+            query_states, padded_key.transpose(2, 3)
+        ) * self.scaling
+        allowed_positions = valid_positions[:, None, None, :]
+        if query_length > 1:
+            key_positions = torch.arange(max_context_length, device=scores.device)
+            query_positions = torch.arange(query_length, device=scores.device)
+            causal_limit = (
+                torch.tensor(prefix_lengths, device=scores.device)[:, None]
+                + query_positions[None, :] + 1
+            )
+            allowed_positions = allowed_positions & (
+                key_positions[None, None, None, :] < causal_limit[:, None, :, None]
+            )
         scores = scores.masked_fill(
-            ~valid_positions[:, None, None, :],
+            ~allowed_positions,
             -torch.inf,
         )
-        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(probs, padded_value).transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, 1, -1)
+        if query_length > 1:
+            probs = torch.cat(
+                [F.softmax(scores[..., index : index + 1, :], dim=-1, dtype=torch.float32)
+                 for index in range(query_length)],
+                dim=-2,
+            ).to(query_states.dtype)
+        else:
+            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = _qwen35_tokenwise_matmul(
+            probs, padded_value
+        ).transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, query_length, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
 
@@ -357,11 +436,11 @@ class Qwen35GatedDeltaNet(nn.Module):
             torch.empty(self.num_v_heads).uniform_(0.01, 16).log_()
         )
         self.norm = Qwen35RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.out_proj = Qwen35TokenwiseLinear(self.value_dim, self.hidden_size, bias=False)
+        self.in_proj_qkv = Qwen35TokenwiseLinear(self.hidden_size, self.conv_dim, bias=False)
+        self.in_proj_z = Qwen35TokenwiseLinear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = Qwen35TokenwiseLinear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = Qwen35TokenwiseLinear(self.hidden_size, self.num_v_heads, bias=False)
 
     def initial_state(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -387,22 +466,42 @@ class Qwen35GatedDeltaNet(nn.Module):
         self,
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        return_prefix_states: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None]:
         mixed_qkv = mixed_qkv.transpose(1, 2)
         original_len = mixed_qkv.shape[-1]
         if conv_state is not None:
             mixed_qkv = torch.cat([conv_state.to(mixed_qkv.dtype), mixed_qkv], dim=-1)
         elif self.conv_kernel_size > 1:
             mixed_qkv = F.pad(mixed_qkv, (self.conv_kernel_size - 1, 0))
-        conv_out = F.conv1d(
-            mixed_qkv,
-            self.conv1d.weight,
-            bias=self.conv1d.bias,
-            groups=self.conv_dim,
-        )
+        if original_len > 1:
+            conv_out = torch.cat(
+                [F.conv1d(
+                    mixed_qkv[..., index : index + self.conv_kernel_size].contiguous(),
+                    self.conv1d.weight,
+                    bias=self.conv1d.bias,
+                    groups=self.conv_dim,
+                ) for index in range(original_len)],
+                dim=-1,
+            )
+        else:
+            conv_out = F.conv1d(
+                mixed_qkv,
+                self.conv1d.weight,
+                bias=self.conv1d.bias,
+                groups=self.conv_dim,
+            )
         conv_out = F.silu(conv_out[..., -original_len:])
-        new_conv = mixed_qkv[..., -max(self.conv_kernel_size - 1, 0) :].detach().clone()
-        return conv_out.transpose(1, 2), new_conv
+        state_width = max(self.conv_kernel_size - 1, 0)
+        new_conv = mixed_qkv[..., -state_width:].detach().clone()
+        prefix_states = None
+        if return_prefix_states:
+            prefix_states = [
+                mixed_qkv[..., index + 1 : index + 1 + state_width].detach()
+                for index in range(original_len)
+            ]
+        return conv_out.transpose(1, 2), new_conv, prefix_states
 
     def forward(
         self,
@@ -413,14 +512,15 @@ class Qwen35GatedDeltaNet(nn.Module):
         state_updates: list[LinearStateUpdate] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
-        if state_updates is not None and seq_len != 1:
-            raise ValueError("state update recording requires a single cached token")
         if recurrent_state is None or conv_state is None:
             recurrent_state, conv_state = self.initial_state(
                 batch_size, hidden_states.device, hidden_states.dtype
             )
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        mixed_qkv, final_conv_state = self._causal_conv(mixed_qkv, conv_state)
+        mixed_qkv, final_conv_state, conv_prefix_states = self._causal_conv(
+            mixed_qkv, conv_state,
+            return_prefix_states=state_updates is not None,
+        )
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
@@ -450,7 +550,7 @@ class Qwen35GatedDeltaNet(nn.Module):
             if state_updates is not None:
                 state_updates.append(LinearStateUpdate(
                     decay_t.detach(), k_t.detach(), delta.detach(),
-                    final_conv_state.detach(),
+                    conv_prefix_states[idx].detach(),
                 ))
             state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             out_t = (state * query[:, idx].float().unsqueeze(-1)).sum(dim=-2)
@@ -459,10 +559,18 @@ class Qwen35GatedDeltaNet(nn.Module):
         z = self.in_proj_z(hidden_states).reshape(
             batch_size, seq_len, self.num_v_heads, self.head_v_dim
         )
-        core = self.norm(
-            core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
-        )
-        core = core.reshape(batch_size, seq_len, self.value_dim)
+        if seq_len > 1:
+            core = torch.cat([
+                self.norm(
+                    core[:, index].reshape(-1, self.head_v_dim),
+                    z[:, index].reshape(-1, self.head_v_dim),
+                ).reshape(batch_size, 1, self.value_dim)
+                for index in range(seq_len)
+            ], dim=1)
+        else:
+            core = self.norm(
+                core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
+            ).reshape(batch_size, seq_len, self.value_dim)
         output = self.out_proj(core)
         if return_final_state:
             return output, state.detach().clone(), final_conv_state
@@ -645,6 +753,89 @@ class Qwen35TextModel(nn.Module):
             request_state.logical_length += 1
         return self.norm(hidden_states), hidden_taps
 
+    def forward_cached_batch_chunk(
+        self,
+        input_ids: torch.Tensor,
+        request_states: list[HybridRequestState],
+        hidden_tap_layers: tuple[int, ...] | None = None,
+        attention_pad_to_length: int | None = None,
+        state_update_logs: list[dict[int, list[LinearStateUpdate]] | None] | None = None,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Verify a causal token block with one target-layer pass per layer."""
+        if input_ids.dim() != 2 or input_ids.shape[1] < 1:
+            raise ValueError("cached target chunk expects [batch, positive length]")
+        batch_size, query_length = input_ids.shape
+        if len(request_states) != batch_size:
+            raise ValueError("cached target state count must match batch")
+        if state_update_logs is not None and len(state_update_logs) != batch_size:
+            raise ValueError("cached target update log count must match batch")
+        start_positions = torch.tensor(
+            [state.logical_length for state in request_states],
+            dtype=torch.long, device=input_ids.device,
+        )
+        position_ids = start_positions[:, None] + torch.arange(
+            query_length, device=input_ids.device,
+        )[None, :]
+        hidden_states = self.embed_tokens(input_ids)
+        position_embeddings = self.rotary_emb(position_ids, hidden_states.dtype)
+        taps = set(hidden_tap_layers or ())
+        hidden_taps: dict[int, torch.Tensor] = {}
+        for layer_idx, layer in enumerate(self.layers):
+            residual = hidden_states
+            normed = layer.input_layernorm(hidden_states)
+            if layer.block_type == "linear_attention":
+                recurrent_rows = []
+                conv_rows = []
+                for request_state in request_states:
+                    previous = request_state.linear_layers.get(layer_idx)
+                    if previous is None:
+                        recurrent, conv = layer.linear_attn.initial_state(
+                            1, normed.device, normed.dtype,
+                        )
+                    else:
+                        recurrent, conv = previous.recurrent_state, previous.conv_state
+                    recurrent_rows.append(recurrent)
+                    conv_rows.append(conv)
+                updates = [] if state_update_logs is not None else None
+                attn_out, recurrent, conv = layer.linear_attn(
+                    normed,
+                    recurrent_state=torch.cat(recurrent_rows, dim=0),
+                    conv_state=torch.cat(conv_rows, dim=0),
+                    return_final_state=True,
+                    **({"state_updates": updates} if updates is not None else {}),
+                )
+                for row, request_state in enumerate(request_states):
+                    if state_update_logs is not None and state_update_logs[row] is not None:
+                        row_updates = state_update_logs[row].setdefault(layer_idx, [])
+                        for update in updates:
+                            row_updates.append(LinearStateUpdate(*(
+                                value[row : row + 1].clone()
+                                for value in (
+                                    update.decay, update.key,
+                                    update.delta, update.conv_state,
+                                )
+                            )))
+                    request_state.linear_layers[layer_idx] = LinearLayerState(
+                        recurrent[row : row + 1].detach().clone(),
+                        conv[row : row + 1].detach().clone(),
+                    )
+            else:
+                attn_out = layer.self_attn.forward_with_cache_batch(
+                    normed,
+                    position_embeddings,
+                    request_states,
+                    attention_pad_to_length=attention_pad_to_length,
+                )
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = residual + layer.mlp(hidden_states)
+            if layer_idx in taps:
+                hidden_taps[layer_idx] = hidden_states.detach().clone()
+        for request_state in request_states:
+            request_state.logical_length += query_length
+        return self.norm(hidden_states), hidden_taps
+
 
 class Qwen35ForCausalLM(nn.Module):
     def __init__(self, config: Qwen35TextConfig | Mapping):
@@ -656,6 +847,37 @@ class Qwen35ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def enable_experimental_batched_linears(
+        self, *, mlp: bool = False, safe_shapes: bool = False,
+    ) -> None:
+        """Try A800-observed B=2 GEMM shapes; guarded by end-to-end fairness."""
+        candidate_shapes = {
+            (5120, 5120), (5120, 17408), (5120, 6144),
+            (5120, 12288), (5120, 1024), (6144, 5120),
+        }
+        for module in self.model.modules():
+            if isinstance(module, Qwen35TokenwiseLinear):
+                module.verified_batch_two = bool(
+                    safe_shapes and (module.in_features, module.out_features)
+                    in candidate_shapes
+                )
+                module.experimental_batch_four = bool(
+                    safe_shapes and (module.in_features, module.out_features)
+                    in candidate_shapes
+                )
+                module.experimental_qkv_pair = bool(
+                    safe_shapes and (module.in_features, module.out_features)
+                    == (5120, 10240)
+                )
+                module.experimental_chunk_two = bool(
+                    safe_shapes and (module.in_features, module.out_features)
+                    == (17408, 5120)
+                )
+        if mlp:
+            for layer in self.model.layers:
+                layer.mlp.gate_proj.verified_batch_two = True
+                layer.mlp.up_proj.verified_batch_two = True
 
     @classmethod
     def from_config_dict(cls, config: Mapping) -> "Qwen35ForCausalLM":
@@ -949,4 +1171,122 @@ class Qwen35ForCausalLM(nn.Module):
                     ),
                 )
             )
+        return outputs
+
+    def forward_with_cache_parallel_batch(
+        self,
+        input_ids: torch.Tensor,
+        query_lengths: list[int] | tuple[int, ...],
+        cache_manager: HybridCacheManager,
+        request_ids: list[str] | tuple[str, ...],
+        *,
+        transactions: Mapping[str, HybridCacheTransaction] | None = None,
+        record_linear_updates: bool = False,
+        capture_hidden_taps: bool = False,
+        hidden_tap_layers: tuple[int, ...] = QWEN35_DEFAULT_HIDDEN_TAPS,
+        attention_pad_to_length: int | None = None,
+        batch_pad_to_size: int | None = None,
+        logit_batch_size: int | None = None,
+    ) -> list[Qwen35ForwardOutput]:
+        """Score all candidate positions in a causal block forward."""
+        reject_qwen35_multimodal_inputs()
+        if input_ids.dim() != 2 or len(request_ids) != input_ids.shape[0]:
+            raise ValueError("parallel cached target inputs must match requests")
+        if len(query_lengths) != input_ids.shape[0] or not query_lengths:
+            raise ValueError("parallel cached target requires nonempty lengths")
+        if any(length < 1 or length > input_ids.shape[1] for length in query_lengths):
+            raise ValueError("parallel cached target query length out of range")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("parallel cached target request IDs must be unique")
+        if record_linear_updates and transactions is None:
+            raise ValueError("state update recording requires cache transactions")
+        if transactions is not None and any(rid not in transactions for rid in request_ids):
+            raise ValueError("parallel cached target is missing a transaction")
+        micro_batch_size = batch_pad_to_size or len(request_ids)
+        if micro_batch_size < 1:
+            raise ValueError("parallel cached target batch size must be positive")
+        outputs: list[Qwen35ForwardOutput | None] = [None] * len(request_ids)
+        taps = hidden_tap_layers if capture_hidden_taps else ()
+        for start in range(0, len(request_ids), micro_batch_size):
+            end = min(start + micro_batch_size, len(request_ids))
+            # Final generation windows can be shorter than K+1. Keep each
+            # causal block rectangular without verifying beyond its reserve.
+            for query_length in sorted(set(query_lengths[start:end])):
+                rows = [
+                    row for row in range(start, end)
+                    if query_lengths[row] == query_length
+                ]
+                indices = torch.tensor(rows, device=input_ids.device)
+                block_ids = input_ids.index_select(0, indices)[:, :query_length]
+                request_states = [cache_manager.ensure_request(request_ids[row]) for row in rows]
+                executed_before = [
+                    0 if transactions is None else (
+                        request_states[block_row].logical_length
+                        - transactions[request_ids[row]].original_states[
+                            request_ids[row]
+                        ].logical_length
+                    )
+                    for block_row, row in enumerate(rows)
+                ]
+                update_logs = (
+                    [transactions[request_ids[row]].linear_updates[request_ids[row]]
+                     for row in rows]
+                    if record_linear_updates else None
+                )
+                padding_rows = micro_batch_size - len(rows)
+                if padding_rows:
+                    block_ids = torch.cat((
+                        block_ids,
+                        block_ids.new_zeros(padding_rows, query_length),
+                    ), dim=0)
+                    request_states.extend(
+                        HybridRequestState(request_id=("parallel-padding", start, row))
+                        for row in range(padding_rows)
+                    )
+                    if update_logs is not None:
+                        update_logs.extend([None] * padding_rows)
+                hidden, hidden_taps = self.model.forward_cached_batch_chunk(
+                    block_ids,
+                    request_states,
+                    hidden_tap_layers=taps,
+                    attention_pad_to_length=attention_pad_to_length,
+                    state_update_logs=update_logs,
+                )
+                # Match the serial verifier's LM-head GEMM shape. BF16 logits
+                # can change at ties if padded or token rows are flattened.
+                head_rows = min(
+                    micro_batch_size,
+                    len(rows) if logit_batch_size is None else logit_batch_size,
+                )
+                if head_rows < len(rows):
+                    raise ValueError("LM head rows cannot omit active requests")
+                logits = torch.stack(
+                    [
+                        self.compute_logits(hidden[:head_rows, token_index])
+                        for token_index in range(query_length)
+                    ],
+                    dim=1,
+                )
+                for block_row, row in enumerate(rows):
+                    request_id = request_ids[row]
+                    transaction = None if transactions is None else transactions[request_id]
+                    if transaction is not None:
+                        for executed in range(1, query_length + 1):
+                            cache_manager.record_step(
+                                transaction, request_id,
+                                executed_before[block_row] + executed,
+                            )
+                    outputs[row] = Qwen35ForwardOutput(
+                        logits=logits[block_row : block_row + 1],
+                        hidden_states=hidden[block_row : block_row + 1],
+                        hidden_taps={
+                            layer_id: value[block_row : block_row + 1]
+                            for layer_id, value in hidden_taps.items()
+                        },
+                        cache_transaction_id=(
+                            None if transaction is None else transaction.transaction_id
+                        ),
+                    )
+        if any(output is None for output in outputs):
+            raise RuntimeError("parallel cached target omitted a request")
         return outputs
