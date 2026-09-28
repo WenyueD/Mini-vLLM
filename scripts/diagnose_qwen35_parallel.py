@@ -29,8 +29,10 @@ def main() -> None:
     parser.add_argument("--full-fp32-activations", action="store_true")
     parser.add_argument("--serial-token-kernels", action="store_true")
     parser.add_argument("--trace-layer0", action="store_true")
+    parser.add_argument("--trace-layer", type=int, default=0)
     parser.add_argument("--batched-mlp", action="store_true")
     parser.add_argument("--batched-safe-linears", action="store_true")
+    parser.add_argument("--vectorized-target-numerics", action="store_true")
     args = parser.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -58,6 +60,8 @@ def main() -> None:
             serial_cache, "probe", return_logits=False,
         )
         parallel_cache._states["probe"] = serial_cache.get_request_state("probe").clone()
+        if args.vectorized_target_numerics:
+            model.set_experimental_vectorized_target(True)
         if args.fp32_linears or args.fp32_kernels or args.full_fp32_activations:
             native_linear = F.linear
 
@@ -137,7 +141,7 @@ def main() -> None:
         phase = ["serial"]
         handles = []
         if args.trace_layer0:
-            layer = model.model.layers[0]
+            layer = model.model.layers[args.trace_layer]
             modules = {
                 "input_norm": layer.input_layernorm,
                 "gdn_qkv": layer.linear_attn.in_proj_qkv,
@@ -185,7 +189,7 @@ def main() -> None:
                 else:
                     b = parallel_items[0][0, pos].float()
                 diff = (a - b).abs()
-                print(f"layer0 {name} position={pos} max={diff.max().item():.7f} mean={diff.mean().item():.7f}", flush=True)
+                print(f"layer{args.trace_layer} {name} position={pos} max={diff.max().item():.7f} mean={diff.mean().item():.7f}", flush=True)
     for pos, token in enumerate(args.query):
         s = serial.logits[0, pos].float()
         p = parallel.logits[0, pos].float()

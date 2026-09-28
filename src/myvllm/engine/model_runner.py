@@ -944,6 +944,8 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if getattr(self, "is_qwen35_target", False):
+            if getattr(self, "config", {}).get("qwen35_vectorized_target", False):
+                self.model.set_experimental_vectorized_target(not is_prefill)
             stage_name = "prefill" if is_prefill else "target_decode"
             self._record_memory_stage(
                 f"{stage_name}_start",
@@ -1512,6 +1514,8 @@ class ModelRunner:
     @torch.inference_mode()
     def _verify_qwen35_cached(self, batch: SpecDecodeBatch) -> list[VerificationResult]:
         """Tensor-batch Qwen3.5/Qwen3.8 verification across request caches."""
+        if self.config.get("qwen35_vectorized_target", False):
+            self.model.set_experimental_vectorized_target(True)
         if self.hybrid_cache_manager is None:
             raise RuntimeError("Qwen3.5/Qwen3.8 verifier requires HybridCacheManager")
         if not batch.sequences:
@@ -2010,6 +2014,8 @@ class ModelRunner:
             )
             query_lengths.append(accepted_length)
             request_ids.append(plan.request_id)
+        if self.config.get("qwen35_vectorized_target", False):
+            self.model.set_experimental_vectorized_target(True)
         self.model.forward_with_cache_batch(
             input_ids,
             query_lengths,

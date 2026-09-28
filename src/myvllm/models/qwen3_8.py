@@ -7,6 +7,58 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+
+if triton is not None:
+    @triton.jit
+    def _qwen35_vectorized_bf16_linear(
+        x_ptr, weight_ptr, out_ptr,
+        m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
+        block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
+        cols = tl.program_id(1) * block_n + tl.arange(0, block_n)
+        kk = tl.arange(0, block_k)
+        acc = tl.zeros((block_m, block_n), dtype=tl.float32)
+        for offset in range(tl.cdiv(k, block_k)):
+            k_rows = offset * block_k + kk
+            inputs = tl.load(
+                x_ptr + rows[:, None] * k + k_rows[None, :],
+                (rows[:, None] < m) & (k_rows[None, :] < k), other=0,
+            )
+            weights = tl.load(
+                weight_ptr + cols[None, :] * k + k_rows[:, None],
+                (cols[None, :] < n) & (k_rows[:, None] < k), other=0,
+            )
+            acc = tl.dot(inputs, weights, acc)
+        tl.store(
+            out_ptr + rows[:, None] * n + cols[None, :],
+            acc.to(tl.bfloat16),
+            (rows[:, None] < m) & (cols[None, :] < n),
+        )
+
+    @triton.jit
+    def _qwen35_vectorized_rmsnorm(
+        x_ptr, weight_ptr, out_ptr,
+        width: tl.constexpr, epsilon: tl.constexpr, block_width: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, block_width)
+        values = tl.load(
+            x_ptr + row * width + cols, cols < width, other=0,
+        ).to(tl.float32)
+        mean_square = tl.sum(values * values, 0) / width
+        scale = tl.rsqrt(mean_square + epsilon)
+        weight = tl.load(weight_ptr + cols, cols < width, other=0).to(tl.float32)
+        normalized = values * scale * (1.0 + weight)
+        tl.store(out_ptr + row * width + cols, normalized, cols < width)
+
 from myvllm.engine.hybrid_cache import (
     FullAttentionLayerState,
     HybridCacheManager,
@@ -35,6 +87,22 @@ class Qwen35TokenwiseLinear(nn.Linear):
     """Retain the BF16 cached-decode GEMM shape for each query position."""
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "experimental_vectorized", False):
+            if triton is None or not input.is_cuda or input.dtype != torch.bfloat16:
+                raise RuntimeError("vectorized Qwen linear requires CUDA BF16 Triton")
+            if self.bias is not None or input.ndim not in (2, 3):
+                raise ValueError("vectorized Qwen linear requires a bias-free matrix")
+            x = input.contiguous().reshape(-1, self.in_features)
+            result = torch.empty(
+                (x.shape[0], self.out_features), device=x.device, dtype=x.dtype
+            )
+            _qwen35_vectorized_bf16_linear[
+                (triton.cdiv(x.shape[0], 16), triton.cdiv(self.out_features, 128))
+            ](
+                x, self.weight, result, x.shape[0], self.out_features,
+                self.in_features, 16, 128, 128, num_warps=4, num_stages=2,
+            )
+            return result.reshape(*input.shape[:-1], self.out_features)
         if input.ndim == 3 and input.shape[1] > 1:
             if getattr(self, "verified_batch_two", False) and input.shape[0] == 2:
                 return F.linear(input, self.weight, self.bias)
@@ -64,8 +132,10 @@ class Qwen35TokenwiseLinear(nn.Linear):
         return F.linear(input, self.weight, self.bias)
 
 
-def _qwen35_tokenwise_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    if left.ndim == 4 and left.shape[-2] > 1:
+def _qwen35_tokenwise_matmul(
+    left: torch.Tensor, right: torch.Tensor, *, tokenwise: bool = True,
+) -> torch.Tensor:
+    if tokenwise and left.ndim == 4 and left.shape[-2] > 1:
         return torch.cat(
             [torch.matmul(left[..., index : index + 1, :].contiguous(), right)
              for index in range(left.shape[-2])],
@@ -85,6 +155,18 @@ class Qwen35RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "experimental_vectorized", False):
+            if triton is None or not x.is_cuda or x.dtype != torch.bfloat16:
+                raise RuntimeError("vectorized Qwen RMSNorm requires CUDA BF16 Triton")
+            width = x.shape[-1]
+            rows = x.contiguous().reshape(-1, width)
+            output = torch.empty_like(rows)
+            _qwen35_vectorized_rmsnorm[(rows.shape[0],)](
+                rows, self.weight, output, width, self.eps,
+                triton.next_power_of_2(width),
+                num_warps=8 if width > 2048 else 4,
+            )
+            return output.reshape(x.shape)
         if x.ndim >= 3 and x.shape[1] > 1:
             # Keep BF16 reductions on the cached one-token kernel shape.
             return torch.cat(
@@ -109,8 +191,10 @@ class Qwen35RMSNormGated(nn.Module):
         return (x * self.weight.float() * F.silu(gate.float())).to(dtype)
 
 
-def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    if x.ndim >= 3 and x.shape[1] > 1:
+def l2norm(
+    x: torch.Tensor, dim: int = -1, eps: float = 1e-6, *, tokenwise: bool = True,
+) -> torch.Tensor:
+    if tokenwise and x.ndim >= 3 and x.shape[1] > 1:
         return torch.cat(
             [l2norm(x[:, index : index + 1].contiguous(), dim=dim, eps=eps)
              for index in range(x.shape[1])],
@@ -375,7 +459,8 @@ class Qwen35Attention(nn.Module):
                 self.num_key_value_groups, dim=1
             )
         scores = _qwen35_tokenwise_matmul(
-            query_states, padded_key.transpose(2, 3)
+            query_states, padded_key.transpose(2, 3),
+            tokenwise=True,
         ) * self.scaling
         allowed_positions = valid_positions[:, None, None, :]
         if query_length > 1:
@@ -401,7 +486,8 @@ class Qwen35Attention(nn.Module):
         else:
             probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = _qwen35_tokenwise_matmul(
-            probs, padded_value
+            probs, padded_value,
+            tokenwise=True,
         ).transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, query_length, -1)
         attn_output = attn_output * torch.sigmoid(gate)
@@ -475,7 +561,7 @@ class Qwen35GatedDeltaNet(nn.Module):
             mixed_qkv = torch.cat([conv_state.to(mixed_qkv.dtype), mixed_qkv], dim=-1)
         elif self.conv_kernel_size > 1:
             mixed_qkv = F.pad(mixed_qkv, (self.conv_kernel_size - 1, 0))
-        if original_len > 1:
+        if original_len > 1 and not getattr(self, "experimental_vectorized", False):
             conv_out = torch.cat(
                 [F.conv1d(
                     mixed_qkv[..., index : index + self.conv_kernel_size].contiguous(),
@@ -531,8 +617,9 @@ class Qwen35GatedDeltaNet(nn.Module):
             repeats = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
-        query = l2norm(query, dim=-1) / (query.shape[-1] ** 0.5)
-        key = l2norm(key, dim=-1)
+        tokenwise = not getattr(self, "experimental_vectorized", False)
+        query = l2norm(query, dim=-1, tokenwise=tokenwise) / (query.shape[-1] ** 0.5)
+        key = l2norm(key, dim=-1, tokenwise=tokenwise)
         beta = self.in_proj_b(hidden_states).sigmoid()
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden_states).float() + self.dt_bias
@@ -559,7 +646,7 @@ class Qwen35GatedDeltaNet(nn.Module):
         z = self.in_proj_z(hidden_states).reshape(
             batch_size, seq_len, self.num_v_heads, self.head_v_dim
         )
-        if seq_len > 1:
+        if seq_len > 1 and not getattr(self, "experimental_vectorized", False):
             core = torch.cat([
                 self.norm(
                     core[:, index].reshape(-1, self.head_v_dim),
@@ -879,6 +966,15 @@ class Qwen35ForCausalLM(nn.Module):
                 layer.mlp.gate_proj.verified_batch_two = True
                 layer.mlp.up_proj.verified_batch_two = True
 
+    def set_experimental_vectorized_target(self, enabled: bool) -> None:
+        self.experimental_fixed_lm_head_rows = bool(enabled)
+        for module in self.model.modules():
+            if isinstance(module, (
+                Qwen35TokenwiseLinear, Qwen35RMSNorm,
+                Qwen35GatedDeltaNet, Qwen35Attention,
+            )):
+                module.experimental_vectorized = bool(enabled)
+
     @classmethod
     def from_config_dict(cls, config: Mapping) -> "Qwen35ForCausalLM":
         return cls(normalize_qwen35_text_config(config))
@@ -1108,6 +1204,8 @@ class Qwen35ForCausalLM(nn.Module):
                 if continue_after_step is not None
                 else hidden[: len(active_rows)]
             )
+            if getattr(self, "experimental_fixed_lm_head_rows", False):
+                logits_hidden = hidden
             step_logits = (
                 self.compute_logits(logits_hidden)[: len(active_rows)]
                 if return_logits else None
@@ -1258,6 +1356,8 @@ class Qwen35ForCausalLM(nn.Module):
                     micro_batch_size,
                     len(rows) if logit_batch_size is None else logit_batch_size,
                 )
+                if getattr(self, "experimental_fixed_lm_head_rows", False):
+                    head_rows = micro_batch_size
                 if head_rows < len(rows):
                     raise ValueError("LM head rows cannot omit active requests")
                 logits = torch.stack(

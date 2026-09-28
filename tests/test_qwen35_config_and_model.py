@@ -658,8 +658,9 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         draft[accepted] = (draft[accepted] + 1) % 32
 
     runs = []
-    for mode in ("full", "early", "parallel", "chunked"):
+    for mode in ("full", "early", "parallel", "chunked", "chunked3"):
         stop_early = mode == "early"
+        chunk_length = 3 if mode == "chunked3" else 4
         cache = HybridCacheManager()
         model.forward_with_cache(torch.tensor([1, 2, 3]), cache, "request")
         runner = ModelRunner.__new__(ModelRunner)
@@ -671,8 +672,8 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
             "capture_verification_hidden_taps": True,
             "qwen35_replay_state_updates": True,
             "qwen35_stop_verification_at_mismatch": stop_early,
-            "qwen35_parallel_verification": mode in {"parallel", "chunked"},
-            "qwen35_parallel_verification_chunk_size": 4 if mode == "chunked" else 0,
+            "qwen35_parallel_verification": mode in {"parallel", "chunked", "chunked3"},
+            "qwen35_parallel_verification_chunk_size": chunk_length if mode in {"chunked", "chunked3"} else 0,
             "qwen35_cached_batch_pad_to_size": 4,
             "qwen35_cached_attention_pad_to_length": 32,
         }
@@ -690,10 +691,11 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         sample = RejectionSampler().sample(proposal, result)
         expected_steps = (
             accepted + 1 if stop_early else
-            4 if mode == "chunked" and accepted < 4 else 8
+            min(8, ((accepted // chunk_length) + 1) * chunk_length)
+            if mode in {"chunked", "chunked3"} else 8
         )
         reported_steps = (
-            accepted + 1 if mode == "chunked" and accepted < 7
+            accepted + 1 if mode in {"chunked", "chunked3"} and accepted < 7
             else expected_steps
         )
         assert result.metadata["verified_tokens"] == reported_steps
@@ -712,11 +714,12 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         assert stats["avoided_request_token_steps"] == 8 - expected_steps
         assert stats["executed_model_steps"] == (
             1 if mode == "parallel" else
-            (1 if accepted < 4 else 2) if mode == "chunked" else
+            (expected_steps + chunk_length - 1) // chunk_length
+            if mode in {"chunked", "chunked3"} else
             expected_steps
         )
         assert stats["avoided_model_steps"] == (
-            0 if mode in {"parallel", "chunked"} else 8 - expected_steps
+            0 if mode in {"parallel", "chunked", "chunked3"} else 8 - expected_steps
         )
         histogram_key = "all_accepted" if accepted == 7 else str(accepted)
         assert stats["first_rejection_position_histogram"] == {histogram_key: 1}
@@ -1220,6 +1223,52 @@ def test_qwen35_cached_runner_tensor_batches_decode_in_request_order():
             None,
         )
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+@pytest.mark.parametrize("width", [128, 5120])
+def test_qwen35_vectorized_rmsnorm_is_query_shape_invariant(width):
+    norm = Qwen35RMSNorm(width).to(device="cuda", dtype=torch.bfloat16)
+    norm.weight.data.uniform_(-0.2, 0.2)
+    norm.experimental_vectorized = True
+    values = torch.randn(4, 4, width, device="cuda", dtype=torch.bfloat16)
+    block = norm(values)
+    individual = torch.cat(
+        [norm(values[:, index : index + 1].contiguous()) for index in range(4)],
+        dim=1,
+    )
+    assert torch.equal(block, individual)
+
+
+def test_qwen35_fixed_lm_head_rows_match_serial_and_parallel():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    serial_cache = HybridCacheManager()
+    parallel_cache = HybridCacheManager()
+    model.forward_with_cache(torch.tensor([1, 2, 3]), serial_cache, "serial")
+    parallel_cache._states["parallel"] = serial_cache.get_request_state("serial").clone()
+    model.experimental_fixed_lm_head_rows = True
+    row_counts = []
+    original_compute_logits = model.compute_logits
+
+    def record_rows(hidden):
+        row_counts.append(hidden.shape[0])
+        return original_compute_logits(hidden)
+
+    model.compute_logits = record_rows
+    try:
+        model.forward_with_cache_batch(
+            torch.tensor([[4]]), [1], serial_cache, ["serial"],
+            attention_pad_to_length=32, batch_pad_to_size=4,
+        )
+        model.forward_with_cache_parallel_batch(
+            torch.tensor([[4, 5, 6]]), [3], parallel_cache, ["parallel"],
+            attention_pad_to_length=32, batch_pad_to_size=4,
+            logit_batch_size=1,
+        )
+    finally:
+        model.compute_logits = original_compute_logits
+    assert row_counts == [4, 4, 4, 4]
 
 
 def test_qwen35_allocate_kv_cache_skips_unused_generic_pool(monkeypatch):

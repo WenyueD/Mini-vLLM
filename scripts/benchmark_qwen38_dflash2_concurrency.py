@@ -163,6 +163,10 @@ def parse_args() -> argparse.Namespace:
         "--parallel-verification-chunk-size", type=int, default=0,
         help="Verify causal blocks in chunks and skip suffix chunks after rejection.",
     )
+    parser.add_argument(
+        "--vectorized-target-numerics", action="store_true",
+        help="Experimentally share a vectorized BF16 target path across baseline and verifier.",
+    )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
         "--ignore-eos", dest="ignore_eos", action="store_true", default=True
@@ -383,6 +387,9 @@ def build_config(
             ),
             "qwen35_parallel_verification_chunk_size": getattr(
                 args, "parallel_verification_chunk_size", 0
+            ),
+            "qwen35_vectorized_target": getattr(
+                args, "vectorized_target_numerics", False
             ),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
