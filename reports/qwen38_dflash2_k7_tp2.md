@@ -872,3 +872,19 @@ verify 还需由 42.27 降至约 16.28 秒，C8 由 67.76 降至
 逐 token 投影。C4/C8 都只有单轮，尚无稳定加速证据，也没有
 完成 TP2。下一步应优先降低这些投影的实际耗时，并以相同源码
 做至少三轮配对测试；不能用不一致的全合批原型充当收益。
+
+### 形状稳定矩阵核的淘汰实验
+
+另外尝试用同一 Triton BF16 矩阵核处理 target-only decode 与
+并行 verifier；探针中同一个输入行在 1/2/4/8/16 行批量下对
+GDN qkv、MLP down/gate 投影得到逐位相同的结果。实验代码默认
+关闭，仅用于 `qwen38_k7_c2_shape_stable_triton_probe_20260928`。
+该次 manifest 的源码树 SHA256 为
+`3eb209d6e3aa5b02fa84bcdefdfda304588e7d9e02648d05d9b36eb29eba387e`，
+原始 patch 保存在结果目录。C2 原始 JSONL 中两模式 8/8 请求、
+512/512 token 一致，DFlash2 接受 376/864，峰值 54.589 GiB；
+但 target-only 为 5.0183 tok/s、DFlash2 仅 4.5962 tok/s，
+verify 30.44 秒。与旧 target-only C2 基线相比，仅 3/8 请求
+输出保持相同，证明这会改变原有 greedy 数值路径，却没有形成
+吞吐收益。因此实验核不纳入阶段三代码检查点；保留原始日志、
+源码 patch 和结果供后续分析。
