@@ -6,6 +6,7 @@ from typing import Callable, Mapping
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from myvllm.models.qwen35_gdn import fused_cached_gdn
 
 try:
     import triton
@@ -625,24 +626,38 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.in_proj_a(hidden_states).float() + self.dt_bias
         )
         state = recurrent_state.to(value.device).float()
-        outputs = []
-        for idx in range(seq_len):
-            decay_t = decay[:, idx].exp().view(batch_size, self.num_v_heads, 1, 1)
-            state = state * decay_t
-            k_t = key[:, idx].float()
-            v_t = value[:, idx].float()
-            beta_t = beta[:, idx].float().unsqueeze(-1)
-            kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-            delta = (v_t - kv_mem) * beta_t
+        if getattr(self, "experimental_fused_gdn", False):
+            decay_factors = decay.exp()
+            core, state, deltas = fused_cached_gdn(
+                query, key, value, beta, decay_factors, state,
+                record_updates=state_updates is not None,
+            )
             if state_updates is not None:
-                state_updates.append(LinearStateUpdate(
-                    decay_t.detach(), k_t.detach(), delta.detach(),
-                    conv_prefix_states[idx].detach(),
-                ))
-            state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-            out_t = (state * query[:, idx].float().unsqueeze(-1)).sum(dim=-2)
-            outputs.append(out_t)
-        core = torch.stack(outputs, dim=1).to(hidden_states.dtype)
+                for idx in range(seq_len):
+                    state_updates.append(LinearStateUpdate(
+                        decay_factors[:, idx].view(batch_size, self.num_v_heads, 1, 1).detach(),
+                        key[:, idx].float().detach(), deltas[:, idx].detach(),
+                        conv_prefix_states[idx].detach(),
+                    ))
+        else:
+            outputs = []
+            for idx in range(seq_len):
+                decay_t = decay[:, idx].exp().view(batch_size, self.num_v_heads, 1, 1)
+                state = state * decay_t
+                k_t = key[:, idx].float()
+                v_t = value[:, idx].float()
+                beta_t = beta[:, idx].float().unsqueeze(-1)
+                kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+                delta = (v_t - kv_mem) * beta_t
+                if state_updates is not None:
+                    state_updates.append(LinearStateUpdate(
+                        decay_t.detach(), k_t.detach(), delta.detach(),
+                        conv_prefix_states[idx].detach(),
+                    ))
+                state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+                out_t = (state * query[:, idx].float().unsqueeze(-1)).sum(dim=-2)
+                outputs.append(out_t)
+            core = torch.stack(outputs, dim=1).to(hidden_states.dtype)
         z = self.in_proj_z(hidden_states).reshape(
             batch_size, seq_len, self.num_v_heads, self.head_v_dim
         )
@@ -966,7 +981,7 @@ class Qwen35ForCausalLM(nn.Module):
                 layer.mlp.gate_proj.verified_batch_two = True
                 layer.mlp.up_proj.verified_batch_two = True
 
-    def set_experimental_vectorized_target(self, enabled: bool) -> None:
+    def set_experimental_vectorized_target(self, enabled: bool, *, fused_gdn: bool = False) -> None:
         self.experimental_fixed_lm_head_rows = bool(enabled)
         for module in self.model.modules():
             if isinstance(module, (
@@ -974,6 +989,8 @@ class Qwen35ForCausalLM(nn.Module):
                 Qwen35GatedDeltaNet, Qwen35Attention,
             )):
                 module.experimental_vectorized = bool(enabled)
+            if isinstance(module, Qwen35GatedDeltaNet):
+                module.experimental_fused_gdn = bool(enabled and fused_gdn)
 
     @classmethod
     def from_config_dict(cls, config: Mapping) -> "Qwen35ForCausalLM":

@@ -1,7 +1,53 @@
 import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_run_variant_releases_timing_wrapper_before_empty_cache(monkeypatch, tmp_path):
+    import torch
+    from scripts import benchmark_qwen38_dflash2_concurrency as benchmark
+    refs = []
+
+    class Runner:
+        def run(self, seqs, is_prefill):
+            return []
+
+    class Engine:
+        def __init__(self, config):
+            self.model_runner = Runner()
+            refs.append(weakref.ref(self.model_runner))
+
+        def exit(self):
+            del self.model_runner
+
+    class Online:
+        is_running = False
+
+        def __init__(self, engine, **kwargs):
+            self.engine = engine
+
+        def start(self):
+            raise RuntimeError("injected after timing wrapper installation")
+
+    def check_released():
+        assert all(ref() is None for ref in refs)
+
+    monkeypatch.setattr("myvllm.engine.llm_engine.LLMEngine", Engine)
+    monkeypatch.setattr("myvllm.online.OnlineEngine", Online)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", check_released)
+    monkeypatch.setattr(benchmark, "cuda_memory_snapshot", lambda _: {})
+    monkeypatch.setattr(benchmark, "build_config", lambda *a, **kw: {})
+    args = SimpleNamespace(device="cpu", dtype="float32", max_metrics_history=100,
+                           run_id="lifecycle", timeout=1)
+    request = benchmark.WorkloadRequest("a", "a", (1,), 1, "short")
+    result = benchmark.run_variant(args, "target_only", "short", [request], 1, 0,
+                                   tmp_path, tmp_path, 2)
+    assert "injected" in result["error"]
+    assert refs[0]() is None
 
 from scripts.benchmark_qwen38_dflash2_concurrency import (
     RequestTimeline,

@@ -12,6 +12,7 @@ import random
 import statistics
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -169,6 +170,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
+        "--fused-gdn-target", action="store_true",
+        help="Fuse the causal GDN recurrence in both vectorized target paths.",
+    )
+    parser.add_argument(
         "--ignore-eos", dest="ignore_eos", action="store_true", default=True
     )
     parser.add_argument("--respect-eos", dest="ignore_eos", action="store_false")
@@ -188,7 +193,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default=os.fspath(RESULTS_ROOT))
     parser.add_argument("--logs-dir", default=os.fspath(LOGS_ROOT))
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fused_gdn_target and not args.vectorized_target_numerics:
+        parser.error("--fused-gdn-target requires --vectorized-target-numerics")
+    return args
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -391,6 +399,7 @@ def build_config(
             "qwen35_vectorized_target": getattr(
                 args, "vectorized_target_numerics", False
             ),
+            "qwen35_fused_gdn": getattr(args, "fused_gdn_target", False),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
@@ -1161,12 +1170,17 @@ def code_provenance(run_dir: Path) -> dict[str, Any]:
     source_tree = hashlib.sha256()
     for name, digest in sorted(files.items()):
         source_tree.update(f"{name}\0{digest}\n".encode())
+    archive_path = run_dir / "source_files.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for path in sources:
+            archive.add(path, arcname=path.relative_to(ROOT).as_posix())
     return {
         "git_status": status,
         "code_diff_patch": os.fspath(diff_path),
         "code_diff_sha256": hashlib.sha256(diff).hexdigest(),
         "source_tree_sha256": source_tree.hexdigest(),
         "source_file_sha256": files,
+        "source_archive": os.fspath(archive_path),
     }
 
 
@@ -1180,6 +1194,7 @@ def runtime_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "draft_model": args.draft_model,
         "dtype": args.dtype,
         "seed": args.seed,
+        "arguments": vars(args),
         "oracle_alignment_status": (
             "PENDING: official vLLM 0.28 V2 runner is blocked by non-lossless "
             "oracle runtime behavior; this benchmark is Mini-vLLM target-only "
@@ -1251,10 +1266,23 @@ def run_variant(
     )
     engine = None
     online = None
+    native_run = None
     load_started = time.perf_counter()
     memory_before = cuda_memory_snapshot(device)
     try:
         engine = LLMEngine(config)
+        target_stage_wall_seconds = {"prefill": 0.0, "target_decode": 0.0}
+        native_run = engine.model_runner.run
+
+        def timed_target_run(seqs, is_prefill):
+            started = time.perf_counter()
+            try:
+                return native_run(seqs, is_prefill)
+            finally:
+                stage = "prefill" if is_prefill else "target_decode"
+                target_stage_wall_seconds[stage] += time.perf_counter() - started
+
+        engine.model_runner.run = timed_target_run
         load_elapsed = time.perf_counter() - load_started
         online = OnlineEngine(
             engine, max_terminal_history=max(args.max_metrics_history, 256)
@@ -1273,6 +1301,7 @@ def run_variant(
                 args.ignore_eos,
             )
             reset_runtime_stats(engine)
+        target_stage_wall_seconds.update(prefill=0.0, target_decode=0.0)
         measured_started = time.perf_counter()
         soak_time_limit_s = (
             args.soak_minutes * 60.0 if args.soak and args.soak_minutes > 0 else None
@@ -1348,6 +1377,7 @@ def run_variant(
             "schema_errors": [],
         }
         summary["schema_errors"] = validate_run_summary(summary)
+        summary["engine"]["target_stage_wall_seconds"] = target_stage_wall_seconds
         write_json(summary_path, summary)
         return summary
     except BaseException as exc:
@@ -1375,6 +1405,9 @@ def run_variant(
                 engine.exit()
             except Exception:
                 pass
+        # Release the closure's bound method before collection. engine.exit()
+        # has already removed model_runner, so do not access that attribute here.
+        native_run = None
         del online
         del engine
         gc.collect()
