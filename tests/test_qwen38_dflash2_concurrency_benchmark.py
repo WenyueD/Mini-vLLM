@@ -5,6 +5,24 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.parametrize("output_length", [512, 1024, 4096])
+def test_long_decode_workload_keeps_short_prompts_and_extends_output(output_length):
+    from scripts.benchmark_qwen38_dflash2_concurrency import build_workload
+
+    class Tokenizer:
+        def encode(self, text):
+            return list(text.encode("utf-8"))
+
+        def decode(self, tokens):
+            return bytes(tokens).decode("utf-8")
+
+    baseline = build_workload(Tokenizer(), "short", 16, 20260907)
+    extended = build_workload(Tokenizer(), f"decode{output_length}", 16, 20260907)
+    assert [r.prompt_token_ids for r in extended] == [r.prompt_token_ids for r in baseline]
+    assert all(r.max_new_tokens == output_length for r in extended)
+    assert all(120 <= len(r.prompt_token_ids) <= 136 for r in extended)
+
+
 def test_run_variant_releases_timing_wrapper_before_empty_cache(monkeypatch, tmp_path):
     import torch
     from scripts import benchmark_qwen38_dflash2_concurrency as benchmark

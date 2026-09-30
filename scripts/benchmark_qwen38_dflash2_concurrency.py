@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,9 @@ LOGS_ROOT = ROOT / "logs" / "qwen38_dflash2_perf"
 
 WORKLOADS = {
     "short": {"isl": 128, "osl": 64},
+    "decode512": {"isl": 128, "osl": 512},
+    "decode1024": {"isl": 128, "osl": 1024},
+    "decode4096": {"isl": 128, "osl": 4096},
     "medium": {"isl": 512, "osl": 128},
     "long": {"isl": 1024, "osl": 128},
 }
@@ -117,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workload",
         nargs="+",
-        choices=("short", "medium", "long", "mixed"),
+        choices=(*WORKLOADS, "mixed"),
         default=["short", "medium", "mixed"],
     )
     parser.add_argument(
@@ -129,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--requests-per-run", type=int, default=0)
     parser.add_argument("--warmup-requests", type=int, default=1)
+    parser.add_argument(
+        "--warmup-output-tokens", type=int, default=0,
+        help="Cap only warmup generation length; zero uses the measured workload length.",
+    )
     parser.add_argument(
         "--num-speculative-tokens", type=int, default=1, choices=range(1, 8)
     )
@@ -194,6 +201,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logs-dir", default=os.fspath(LOGS_ROOT))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.warmup_output_tokens < 0:
+        parser.error("--warmup-output-tokens must be nonnegative")
     if args.fused_gdn_target and not args.vectorized_target_numerics:
         parser.error("--fused-gdn-target requires --vectorized-target-numerics")
     return args
@@ -1290,6 +1299,11 @@ def run_variant(
         online.start()
         if args.warmup_requests > 0:
             warmup = workload[: min(args.warmup_requests, len(workload))]
+            if getattr(args, "warmup_output_tokens", 0):
+                warmup = [
+                    replace(spec, max_new_tokens=min(spec.max_new_tokens, args.warmup_output_tokens))
+                    for spec in warmup
+                ]
             run_closed_loop(
                 online,
                 warmup,
