@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument(
+        "--native-token-prompt", action="store_true",
+        help="Pass workload token IDs directly to vLLM for fixed-prefix diagnostics.",
+    )
+    parser.add_argument(
         "--workload-json",
         default=None,
         help="Optional benchmark workload JSON containing prompt_token_ids.",
@@ -914,12 +918,15 @@ def main() -> None:
                 f"Invalid workload request {args.request_id!r}: {exc}"
             ) from exc
         prompt = tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
-        if [int(value) for value in tokenizer.encode(prompt)] != prompt_token_ids:
+        if not args.native_token_prompt and [int(value) for value in tokenizer.encode(prompt)] != prompt_token_ids:
             raise SystemExit("Decoded workload prompt does not round-trip to token IDs")
     else:
         prompt_token_ids = [int(value) for value in tokenizer.encode(prompt)]
     if not prompt_token_ids:
         raise SystemExit("prompt encoded to zero tokens")
+    generation_prompt = (
+        {"prompt_token_ids": prompt_token_ids} if args.native_token_prompt else prompt
+    )
 
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -936,7 +943,7 @@ def main() -> None:
         )
     elif not args.skip_target_preflight:
         target_llm = LLM(**build_llm_kwargs(args, speculative=False))
-        target_outputs = target_llm.generate([prompt], sampling_params)
+        target_outputs = target_llm.generate([generation_prompt], sampling_params)
         target_only_token_ids = (
             completion_output_token_ids(target_outputs[0], prompt_token_ids)
             if target_outputs
@@ -960,7 +967,7 @@ def main() -> None:
     llm = LLM(**build_llm_kwargs(args, speculative=True))
     CAPTURE_ENABLED = True
     try:
-        outputs = llm.generate([prompt], sampling_params)
+        outputs = llm.generate([generation_prompt], sampling_params)
     finally:
         CAPTURE_ENABLED = False
     if not CAPTURES:
