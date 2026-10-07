@@ -675,6 +675,10 @@ class Qwen35GatedDeltaNet(nn.Module):
             ).reshape(batch_size, seq_len, self.value_dim)
         output = self.out_proj(core)
         if return_final_state:
+            if getattr(self, "compact_verification_copies", False):
+                # Both recurrence implementations produce a new final tensor.
+                # The cache owner below still clones each request's row.
+                return output, state.detach(), final_conv_state
             return output, state.detach().clone(), final_conv_state
         return output
 
@@ -909,14 +913,27 @@ class Qwen35TextModel(nn.Module):
                 for row, request_state in enumerate(request_states):
                     if state_update_logs is not None and state_update_logs[row] is not None:
                         row_updates = state_update_logs[row].setdefault(layer_idx, [])
-                        for update in updates:
-                            row_updates.append(LinearStateUpdate(*(
-                                value[row : row + 1].clone()
-                                for value in (
-                                    update.decay, update.key,
-                                    update.delta, update.conv_state,
-                                )
-                            )))
+                        if getattr(self, "compact_verification_copies", False):
+                            # Four owned buffers per request/layer, instead of
+                            # four clones per token. Views partition each buffer;
+                            # no padding rows or full recurrent states are retained.
+                            packed = tuple(torch.stack([
+                                getattr(update, name)[row : row + 1]
+                                for update in updates
+                            ], dim=1) for name in ("decay", "key", "delta", "conv_state"))
+                            row_updates.extend(
+                                LinearStateUpdate(*(value[:, index] for value in packed))
+                                for index in range(len(updates))
+                            )
+                        else:
+                            for update in updates:
+                                row_updates.append(LinearStateUpdate(*(
+                                    value[row : row + 1].clone()
+                                    for value in (
+                                        update.decay, update.key,
+                                        update.delta, update.conv_state,
+                                    )
+                                )))
                     request_state.linear_layers[layer_idx] = LinearLayerState(
                         recurrent[row : row + 1].detach().clone(),
                         conv[row : row + 1].detach().clone(),
@@ -981,8 +998,11 @@ class Qwen35ForCausalLM(nn.Module):
                 layer.mlp.gate_proj.verified_batch_two = True
                 layer.mlp.up_proj.verified_batch_two = True
 
-    def set_experimental_vectorized_target(self, enabled: bool, *, fused_gdn: bool = False) -> None:
+    def set_experimental_vectorized_target(
+        self, enabled: bool, *, fused_gdn: bool = False, compact_updates: bool = False,
+    ) -> None:
         self.experimental_fixed_lm_head_rows = bool(enabled)
+        self.model.compact_verification_copies = bool(enabled and compact_updates)
         for module in self.model.modules():
             if isinstance(module, (
                 Qwen35TokenwiseLinear, Qwen35RMSNorm,
@@ -991,6 +1011,7 @@ class Qwen35ForCausalLM(nn.Module):
                 module.experimental_vectorized = bool(enabled)
             if isinstance(module, Qwen35GatedDeltaNet):
                 module.experimental_fused_gdn = bool(enabled and fused_gdn)
+                module.compact_verification_copies = bool(enabled and compact_updates)
 
     @classmethod
     def from_config_dict(cls, config: Mapping) -> "Qwen35ForCausalLM":

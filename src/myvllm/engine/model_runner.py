@@ -1519,6 +1519,7 @@ class ModelRunner:
         if self.config.get("qwen35_vectorized_target", False):
             self.model.set_experimental_vectorized_target(
                 True, fused_gdn=self.config.get("qwen35_fused_gdn", False),
+                compact_updates=self.config.get("qwen35_compact_verification_copies", False),
             )
         if self.hybrid_cache_manager is None:
             raise RuntimeError("Qwen3.5/Qwen3.8 verifier requires HybridCacheManager")
@@ -1611,6 +1612,10 @@ class ModelRunner:
             parallel_chunk_size = int(
                 self.config.get("qwen35_parallel_verification_chunk_size", 0) or 0
             )
+            reuse_chunk_samples = (
+                parallel_verification and parallel_chunk_size > 0
+                and self.config.get("qwen35_reuse_verification_samples", False)
+            )
             parallel_model_calls = None
             if parallel_verification and parallel_chunk_size > 0:
                 parts = [[] for _ in batch.sequences]
@@ -1669,6 +1674,8 @@ class ModelRunner:
                                 -1, chunk_output.hidden_states.shape[-1]
                             ),
                         ).detach().cpu().tolist()
+                        if reuse_chunk_samples:
+                            sampled_by_request[batch.sequences[row].request_id].extend(tokens)
                         proposal = batch.proposals[row].token_ids
                         first_rejection = next((
                             position for position, token in enumerate(
@@ -1723,11 +1730,11 @@ class ModelRunner:
                 raise RuntimeError(
                     "batched cached target returned the wrong output count"
                 )
-            if stop_at_mismatch:
+            if stop_at_mismatch or reuse_chunk_samples:
                 flat_token_ids = [
                     token_id
-                    for seq in batch.sequences
-                    for token_id in sampled_by_request[seq.request_id]
+                    for seq, output in zip(batch.sequences, outputs)
+                    for token_id in sampled_by_request[seq.request_id][:output.logits.shape[1]]
                 ]
             else:
                 flat_logits = torch.cat(
@@ -2076,6 +2083,7 @@ class ModelRunner:
                     and hasattr(self.hybrid_cache_manager, "restore_verified_prefix")
                     and self.hybrid_cache_manager.restore_verified_prefix(
                         plan.transaction, plan.request_id, accepted_length,
+                        fused=self.config.get("qwen35_fused_prefix_commit", False),
                     )
                 ):
                     continue

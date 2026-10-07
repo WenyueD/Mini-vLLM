@@ -334,6 +334,8 @@ class HybridCacheManager:
         transaction: HybridCacheTransaction,
         request_id: RequestId,
         accepted: int,
+        *,
+        fused: bool = False,
     ) -> bool:
         """Restore a prefix using recorded rank-one updates, without model replay."""
         self._require_active(transaction)
@@ -361,10 +363,14 @@ class HybridCacheManager:
                 torch.zeros_like(current.recurrent_state)
                 if previous is None else previous.recurrent_state
             )
-            for update in updates[layer_id][:accepted]:
-                # Preserve the two FP32 operations used during verification.
-                recurrent = recurrent * update.decay
-                recurrent = recurrent + update.key.unsqueeze(-1) * update.delta.unsqueeze(-2)
+            if fused and recurrent.is_cuda:
+                from myvllm.models.qwen35_gdn import fused_replay_gdn_prefix
+                recurrent = fused_replay_gdn_prefix(recurrent, updates[layer_id][:accepted])
+            else:
+                for update in updates[layer_id][:accepted]:
+                    # Preserve the FP32 rounding used during verification.
+                    recurrent = recurrent * update.decay
+                    recurrent = recurrent + update.key.unsqueeze(-1) * update.delta.unsqueeze(-2)
             restored_linear[layer_id] = LinearLayerState(
                 recurrent, updates[layer_id][accepted - 1].conv_state.clone(),
             )

@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from myvllm.models.qwen35_gdn import fused_cached_gdn
-from myvllm.engine.hybrid_cache import HybridCacheManager
+from myvllm.models.qwen35_gdn import fused_cached_gdn, fused_replay_gdn_prefix
+from myvllm.engine.hybrid_cache import HybridCacheManager, LinearStateUpdate
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.sequence import Sequence
 from myvllm.sampling_parameters import SamplingParams
@@ -47,6 +47,8 @@ def test_fused_gdn_reference_shape_invariance_and_every_prefix(dim, dtype):
                                atol=0.008 if dtype == torch.bfloat16 else 2e-6)
     replay = state.clone()
     serial = state.clone()
+    updates = []
+    torch.testing.assert_close(fused_replay_gdn_prefix(state[:1], []), state[:1], rtol=0, atol=0)
     for pos in range(8):
         step, serial, _ = fused_cached_gdn(
             q[:, pos:pos+1], k[:, pos:pos+1], v[:, pos:pos+1],
@@ -56,6 +58,13 @@ def test_fused_gdn_reference_shape_invariance_and_every_prefix(dim, dtype):
         replay = replay * decay[:, pos, :, None, None]
         replay = replay + k[:, pos].float().unsqueeze(-1) * deltas[:, pos].unsqueeze(-2)
         torch.testing.assert_close(replay, serial, rtol=0, atol=0)
+        updates.append(LinearStateUpdate(
+            decay[:1, pos, :, None, None], k[:1, pos].float(),
+            deltas[:1, pos], torch.empty(0, device="cuda"),
+        ))
+        fused_prefix = fused_replay_gdn_prefix(state[:1], updates)
+        torch.testing.assert_close(fused_prefix, serial[:1], rtol=0, atol=0)
+        torch.testing.assert_close(state, initial, rtol=0, atol=0)
     torch.testing.assert_close(serial, final, rtol=0, atol=0)
     for width in [3, 4]:
         chunk_state = state.clone()
@@ -97,6 +106,9 @@ def make_runner(model, cache):
         "qwen35_parallel_verification_chunk_size": 4,
         "qwen35_cached_batch_pad_to_size": 4,
         "qwen35_cached_attention_pad_to_length": 32,
+        "qwen35_fused_prefix_commit": True,
+        "qwen35_reuse_verification_samples": True,
+        "qwen35_compact_verification_copies": True,
     }
     runner.sampler = lambda logits, _: greedy_token_ids(logits)
     runner._pending_verified_cache_transactions = {}
@@ -149,6 +161,16 @@ def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted):
     assert all(t.shape[1] == len(pending.query_tokens) for t in pending.hidden_taps.values())
     assert cache.estimate_bytes()["transaction_snapshot_state_bytes"] == 0
     assert cache.estimate_bytes()["transaction_linear_update_bytes"] > 0
+    # Packed views must not retain padded request rows or hidden full states.
+    storages = {}
+    for transaction in cache._active.values():
+        for layers in transaction.linear_updates.values():
+            for updates in layers.values():
+                for update in updates:
+                    for value in (update.decay, update.key, update.delta, update.conv_state):
+                        storage = value.untyped_storage()
+                        storages[storage.data_ptr()] = storage.nbytes()
+    assert sum(storages.values()) == cache.estimate_bytes()["transaction_linear_update_bytes"]
     runner.commit_verified_cache({a.seq_id: accepted + 1})
     runner.rollback_verified_cache([b.seq_id])
     assert_state_exact(cache.get_request_state("a"), states[accepted])
@@ -169,6 +191,31 @@ def test_fused_verifier_exception_rolls_back():
     runner._sample_qwen35_logits = fail
     with pytest.raises(RuntimeError, match="injected"):
         runner.verify(SpecDecodeBatch([seq], [Proposal(seq.seq_id, (0,) * 7)]))
+    assert_state_exact(cache.get_request_state("a"), before)
+    assert cache.estimate_bytes()["active_transactions"] == 0
+
+
+@torch.inference_mode()
+def test_fused_prefix_commit_exception_rolls_back(monkeypatch):
+    import myvllm.models.qwen35_gdn as gdn
+
+    model, cache = make_model(), HybridCacheManager()
+    prefill(model, cache, "a", [1, 2, 3])
+    before = cache.get_request_state("a").clone()
+    runner = make_runner(model, cache)
+    seq = Sequence([1, 2, 3, 4], 4, SamplingParams(temperature=0, max_tokens=16), request_id="a")
+    seq.mark_computed(3); seq.begin_speculation([0] * 7)
+    runner.verify(SpecDecodeBatch([seq], [Proposal(seq.seq_id, (0,) * 7)]))
+    original = gdn.fused_replay_gdn_prefix
+    calls = []
+    def fail_after_one_layer(*args, **kwargs):
+        if calls:
+            raise RuntimeError("injected during prefix commit")
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gdn, "fused_replay_gdn_prefix", fail_after_one_layer)
+    with pytest.raises(RuntimeError, match="injected during prefix commit"):
+        runner.commit_verified_cache({seq.seq_id: 1})
     assert_state_exact(cache.get_request_state("a"), before)
     assert cache.estimate_bytes()["active_transactions"] == 0
 

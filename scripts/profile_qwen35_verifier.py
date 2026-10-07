@@ -55,10 +55,14 @@ def main():
     parser.add_argument("--profile-output-dir", type=Path, required=True)
     parser.add_argument("--profile-skip-calls", type=int, default=5)
     parser.add_argument("--profile-calls", type=int, default=2)
+    parser.add_argument("--profile-stage", choices=["verify", "commit", "both"], default="verify")
+    parser.add_argument("--skip-startup-warmup", action="store_true")
     args, remaining = parser.parse_known_args()
     args.profile_output_dir.mkdir(parents=True, exist_ok=True)
     active = [False]
-    count = [0]
+    count = defaultdict(int)
+    if args.skip_startup_warmup:
+        ModelRunner.warmup_model = lambda self: None
 
     def annotate(owner, method, label):
         original = getattr(owner, method)
@@ -86,17 +90,18 @@ def main():
         (HybridCacheManager, "begin_transaction", "cache_transaction"),
         (FullAttentionLayerState, "append", "cache_append"),
         (ModelRunner, "_sample_qwen35_logits", "sampling"),
+        (HybridCacheManager, "restore_verified_prefix", "commit_restore_prefix"),
+        (HybridCacheManager, "finalize_replayed_commit", "commit_finalize"),
+        (ModelRunner, "_append_dflash2_hidden_history", "commit_hidden_history"),
+        (ModelRunner, "_install_dflash2_projected_context", "commit_context_projection"),
     ]:
         annotate(owner, method, label)
 
-    original_verify = ModelRunner._verify_qwen35_cached
-
-    @wraps(original_verify)
-    def profile_verify(self, batch):
-        count[0] += 1
-        call = count[0]
+    def profile_call(stage, original, self, payload):
+        count[stage] += 1
+        call = count[stage]
         if not (args.profile_skip_calls < call <= args.profile_skip_calls + args.profile_calls):
-            return original_verify(self, batch)
+            return original(self, payload)
         torch.cuda.synchronize()
         started = time.perf_counter()
         active[0] = True
@@ -105,8 +110,8 @@ def main():
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 record_shapes=True,
             ) as prof:
-                with torch.profiler.record_function("qwen/verifier_other"):
-                    result = original_verify(self, batch)
+                with torch.profiler.record_function("qwen/" + stage + "_other"):
+                    result = original(self, payload)
                 torch.cuda.synchronize()
         finally:
             active[0] = False
@@ -122,24 +127,36 @@ def main():
             row = categories[label]
             row["cpu_self_ms"] += event.self_cpu_time_total / 1000
             row["events"] += 1
-        prefix = args.profile_output_dir / f"verify_{call}"
+        prefix = args.profile_output_dir / f"{stage}_{call}"
         prof.export_chrome_trace(str(prefix.with_suffix(".trace.json")))
         prefix.with_suffix(".operators.txt").write_text(
             prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=40)
         )
         payload = {
-            "diagnostic_only": True, "call": call, "requests": len(batch.sequences),
-            "query_lengths": [len(p.token_ids) + 1 for p in batch.proposals],
+            "diagnostic_only": True, "stage": stage, "call": call,
+            "requests": len(payload.sequences) if stage == "verify" else len(payload),
+            "lengths": ([len(p.token_ids) + 1 for p in payload.proposals]
+                        if stage == "verify" else list(payload.values())),
             "instrumented_wall_s": elapsed,
             "categories": dict(categories),
             "cuda_launch_attribution": summarize_trace(prefix.with_suffix(".trace.json")),
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
         }
         prefix.with_suffix(".json").write_text(json.dumps(payload, indent=2))
-        print("verifier_profile=" + json.dumps(payload), flush=True)
+        print("decode_profile=" + json.dumps(payload), flush=True)
         return result
 
-    ModelRunner._verify_qwen35_cached = profile_verify
+    def install_profile(stage, method):
+        original = getattr(ModelRunner, method)
+        @wraps(original)
+        def wrapped(self, payload):
+            return profile_call(stage, original, self, payload)
+        setattr(ModelRunner, method, wrapped)
+
+    if args.profile_stage in {"verify", "both"}:
+        install_profile("verify", "_verify_qwen35_cached")
+    if args.profile_stage in {"commit", "both"}:
+        install_profile("commit", "commit_verified_cache")
     sys.argv = [sys.argv[0], *remaining]
     benchmark.main()
 

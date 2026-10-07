@@ -64,6 +64,58 @@ if triton is not None:
             tl.store(delta_ptr + row * value_dim + vals, delta, vals < value_dim)
         tl.store(final_ptr + state_offsets, state, state_mask)
 
+    @triton.jit
+    def _replay_gdn_prefix(
+        state_ptr, decay_ptr, key_ptr, delta_ptr, out_ptr,
+        heads: tl.constexpr, key_dim: tl.constexpr, value_dim: tl.constexpr,
+        steps: tl.constexpr, block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        size: tl.constexpr = heads * key_dim * value_dim
+        mask = offsets < size
+        head = offsets // (key_dim * value_dim)
+        key = (offsets // value_dim) % key_dim
+        value = offsets % value_dim
+        state = tl.load(state_ptr + offsets, mask, other=0)
+        for step in range(steps):
+            decay = tl.load(decay_ptr + step * heads + head, mask, other=0)
+            k = tl.load(key_ptr + (step * heads + head) * key_dim + key, mask, other=0)
+            delta = tl.load(delta_ptr + (step * heads + head) * value_dim + value, mask, other=0)
+            state = _add_rn(_mul_rn(state, decay), _mul_rn(k, delta))
+        tl.store(out_ptr + offsets, state, mask)
+
+
+def fused_replay_gdn_prefix(state, updates):
+    """Replay compact updates with exactly the eager FP32 rounding.
+
+    Only the output state and O(K*H*(Dk+Dv)) packed updates are allocated.
+    Original rollback state and recorded updates remain immutable.
+    """
+    if triton is None or not state.is_cuda:
+        raise RuntimeError("fused GDN prefix replay requires CUDA Triton")
+    if state.ndim != 4 or state.shape[0] != 1 or state.dtype != torch.float32:
+        raise ValueError("prefix replay expects one FP32 [1,H,Dk,Dv] state")
+    if not updates:
+        return state.clone()
+    _, heads, key_dim, value_dim = state.shape
+    for update in updates:
+        if (update.decay.shape != (1, heads, 1, 1)
+                or update.key.shape != (1, heads, key_dim)
+                or update.delta.shape != (1, heads, value_dim)
+                or any(x.dtype != torch.float32 or x.device != state.device
+                       for x in (update.decay, update.key, update.delta))):
+            raise ValueError("incompatible FP32 prefix update")
+    decay = torch.stack([u.decay for u in updates])
+    key = torch.stack([u.key for u in updates])
+    delta = torch.stack([u.delta for u in updates])
+    output = torch.empty_like(state, memory_format=torch.contiguous_format)
+    _replay_gdn_prefix[(triton.cdiv(state.numel(), 256),)](
+        state.contiguous(), decay, key, delta, output,
+        heads, key_dim, value_dim, len(updates), 256,
+        enable_fp_fusion=False,
+    )
+    return output
+
 
 def fused_cached_gdn(query, key, value, beta, decay, state, *, record_updates=False):
     """Inputs are [B,T,H,D], scalar gates [B,T,H]; decay is already exp(g).

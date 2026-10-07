@@ -249,6 +249,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default=os.fspath(RESULTS_ROOT))
     parser.add_argument("--logs-dir", default=os.fspath(LOGS_ROOT))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--fused-prefix-commit", action="store_true")
+    parser.add_argument("--reuse-verification-samples", action="store_true")
+    parser.add_argument("--compact-verification-copies", action="store_true")
     args = parser.parse_args()
     if args.warmup_output_tokens < 0:
         parser.error("--warmup-output-tokens must be nonnegative")
@@ -465,6 +468,9 @@ def build_config(
                 args, "vectorized_target_numerics", False
             ),
             "qwen35_fused_gdn": getattr(args, "fused_gdn_target", False),
+            "qwen35_fused_prefix_commit": getattr(args, "fused_prefix_commit", False),
+            "qwen35_reuse_verification_samples": getattr(args, "reuse_verification_samples", False),
+            "qwen35_compact_verification_copies": getattr(args, "compact_verification_copies", False),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
