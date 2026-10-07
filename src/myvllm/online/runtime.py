@@ -82,12 +82,14 @@ class OnlineEngine:
         engine: LLMEngine,
         close_engine: bool = True,
         max_terminal_history: int = 256,
+        lightweight_stats: bool = False,
     ):
         if max_terminal_history < 0:
             raise ValueError("max_terminal_history must be non-negative")
         self.engine = engine
         self.close_engine = close_engine
         self.max_terminal_history = max_terminal_history
+        self.lightweight_stats = lightweight_stats
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._channels: dict[str, queue.Queue[RequestOutput]] = {}
         self._snapshot_lock = threading.Lock()
@@ -215,7 +217,12 @@ class OnlineEngine:
                 status = self._terminal_history.get(request_id)
             return dict(status) if status is not None else None
 
-    def stats(self) -> dict:
+    def stats(self, *, detailed: bool = False, timeout: float | None = 10.0) -> dict:
+        if detailed:
+            self._require_running()
+            future = Future()
+            self._commands.put(_Command("stats", {}, future))
+            return future.result(timeout=timeout)
         with self._snapshot_lock:
             return dict(self._stats)
 
@@ -271,6 +278,14 @@ class OnlineEngine:
 
     def _handle_command(self, command: _Command) -> bool:
         try:
+            if command.kind == "stats":
+                result = self.engine.get_stats()
+                with self._snapshot_lock:
+                    result.update({key: self._stats[key] for key in
+                                   ("healthy", "online_running", "online_requests")
+                                   if key in self._stats})
+                command.future.set_result(result)
+                return False
             if command.kind == "add":
                 handle = self._admit_request(command.payload)
                 self._submitted_requests += 1
@@ -388,7 +403,9 @@ class OnlineEngine:
             self._statuses[request_id] = status
 
     def _refresh_snapshots(self) -> None:
-        stats = self.engine.get_stats() if hasattr(self.engine, "get_stats") else {}
+        snapshot = getattr(self.engine, "get_live_stats", None) if self.lightweight_stats else None
+        snapshot = snapshot or getattr(self.engine, "get_stats", None)
+        stats = snapshot() if snapshot is not None else {}
         with self._snapshot_lock:
             self._stats = {
                 **stats,

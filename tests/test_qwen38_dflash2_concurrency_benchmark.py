@@ -5,6 +5,26 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_long_tasks_preserve_complete_chat_prompt_and_4096_output():
+    from scripts.benchmark_qwen38_dflash2_concurrency import build_workload, LONG_OUTPUT_TASKS
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            assert tokenize is False and add_generation_prompt is True
+            return "USER:" + messages[0]["content"] + "\nASSISTANT:"
+
+        def encode(self, text):
+            return list(text.encode("utf-8"))
+
+    requests = build_workload(Tokenizer(), "tasks4096", 4, 20260907)
+    assert len(requests) == 4
+    for spec, task in zip(requests, LONG_OUTPUT_TASKS):
+        assert task in spec.prompt
+        assert spec.prompt.endswith("\nASSISTANT:")
+        assert spec.prompt_token_ids == tuple(spec.prompt.encode("utf-8"))
+        assert spec.max_new_tokens == 4096
+
+
 @pytest.mark.parametrize("output_length", [512, 1024, 4096])
 def test_long_decode_workload_keeps_short_prompts_and_extends_output(output_length):
     from scripts.benchmark_qwen38_dflash2_concurrency import build_workload

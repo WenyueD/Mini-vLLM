@@ -4,6 +4,45 @@ import time
 
 import pytest
 
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_lightweight_live_stats_retain_full_history_for_explicit_worker_snapshot(monkeypatch, speculative):
+    import threading
+
+    engine = make_engine(speculative)
+    original = engine.get_stats
+    full_threads = []
+
+    def observed_stats(*, include_history=True):
+        if include_history:
+            full_threads.append(threading.get_ident())
+        return original(include_history=include_history)
+
+    monkeypatch.setattr(engine, "get_stats", observed_stats)
+    online = OnlineEngine(engine, close_engine=False, lightweight_stats=True)
+    online.start()
+    try:
+        handle = online.submit(
+            "1,2,3", SamplingParams(temperature=0, max_tokens=16, ignore_eos=True),
+            request_id="light-stats",
+        )
+        outputs = consume(handle)
+        assert sum(len(o.token_ids) for o in outputs) == 16
+        live = online.stats()
+        assert live["recent_decode_steps"] == []
+        assert full_threads == []
+        full = online.stats(detailed=True)
+        assert len(full["recent_decode_steps"]) == full["decode_steps"] > 0
+        assert full["decode_steps"] == live["decode_steps"]
+        assert len(full_threads) == 1
+        assert full_threads[0] != threading.get_ident()
+        if speculative:
+            assert full["speculative"]["acceptance_lengths"]
+            assert live["speculative"]["acceptance_lengths"] == []
+            assert full["speculative"]["accepted_tokens"] == live["speculative"]["accepted_tokens"]
+    finally:
+        online.close()
+
 from myvllm.online import OnlineEngine, OnlineRequest, OnlineRequestSpec
 from myvllm.sampling_parameters import SamplingParams
 

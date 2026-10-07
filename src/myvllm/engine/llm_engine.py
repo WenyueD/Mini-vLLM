@@ -280,7 +280,7 @@ class LLMEngine:
             speculative=observation,
         )
 
-    def get_speculative_stats(self) -> dict:
+    def get_speculative_stats(self, *, include_history: bool = True) -> dict:
         if self.spec_decode_coordinator is None:
             return {
                 "enabled": False,
@@ -289,13 +289,17 @@ class LLMEngine:
             }
         return {
             "enabled": True,
-            **self.spec_decode_coordinator.metrics.snapshot(),
+            **self.spec_decode_coordinator.metrics.snapshot(include_history=include_history),
         }
 
-    def get_stats(self) -> dict:
+    def get_live_stats(self) -> dict:
+        """Read current counters without serializing retained diagnostic history."""
+        return self.get_stats(include_history=False)
+
+    def get_stats(self, *, include_history: bool = True) -> dict:
         self._ensure_runtime_state()
-        result = self.metrics.snapshot()
-        result["speculative"] = self.get_speculative_stats()
+        result = self.metrics.snapshot(include_history=include_history)
+        result["speculative"] = self.get_speculative_stats(include_history=include_history)
         model_runner = getattr(self, "model_runner", None)
         if model_runner is not None and getattr(
             model_runner, "is_qwen35_target", False
@@ -303,13 +307,13 @@ class LLMEngine:
             result["qwen35_verification"] = model_runner.call(
                 "get_qwen35_verification_stats"
             )
-            if hasattr(model_runner, "get_target_decision_diagnostics"):
+            if include_history and hasattr(model_runner, "get_target_decision_diagnostics"):
                 result["target_decision_diagnostics"] = model_runner.call(
                     "get_target_decision_diagnostics"
                 )
-            if hasattr(model_runner, "get_memory_trace"):
+            if include_history and hasattr(model_runner, "get_memory_trace"):
                 result["memory_trace"] = model_runner.call("get_memory_trace")
-        if model_runner is not None and getattr(
+        if include_history and model_runner is not None and getattr(
             model_runner, "dflash2_draft_model", None
         ) is not None:
             result["dflash2_profile"] = model_runner.call(

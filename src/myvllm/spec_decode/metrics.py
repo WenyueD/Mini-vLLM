@@ -37,8 +37,16 @@ class SpecDecodeMetrics:
             self.per_position_proposed[position] += 1
             self.per_position_accepted[position] += int(accepted)
 
-    def snapshot(self) -> dict:
-        result = asdict(self)
+    def snapshot(self, *, include_history: bool = True) -> dict:
+        result = asdict(self) if include_history else {
+            "sequence_records": self.sequence_records,
+            "proposed_tokens": self.proposed_tokens,
+            "accepted_tokens": self.accepted_tokens,
+            "acceptance_lengths": [],
+            "per_position_accepted": list(self.per_position_accepted),
+            "per_position_proposed": list(self.per_position_proposed),
+            "stage_seconds": dict(self.stage_seconds),
+        }
         result["acceptance_rate"] = (
             self.accepted_tokens / self.proposed_tokens if self.proposed_tokens else 0.0
         )

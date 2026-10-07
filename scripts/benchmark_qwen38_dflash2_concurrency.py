@@ -37,6 +37,7 @@ WORKLOADS = {
     "decode512": {"isl": 128, "osl": 512},
     "decode1024": {"isl": 128, "osl": 1024},
     "decode4096": {"isl": 128, "osl": 4096},
+    "tasks4096": {"isl": None, "osl": 4096},
     "medium": {"isl": 512, "osl": 128},
     "long": {"isl": 1024, "osl": 128},
 }
@@ -47,6 +48,50 @@ DEFAULT_PROMPT_SEEDS = [
     "Solve the arithmetic puzzle step by step and verify every intermediate value.",
     "Write a compact implementation checklist for a high-throughput inference server.",
     "Compare cache allocation strategies for mixed short and long generation requests.",
+]
+
+LONG_OUTPUT_TASKS = [
+    "Write a complete Python 3 implementation of a persistent SQLite job queue. "
+    "Include schema creation and migration, enqueue with idempotency keys, atomic "
+    "leasing by multiple worker processes, lease renewal, retries with exponential "
+    "backoff, dead-letter handling, and crash recovery. Use only the standard library. "
+    "Provide all executable source code, followed by at least twenty concrete unittest "
+    "tests covering successful execution, contention, expired leases, transaction "
+    "rollback, duplicate keys, retry exhaustion, and recovery after reopening the database. "
+    "Then explain each transaction boundary, demonstrate a two-worker run, and discuss "
+    "correctness invariants and limitations. Do not substitute outlines, placeholders, "
+    "or ellipses for the requested implementation or tests.",
+    "Develop a complete Python asyncio client and server for a length-prefixed binary "
+    "protocol using only the standard library. Messages carry request IDs, operation "
+    "names, and JSON bodies. Implement incremental frame parsing, maximum frame sizes, "
+    "timeouts, backpressure, bounded concurrency, cancellation, reconnect behavior, "
+    "and graceful shutdown. Include the complete client, server, parser, and a runnable "
+    "demonstration. Provide at least twenty executable tests for fragmented frames, "
+    "multiple frames in a read, malformed lengths, malformed JSON, disconnects, slow "
+    "clients, cancellation races, and shutdown. Finish with a detailed explanation "
+    "of resource ownership, error propagation, and protocol invariants. Give actual "
+    "code and assertions throughout rather than a sketch or a list of future work.",
+    "Build a detailed tutorial and complete Python implementation for weighted interval "
+    "scheduling with reconstruction and deterministic tie breaking. Begin with a precise "
+    "problem statement covering negative weights, empty intervals, duplicate endpoints, "
+    "and half-open interval semantics. Derive the dynamic-programming recurrence and "
+    "prove correctness and complexity. Implement binary-search predecessor lookup, "
+    "solution reconstruction, and tie breaking by the lexicographically smallest list "
+    "of original interval IDs. Include a brute-force oracle and at least twenty-five "
+    "fully specified tests, including exhaustive comparisons on small instances. Work "
+    "through three nontrivial examples with predecessor arrays, every DP entry, and "
+    "reconstructed solutions. Explain why common greedy alternatives fail, using "
+    "explicit counterexamples. Supply complete runnable code without omitted helpers.",
+    "Implement a production-oriented Python in-memory cache with weighted LRU eviction, "
+    "per-entry TTL, a monotonic clock, and thread-safe single-flight loading. Use the "
+    "standard library only and allow a fake clock for tests. Specify behavior for "
+    "oversized entries, replacement, expiry, loader exceptions, reentrant calls, and "
+    "concurrent invalidation. Provide the complete implementation and at least twenty-five "
+    "executable unittest cases. Tests must cover weight accounting, access ordering, "
+    "expiry boundaries, failed loaders, concurrent waiters, invalidation during a load, "
+    "and resource cleanup. Include a realistic usage example, a proof-style discussion "
+    "of invariants, and an analysis of time and space complexity. Explain concurrency "
+    "choices and failure behavior in detail. Do not replace code or tests with pseudocode.",
 ]
 
 
@@ -176,6 +221,10 @@ def parse_args() -> argparse.Namespace:
         help="Experimentally share a vectorized BF16 target path across baseline and verifier.",
     )
     parser.add_argument("--max-metrics-history", type=int, default=100000)
+    parser.add_argument(
+        "--lightweight-live-stats", action="store_true",
+        help="Poll live counters only; export complete retained history once after timing.",
+    )
     parser.add_argument(
         "--fused-gdn-target", action="store_true",
         help="Fuse the causal GDN recurrence in both vectorized target paths.",
@@ -330,10 +379,17 @@ def build_workload(
     arrival = 0.0
     for index in range(total_requests):
         bucket_name, isl, osl = buckets[index % len(buckets)]
-        jitter = rng.randint(-max(1, isl // 16), max(1, isl // 16))
-        prompt, token_ids = prompt_for_token_count(
-            tokenizer, max(1, isl + jitter), index
-        )
+        if workload == "tasks4096":
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": LONG_OUTPUT_TASKS[index % len(LONG_OUTPUT_TASKS)]}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            token_ids = tuple(tokenizer.encode(prompt))
+        else:
+            jitter = rng.randint(-max(1, isl // 16), max(1, isl // 16))
+            prompt, token_ids = prompt_for_token_count(
+                tokenizer, max(1, isl + jitter), index
+            )
         if open_loop_rate > 0:
             arrival += rng.expovariate(open_loop_rate)
         elif burst_interval > 0:
@@ -1294,7 +1350,8 @@ def run_variant(
         engine.model_runner.run = timed_target_run
         load_elapsed = time.perf_counter() - load_started
         online = OnlineEngine(
-            engine, max_terminal_history=max(args.max_metrics_history, 256)
+            engine, max_terminal_history=max(args.max_metrics_history, 256),
+            lightweight_stats=getattr(args, "lightweight_live_stats", False),
         )
         online.start()
         if args.warmup_requests > 0:
@@ -1332,7 +1389,9 @@ def run_variant(
         )
         measured_elapsed = time.perf_counter() - measured_started
         append_jsonl(monitor_path, monitor_samples)
-        stats = online.stats()
+        stats = online.stats(detailed=True, timeout=args.timeout) if getattr(
+            args, "lightweight_live_stats", False
+        ) else online.stats()
         request_ids = {item.request_id for item in workload}
         memory_after = cuda_memory_snapshot(device)
         summary = {

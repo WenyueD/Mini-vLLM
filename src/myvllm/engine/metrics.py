@@ -38,7 +38,7 @@ class EngineMetrics:
             ]
         self.step_history.append(observation)
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, include_history: bool = True) -> dict:
         return {
             "engine_steps": self.engine_steps,
             "decode_steps": self.decode_steps,
@@ -53,5 +53,5 @@ class EngineMetrics:
             "per_position_accepted": list(self.per_position_accepted),
             "recent_decode_steps": [
                 asdict(observation) for observation in self.step_history
-            ],
+            ] if include_history else [],
         }
