@@ -77,10 +77,10 @@ if triton is not None:
         key = (offsets // value_dim) % key_dim
         value = offsets % value_dim
         state = tl.load(state_ptr + offsets, mask, other=0)
-        for step in range(steps):
-            decay = tl.load(decay_ptr + step * heads + head, mask, other=0)
-            k = tl.load(key_ptr + (step * heads + head) * key_dim + key, mask, other=0)
-            delta = tl.load(delta_ptr + (step * heads + head) * value_dim + value, mask, other=0)
+        for step in tl.static_range(steps):
+            decay = tl.load(decay_ptr[step] + head, mask, other=0)
+            k = tl.load(key_ptr[step] + head * key_dim + key, mask, other=0)
+            delta = tl.load(delta_ptr[step] + head * value_dim + value, mask, other=0)
             state = _add_rn(_mul_rn(state, decay), _mul_rn(k, delta))
         tl.store(out_ptr + offsets, state, mask)
 
@@ -88,7 +88,7 @@ if triton is not None:
 def fused_replay_gdn_prefix(state, updates):
     """Replay compact updates with exactly the eager FP32 rounding.
 
-    Only the output state and O(K*H*(Dk+Dv)) packed updates are allocated.
+    Only the output state is allocated; the kernel reads existing update views.
     Original rollback state and recorded updates remain immutable.
     """
     if triton is None or not state.is_cuda:
@@ -102,12 +102,14 @@ def fused_replay_gdn_prefix(state, updates):
         if (update.decay.shape != (1, heads, 1, 1)
                 or update.key.shape != (1, heads, key_dim)
                 or update.delta.shape != (1, heads, value_dim)
-                or any(x.dtype != torch.float32 or x.device != state.device
+                or any(x.dtype != torch.float32 or x.device != state.device or not x.is_contiguous()
                        for x in (update.decay, update.key, update.delta))):
             raise ValueError("incompatible FP32 prefix update")
-    decay = torch.stack([u.decay for u in updates])
-    key = torch.stack([u.key for u in updates])
-    delta = torch.stack([u.delta for u in updates])
+    # Pointer tuples work across verifier chunk boundaries without repacking
+    # records. Static iteration retains the exact causal FP32 operation order.
+    decay = tuple(u.decay for u in updates)
+    key = tuple(u.key for u in updates)
+    delta = tuple(u.delta for u in updates)
     output = torch.empty_like(state, memory_format=torch.contiguous_format)
     _replay_gdn_prefix[(triton.cdiv(state.numel(), 256),)](
         state.contiguous(), decay, key, delta, output,
