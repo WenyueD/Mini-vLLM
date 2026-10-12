@@ -1068,3 +1068,22 @@ target-only 37.4535 tok/s，DFlash2四位置34.9819，八位置39.1779。
 实际块前向2183→1349（1345次verifier调用，额外4次为尾部长度分组），
 峰值分配59.3989 GiB，完整逐tokenstate快照0。内部attention仍有逐位置算子。
 全部运行结束；完整配置、回滚与证据见[8位置验证报告](qwen38_dflash2_verify8_20261012.md)。
+
+## 2026-10-12 补充：短块 cached-prefill attention
+
+实现checkpoint `5d90b2e`，新增默认关闭的 `--short-prefill-attention`：
+QK/PV采用固定行归约的Triton块计算、整块softmax，直接读取compact KV，
+减少padding复制与GQA实体展开；相同路径同时用于target-only、验证和必要回放。
+全量285 passed、2 skipped，含真实24/4头、D256、4299上下文的逐步/整块逐位一致。
+
+C4/K7、每请求4096输出，各模式一次：
+新target-only40.2235 tok/s，旧8位置DFlash2 39.3712，新DFlash2 42.6830。
+新DFlash2比新target-only快6.11%；平均verify轮耗时210.4259→169.7695ms，
+累计verify283.0228→246.5053秒，峰值分配59.3931→58.4544GiB。
+
+新接受率29.0024%（10969/37821），旧为30.9200%。
+**新target数值路径改变了历史输出**：四请求相同开头长度为162/144/337/270。
+新DFlash2与新target-only全部16384个token严格一致；旧路径回归也通过。
+这是共同新路径内部的正确性结果，不是新旧模型执行逐位等价的证明。
+开关保留默认关闭；没有完成三轮稳定收益验证、C8或TP2。
+完整限制与证据见[短块attention报告](qwen38_dflash2_short_prefill_20261012.md)。
