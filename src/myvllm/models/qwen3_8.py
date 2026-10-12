@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from myvllm.models.qwen35_gdn import fused_cached_gdn
+from myvllm.models.qwen35_attention import short_cached_attention
 
 try:
     import triton
@@ -426,6 +427,12 @@ class Qwen35Attention(nn.Module):
             max(context_lengths),
             0 if attention_pad_to_length is None else attention_pad_to_length,
         )
+        if getattr(self, "short_prefill_attention", False):
+            attn_output = short_cached_attention(
+                query_states, cached_rows, prefix_lengths, max_context_length,
+            ).reshape(batch_size, query_length, -1)
+            return self.o_proj(attn_output * torch.sigmoid(gate))
+
         padded_key = key_states.new_zeros(
             batch_size,
             max_context_length,
@@ -1000,6 +1007,7 @@ class Qwen35ForCausalLM(nn.Module):
 
     def set_experimental_vectorized_target(
         self, enabled: bool, *, fused_gdn: bool = False, compact_updates: bool = False,
+        short_prefill_attention: bool = False,
     ) -> None:
         self.experimental_fixed_lm_head_rows = bool(enabled)
         self.model.compact_verification_copies = bool(enabled and compact_updates)
@@ -1009,6 +1017,8 @@ class Qwen35ForCausalLM(nn.Module):
                 Qwen35GatedDeltaNet, Qwen35Attention,
             )):
                 module.experimental_vectorized = bool(enabled)
+            if isinstance(module, Qwen35Attention):
+                module.short_prefill_attention = bool(enabled and short_prefill_attention)
             if isinstance(module, Qwen35GatedDeltaNet):
                 module.experimental_fused_gdn = bool(enabled and fused_gdn)
                 module.compact_verification_copies = bool(enabled and compact_updates)

@@ -94,7 +94,7 @@ def make_model():
     return model.cuda().bfloat16().eval()
 
 
-def make_runner(model, cache, chunk_size=8):
+def make_runner(model, cache, chunk_size=8, short_prefill=True):
     runner = ModelRunner.__new__(ModelRunner)
     runner.model, runner.hybrid_cache_manager = model, cache
     runner.is_qwen35_target, runner.rank = True, 0
@@ -109,6 +109,7 @@ def make_runner(model, cache, chunk_size=8):
         "qwen35_fused_prefix_commit": True,
         "qwen35_reuse_verification_samples": True,
         "qwen35_compact_verification_copies": True,
+        "qwen35_short_prefill_attention": short_prefill,
     }
     runner.sampler = lambda logits, _: greedy_token_ids(logits)
     runner._pending_verified_cache_transactions = {}
@@ -121,23 +122,27 @@ def prefill(model, cache, rid, ids):
     model.set_experimental_vectorized_target(True, fused_gdn=True)
 
 
-def step(model, cache, rid, token):
+def step(model, cache, rid, token, short_prefill=True):
+    model.set_experimental_vectorized_target(
+        True, fused_gdn=True, short_prefill_attention=short_prefill,
+    )
     return model.forward_with_cache_batch(
         torch.tensor([[token]], device="cuda"), [1], cache, [rid],
         attention_pad_to_length=32, batch_pad_to_size=4,
     )[0]
 
 
+@pytest.mark.parametrize("short_prefill", [False, True])
 @pytest.mark.parametrize("chunk_size", [4, 8])
 @pytest.mark.parametrize("accepted", range(8))
 @torch.inference_mode()
-def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted, chunk_size, monkeypatch):
+def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted, chunk_size, short_prefill, monkeypatch):
     model = make_model()
     reference = HybridCacheManager()
     prefill(model, reference, "a", [1, 2, 3])
     token, draft, states = 4, [], []
     for _ in range(8):
-        output = step(model, reference, "a", token)
+        output = step(model, reference, "a", token, short_prefill)
         states.append(reference.get_request_state("a").clone())
         token = int(greedy_token_ids(output.logits.reshape(1, -1)).item())
         draft.append(token)
@@ -148,7 +153,7 @@ def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted, chunk
     prefill(model, cache, "a", [1, 2, 3])
     prefill(model, cache, "b", [5, 6])
     before_b = cache.get_request_state("b").clone()
-    runner = make_runner(model, cache, chunk_size)
+    runner = make_runner(model, cache, chunk_size, short_prefill)
     forward_calls = []
     original_forward = model.forward_with_cache_parallel_batch
 

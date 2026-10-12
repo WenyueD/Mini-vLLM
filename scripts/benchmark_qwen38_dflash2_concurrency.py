@@ -252,9 +252,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fused-prefix-commit", action="store_true")
     parser.add_argument("--reuse-verification-samples", action="store_true")
     parser.add_argument("--compact-verification-copies", action="store_true")
+    parser.add_argument("--short-prefill-attention", action="store_true",
+                        help="Use fixed-row direct-KV attention in both decode and verification.")
     args = parser.parse_args()
     if args.warmup_output_tokens < 0:
         parser.error("--warmup-output-tokens must be nonnegative")
+    if args.short_prefill_attention and not args.vectorized_target_numerics:
+        parser.error("--short-prefill-attention requires --vectorized-target-numerics")
     if args.fused_gdn_target and not args.vectorized_target_numerics:
         parser.error("--fused-gdn-target requires --vectorized-target-numerics")
     return args
@@ -471,6 +475,7 @@ def build_config(
             "qwen35_fused_prefix_commit": getattr(args, "fused_prefix_commit", False),
             "qwen35_reuse_verification_samples": getattr(args, "reuse_verification_samples", False),
             "qwen35_compact_verification_copies": getattr(args, "compact_verification_copies", False),
+            "qwen35_short_prefill_attention": getattr(args, "short_prefill_attention", False),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
