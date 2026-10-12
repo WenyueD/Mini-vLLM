@@ -1610,7 +1610,7 @@ class ModelRunner:
                 batch_pad_to_size=self.config.get("qwen35_cached_batch_pad_to_size"),
             )
             parallel_chunk_size = int(
-                self.config.get("qwen35_parallel_verification_chunk_size", 0) or 0
+                self.config.get("qwen35_parallel_verification_chunk_size", 8) or 0
             )
             reuse_chunk_samples = (
                 parallel_verification and parallel_chunk_size > 0

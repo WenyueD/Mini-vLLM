@@ -94,7 +94,7 @@ def make_model():
     return model.cuda().bfloat16().eval()
 
 
-def make_runner(model, cache):
+def make_runner(model, cache, chunk_size=8):
     runner = ModelRunner.__new__(ModelRunner)
     runner.model, runner.hybrid_cache_manager = model, cache
     runner.is_qwen35_target, runner.rank = True, 0
@@ -103,7 +103,7 @@ def make_runner(model, cache):
         "capture_verification_hidden_taps": True,
         "qwen35_replay_state_updates": True,
         "qwen35_parallel_verification": True,
-        "qwen35_parallel_verification_chunk_size": 4,
+        "qwen35_parallel_verification_chunk_size": chunk_size,
         "qwen35_cached_batch_pad_to_size": 4,
         "qwen35_cached_attention_pad_to_length": 32,
         "qwen35_fused_prefix_commit": True,
@@ -128,9 +128,10 @@ def step(model, cache, rid, token):
     )[0]
 
 
+@pytest.mark.parametrize("chunk_size", [4, 8])
 @pytest.mark.parametrize("accepted", range(8))
 @torch.inference_mode()
-def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted):
+def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted, chunk_size, monkeypatch):
     model = make_model()
     reference = HybridCacheManager()
     prefill(model, reference, "a", [1, 2, 3])
@@ -147,13 +148,27 @@ def test_fused_verifier_all_acceptance_lengths_ragged_and_commit(accepted):
     prefill(model, cache, "a", [1, 2, 3])
     prefill(model, cache, "b", [5, 6])
     before_b = cache.get_request_state("b").clone()
-    runner = make_runner(model, cache)
+    runner = make_runner(model, cache, chunk_size)
+    forward_calls = []
+    original_forward = model.forward_with_cache_parallel_batch
+
+    def record_forward(input_ids, query_lengths, *args, **kwargs):
+        forward_calls.append(list(query_lengths))
+        return original_forward(input_ids, query_lengths, *args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_with_cache_parallel_batch", record_forward)
     a = Sequence([1, 2, 3, 4], 4, SamplingParams(temperature=0, max_tokens=16), request_id="a")
     b = Sequence([5, 6, 7], 4, SamplingParams(temperature=0, max_tokens=16), request_id="b")
     a.mark_computed(3); b.mark_computed(2)
     a.begin_speculation(proposal_tokens); b.begin_speculation([0, 1])
     proposals = [Proposal(a.seq_id, tuple(proposal_tokens)), Proposal(b.seq_id, (0, 1))]
     result = runner.verify(SpecDecodeBatch([a, b], proposals))
+    if chunk_size == 8:
+        # Even an immediate mismatch must use one complete K+1 verification block.
+        assert forward_calls == [[8, 3]]
+    else:
+        assert forward_calls[0] == [4, 3]
+        assert len(forward_calls) == (2 if accepted >= 4 else 1)
     sample = RejectionSampler().sample(proposals[0], result[0])
     assert sample.accepted_proposal_tokens == accepted
     assert sample.emitted_token_ids == tuple(draft[:accepted+1])

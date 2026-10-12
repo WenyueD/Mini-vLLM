@@ -213,8 +213,8 @@ def parse_args() -> argparse.Namespace:
         help="Experimentally batch A800-observed B=2 projection shapes.",
     )
     parser.add_argument(
-        "--parallel-verification-chunk-size", type=int, default=0,
-        help="Verify causal blocks in chunks and skip suffix chunks after rejection.",
+        "--parallel-verification-chunk-size", type=int, default=8,
+        help="Verification block width (default 8: one full K=7 block); use 4 for chunked comparison.",
     )
     parser.add_argument(
         "--vectorized-target-numerics", action="store_true",
@@ -462,7 +462,7 @@ def build_config(
                 args, "parallel_batched_safe_linears", False
             ),
             "qwen35_parallel_verification_chunk_size": getattr(
-                args, "parallel_verification_chunk_size", 0
+                args, "parallel_verification_chunk_size", 8
             ),
             "qwen35_vectorized_target": getattr(
                 args, "vectorized_target_numerics", False
