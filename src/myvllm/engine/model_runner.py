@@ -97,6 +97,9 @@ class ModelRunner:
             "executed_model_steps": 0,
             "avoided_model_steps": 0,
             "first_rejection_position_histogram": {},
+            "postprocess_sampling_calls": 0,
+            "postprocess_token_downloads": 0,
+            "single_block_reused_requests": 0,
         }
         self._target_decision_diagnostics = []
         self.dflash2_draft_model = None
@@ -1960,9 +1963,9 @@ class ModelRunner:
                 for start in range(0, len(lengths), micro_batch_size)
             )
 
-        stats["postprocess_sampling_calls"] += postprocess_sampling_calls
-        stats["postprocess_token_downloads"] += postprocess_token_downloads
-        stats["single_block_reused_requests"] += single_block_reused_requests
+        stats["postprocess_sampling_calls"] = stats.get("postprocess_sampling_calls", 0) + postprocess_sampling_calls
+        stats["postprocess_token_downloads"] = stats.get("postprocess_token_downloads", 0) + postprocess_token_downloads
+        stats["single_block_reused_requests"] = stats.get("single_block_reused_requests", 0) + single_block_reused_requests
         stats["calls"] += 1
         stats["max_batch_size"] = max(
             stats["max_batch_size"],

@@ -1851,3 +1851,20 @@ def test_verifier_single_block_result_shares_storage_after_rejection(reuse_singl
     assert stats["single_block_reused_requests"] == (2 if reuse_single_block else 0)
     runner.rollback_verified_cache([seq.seq_id for seq in sequences])
     assert cache.estimate_bytes()["active_transactions"] == 0
+
+def test_verifier_postprocess_counters_accept_preinitialized_legacy_stats():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {"qwen35_cached_batch_pad_to_size": 4}
+    initial = runner.get_qwen35_verification_stats()
+    for field in ("postprocess_sampling_calls", "postprocess_token_downloads",
+                  "single_block_reused_requests"):
+        initial.pop(field)
+    runner._qwen35_verification_stats = initial
+    runner._record_qwen35_verification_batch([8, 8],
+        parallel_verification=True, parallel_model_calls=1,
+        postprocess_sampling_calls=1, postprocess_token_downloads=1,
+        single_block_reused_requests=2)
+    stats = runner.get_qwen35_verification_stats()
+    assert stats["calls"] == 1
+    assert stats["postprocess_sampling_calls"] == stats["postprocess_token_downloads"] == 1
+    assert stats["single_block_reused_requests"] == 2
