@@ -1079,6 +1079,52 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def _sample_qwen35_block_outputs(self, outputs):
+        """Sample once per model batch, then download only the token IDs."""
+        if not self.config.get("qwen35_batch_verification_sampling", True):
+            tokens = []
+            for output in outputs:
+                tokens.append(self._sample_qwen35_logits(
+                    output.logits.reshape(-1, output.logits.shape[-1]),
+                    torch.zeros(output.logits.shape[1], dtype=torch.float32,
+                                device=output.logits.device),
+                    hidden_states=output.hidden_states.reshape(
+                        -1, output.hidden_states.shape[-1]),
+                ).detach().cpu().tolist())
+            return tokens, len(outputs)
+        groups = {}
+        for index, output in enumerate(outputs):
+            batch = getattr(output, "verification_batch", None)
+            key = None if batch is None else id(batch[0])
+            groups.setdefault(key, []).append((index, output))
+        tokens = [None] * len(outputs)
+        for entries in groups.values():
+            first_batch = getattr(entries[0][1], "verification_batch", None)
+            rows = [getattr(output, "verification_batch", (None, None, None))[2]
+                    if getattr(output, "verification_batch", None) is not None
+                    else None for _, output in entries]
+            if first_batch is not None and rows == list(range(len(entries))):
+                logits, hidden, _ = first_batch
+                logits = logits[:len(entries)].reshape(-1, logits.shape[-1])
+                hidden = hidden[:len(entries)].reshape(-1, hidden.shape[-1])
+            else:
+                # Legacy/custom outputs or an incomplete batch: gather once.
+                logits = torch.cat([output.logits.reshape(-1, output.logits.shape[-1])
+                                    for _, output in entries], dim=0)
+                hidden = torch.cat([output.hidden_states.reshape(
+                    -1, output.hidden_states.shape[-1]) for _, output in entries], dim=0)
+            selected = self._sample_qwen35_logits(
+                logits, torch.zeros(logits.shape[0], dtype=torch.float32,
+                                    device=logits.device),
+                hidden_states=hidden,
+            ).detach().cpu().tolist()
+            offset = 0
+            for index, output in entries:
+                count = output.logits.shape[1]
+                tokens[index] = selected[offset:offset + count]
+                offset += count
+        return tokens, len(groups)
+
     def _sample_qwen35_logits(
         self,
         logits: torch.Tensor,
@@ -1579,9 +1625,16 @@ class ModelRunner:
                 for seq, proposal in zip(batch.sequences, batch.proposals)
             }
 
+            postprocess_sampling_calls = 0
+            postprocess_token_downloads = 0
+            single_block_reused_requests = 0
+
             def continue_after_step(
                 active_request_ids, step_logits, step_hidden, token_index,
             ):
+                nonlocal postprocess_sampling_calls, postprocess_token_downloads
+                postprocess_sampling_calls += 1
+                postprocess_token_downloads += 1
                 temperatures = torch.zeros(
                     step_logits.shape[0], dtype=torch.float32,
                     device=step_logits.device,
@@ -1661,23 +1714,13 @@ class ModelRunner:
                         len(set(chunk_lengths[start:start + micro_batch_size]))
                         for start in range(0, len(chunk_lengths), micro_batch_size)
                     )
+                    chunk_samples, sampling_calls = self._sample_qwen35_block_outputs(chunk_outputs)
+                    postprocess_sampling_calls += sampling_calls
+                    postprocess_token_downloads += sampling_calls
                     continuing_rows = []
-                    for row, chunk_output in zip(active_rows, chunk_outputs):
+                    for row, chunk_output, tokens in zip(active_rows, chunk_outputs, chunk_samples):
                         parts[row].append(chunk_output)
                         actual_lengths[row] += chunk_output.logits.shape[1]
-                        tokens = self._sample_qwen35_logits(
-                            chunk_output.logits.reshape(
-                                -1, chunk_output.logits.shape[-1]
-                            ),
-                            torch.zeros(
-                                chunk_output.logits.shape[1],
-                                dtype=torch.float32,
-                                device=chunk_output.logits.device,
-                            ),
-                            hidden_states=chunk_output.hidden_states.reshape(
-                                -1, chunk_output.hidden_states.shape[-1]
-                            ),
-                        ).detach().cpu().tolist()
                         if reuse_chunk_samples:
                             sampled_by_request[batch.sequences[row].request_id].extend(tokens)
                         proposal = batch.proposals[row].token_ids
@@ -1699,6 +1742,18 @@ class ModelRunner:
                         raise RuntimeError("chunked verifier omitted a request")
                     output_class = type(request_parts[0])
                     reported_length = reported_lengths[row] or actual_lengths[row]
+                    if (len(request_parts) == 1
+                            and self.config.get("qwen35_reuse_single_block_outputs", True)):
+                        part = request_parts[0]
+                        outputs.append(output_class(
+                            logits=part.logits[:, :reported_length],
+                            hidden_states=part.hidden_states[:, :reported_length],
+                            hidden_taps={layer_id: value[:, :reported_length]
+                                         for layer_id, value in part.hidden_taps.items()},
+                            cache_transaction_id=part.cache_transaction_id,
+                        ))
+                        single_block_reused_requests += 1
+                        continue
                     outputs.append(output_class(
                         logits=torch.cat(
                             [part.logits for part in request_parts], dim=1
@@ -1764,6 +1819,8 @@ class ModelRunner:
                     dtype=torch.float32,
                     device=flat_logits.device,
                 )
+                postprocess_sampling_calls += 1
+                postprocess_token_downloads += 1
                 flat_token_ids_tensor = self._sample_qwen35_logits(
                     flat_logits,
                     temperatures,
@@ -1837,6 +1894,9 @@ class ModelRunner:
                 target_tokens=[result.target_token_ids for result in results],
                 parallel_verification=parallel_verification,
                 parallel_model_calls=parallel_model_calls,
+                postprocess_sampling_calls=postprocess_sampling_calls,
+                postprocess_token_downloads=postprocess_token_downloads,
+                single_block_reused_requests=single_block_reused_requests,
             )
             self._record_memory_stage(
                 "verify",
@@ -1863,6 +1923,9 @@ class ModelRunner:
         target_tokens: list[tuple[int, ...]] | None = None,
         parallel_verification: bool = False,
         parallel_model_calls: int | None = None,
+        postprocess_sampling_calls: int = 0,
+        postprocess_token_downloads: int = 0,
+        single_block_reused_requests: int = 0,
     ) -> None:
         stats = getattr(self, "_qwen35_verification_stats", None)
         if stats is None:
@@ -1877,6 +1940,9 @@ class ModelRunner:
                 "executed_model_steps": 0,
                 "avoided_model_steps": 0,
                 "first_rejection_position_histogram": {},
+                "postprocess_sampling_calls": 0,
+                "postprocess_token_downloads": 0,
+                "single_block_reused_requests": 0,
             }
             self._qwen35_verification_stats = stats
         planned_lengths = planned_lengths or query_lengths
@@ -1894,6 +1960,9 @@ class ModelRunner:
                 for start in range(0, len(lengths), micro_batch_size)
             )
 
+        stats["postprocess_sampling_calls"] += postprocess_sampling_calls
+        stats["postprocess_token_downloads"] += postprocess_token_downloads
+        stats["single_block_reused_requests"] += single_block_reused_requests
         stats["calls"] += 1
         stats["max_batch_size"] = max(
             stats["max_batch_size"],
@@ -1948,6 +2017,9 @@ class ModelRunner:
                 "executed_model_steps": 0,
                 "avoided_model_steps": 0,
                 "first_rejection_position_histogram": {},
+                "postprocess_sampling_calls": 0,
+                "postprocess_token_downloads": 0,
+                "single_block_reused_requests": 0,
             }
         return {
             **stats,

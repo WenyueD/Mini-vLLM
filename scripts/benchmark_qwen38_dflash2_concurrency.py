@@ -249,6 +249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default=os.fspath(RESULTS_ROOT))
     parser.add_argument("--logs-dir", default=os.fspath(LOGS_ROOT))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-batch-verification-sampling", action="store_true")
+    parser.add_argument("--no-reuse-single-block-outputs", action="store_true")
     parser.add_argument("--no-reuse-transaction-kv", action="store_true",
                         help="Use full KV transaction copies for the baseline A/B.")
     parser.add_argument("--fused-prefix-commit", action="store_true")
@@ -474,6 +476,8 @@ def build_config(
                 args, "vectorized_target_numerics", False
             ),
             "qwen35_fused_gdn": getattr(args, "fused_gdn_target", False),
+            "qwen35_batch_verification_sampling": not getattr(args, "no_batch_verification_sampling", False),
+            "qwen35_reuse_single_block_outputs": not getattr(args, "no_reuse_single_block_outputs", False),
             "qwen35_reuse_transaction_kv": not getattr(args, "no_reuse_transaction_kv", False),
             "qwen35_fused_prefix_commit": getattr(args, "fused_prefix_commit", False),
             "qwen35_reuse_verification_samples": getattr(args, "reuse_verification_samples", False),
@@ -1423,6 +1427,8 @@ def run_variant(
                 "num_speculative_tokens": args.num_speculative_tokens,
                 "temperature": 0.0,
                 "ignore_eos": args.ignore_eos,
+                "batch_verification_sampling": config.get("qwen35_batch_verification_sampling", True),
+                "reuse_single_block_outputs": config.get("qwen35_reuse_single_block_outputs", True),
                 "reuse_transaction_kv": config.get("qwen35_reuse_transaction_kv", True),
                 "cached_batch_pad_to_size": config.get(
                     "qwen35_cached_batch_pad_to_size"

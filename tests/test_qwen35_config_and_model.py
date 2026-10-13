@@ -658,9 +658,10 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         draft[accepted] = (draft[accepted] + 1) % 32
 
     runs = []
-    for mode in ("full", "early", "parallel", "chunked", "chunked3"):
+    chunked_modes = {"chunked", "chunked3", "block8_copy", "block8_reuse"}
+    for mode in ("full", "early", "parallel", "chunked", "chunked3", "block8_copy", "block8_reuse"):
         stop_early = mode == "early"
-        chunk_length = 3 if mode == "chunked3" else 4
+        chunk_length = 8 if mode.startswith("block8") else 3 if mode == "chunked3" else 4
         cache = HybridCacheManager()
         model.forward_with_cache(torch.tensor([1, 2, 3]), cache, "request")
         runner = ModelRunner.__new__(ModelRunner)
@@ -670,10 +671,13 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         runner.rank = 0
         runner.config = {
             "capture_verification_hidden_taps": True,
+            "qwen35_batch_verification_sampling": mode != "block8_copy",
+            "qwen35_reuse_single_block_outputs": mode != "block8_copy",
+            "qwen35_reuse_verification_samples": mode.startswith("block8"),
             "qwen35_replay_state_updates": True,
             "qwen35_stop_verification_at_mismatch": stop_early,
-            "qwen35_parallel_verification": mode in {"parallel", "chunked", "chunked3"},
-            "qwen35_parallel_verification_chunk_size": chunk_length if mode in {"chunked", "chunked3"} else 0,
+            "qwen35_parallel_verification": mode in chunked_modes or mode == "parallel",
+            "qwen35_parallel_verification_chunk_size": chunk_length if mode in chunked_modes else 0,
             "qwen35_cached_batch_pad_to_size": 4,
             "qwen35_cached_attention_pad_to_length": 32,
         }
@@ -692,10 +696,10 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         expected_steps = (
             accepted + 1 if stop_early else
             min(8, ((accepted // chunk_length) + 1) * chunk_length)
-            if mode in {"chunked", "chunked3"} else 8
+            if mode in chunked_modes else 8
         )
         reported_steps = (
-            accepted + 1 if mode in {"chunked", "chunked3"} and accepted < 7
+            accepted + 1 if mode in chunked_modes and accepted < 7
             else expected_steps
         )
         assert result.metadata["verified_tokens"] == reported_steps
@@ -715,14 +719,17 @@ def test_qwen35_early_stop_matches_full_verification_and_committed_cache(accepte
         assert stats["executed_model_steps"] == (
             1 if mode == "parallel" else
             (expected_steps + chunk_length - 1) // chunk_length
-            if mode in {"chunked", "chunked3"} else
+            if mode in chunked_modes else
             expected_steps
         )
         assert stats["avoided_model_steps"] == (
-            0 if mode in {"parallel", "chunked", "chunked3"} else 8 - expected_steps
+            0 if mode in chunked_modes or mode == "parallel" else 8 - expected_steps
         )
         histogram_key = "all_accepted" if accepted == 7 else str(accepted)
         assert stats["first_rejection_position_histogram"] == {histogram_key: 1}
+        if mode == "block8_reuse":
+            assert stats["single_block_reused_requests"] == 1
+            assert stats["postprocess_token_downloads"] == 1
         runs.append((cache, sample))
 
     for cache, sample in runs[1:]:
@@ -1698,3 +1705,149 @@ def test_reused_transaction_kv_exception_restores_grown_prefix(monkeypatch):
     tx = cache.begin_transaction(["r0"], 8)
     assert cache.ensure_request("r0").full_attention_layers[3].key.data_ptr() == pointers["r0"]
     cache.rollback(tx)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"))])
+@pytest.mark.parametrize("resolve_ties", [False, True])
+@torch.inference_mode()
+def test_verifier_batch_sampling_matches_request_sampling_without_logit_cat(device, resolve_ties, monkeypatch):
+    from myvllm.models.qwen3_8 import Qwen35ForwardOutput
+    logits = torch.zeros(4, 8, 32, dtype=torch.bfloat16, device=device)
+    # Include exact ties and distinct winners; padded rows must not be sampled.
+    logits[0, :, 4] = 3
+    logits[0, :, 9] = 3
+    logits[1, :, 17] = 4
+    hidden = torch.ones(4, 8, 16, dtype=torch.bfloat16, device=device)
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = SimpleNamespace(lm_head=torch.nn.Linear(16, 32, bias=False).to(
+        device=device, dtype=torch.bfloat16))
+    runner.model.lm_head.weight.zero_()
+    runner.model.lm_head.weight[4].fill_(2)
+    runner.model.lm_head.weight[9].fill_(1)
+    runner.config = {"qwen35_batch_verification_sampling": False,
+                     "resolve_greedy_ties_with_fp32_lm_head": resolve_ties}
+    outputs = [Qwen35ForwardOutput(logits[row:row + 1], hidden[row:row + 1], {},
+               verification_batch=(logits, hidden, row)) for row in range(2)]
+    old, old_calls = runner._sample_qwen35_block_outputs(outputs)
+    assert old_calls == 2
+    assert old[0] == [4 if resolve_ties else 9] * 8
+    runner.config["qwen35_batch_verification_sampling"] = True
+    def no_cat(*args, **kwargs):
+        raise AssertionError("shared batch sampling must not gather logits")
+    monkeypatch.setattr(torch, "cat", no_cat)
+    new, new_calls = runner._sample_qwen35_block_outputs(outputs)
+    assert new == old
+    assert new_calls == 1
+    assert len(new) == 2 and all(len(tokens) == 8 for tokens in new)
+
+
+@torch.inference_mode()
+def test_verifier_batch_sampling_fallback_handles_ragged_legacy_outputs():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = {"qwen35_batch_verification_sampling": False}
+    outputs = [SimpleNamespace(logits=torch.randn(1, n, 32),
+                               hidden_states=torch.randn(1, n, 16))
+               for n in (8, 3, 1)]
+    expected, _ = runner._sample_qwen35_block_outputs(outputs)
+    runner.config["qwen35_batch_verification_sampling"] = True
+    actual, calls = runner._sample_qwen35_block_outputs(outputs)
+    assert actual == expected
+    assert calls == 1
+    assert list(map(len, actual)) == [8, 3, 1]
+
+
+@torch.inference_mode()
+def test_verifier_batched_sampling_failure_rolls_back_all_shared_kv_requests():
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    cache = HybridCacheManager(reuse_transaction_kv=True)
+    ids = ["a", "b"]
+    for rid in ids:
+        model.forward_with_cache(torch.tensor([1, 2, 3]), cache, rid)
+    before = {rid: cache.ensure_request(rid).clone() for rid in ids}
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model, runner.hybrid_cache_manager = model, cache
+    runner.dflash2_draft_model = None
+    runner.dflash2_draft_cache = None
+    runner.is_qwen35_target, runner.rank = True, 0
+    runner.config = {"qwen35_parallel_verification": True,
+        "qwen35_parallel_verification_chunk_size": 8,
+        "qwen35_replay_state_updates": True, "qwen35_reuse_verification_samples": True,
+        "qwen35_cached_batch_pad_to_size": 4, "qwen35_cached_attention_pad_to_length": 32}
+    runner._pending_verified_cache_transactions = {}
+    calls = []
+    def fail(logits, temperatures, *, hidden_states=None):
+        calls.append(logits.shape[0])
+        raise RuntimeError("injected batched sampling failure")
+    runner._sample_qwen35_logits = fail
+    sequences = [Sequence([1, 2, 3, 4], 4, SamplingParams(temperature=0, max_tokens=16),
+                          request_id=rid) for rid in ids]
+    drafts = [(5, 6, 7, 8, 9, 10, 11)] * 2
+    for seq, draft in zip(sequences, drafts):
+        seq.mark_computed(3)
+        seq.begin_speculation(draft)
+    with pytest.raises(RuntimeError, match="injected batched"):
+        runner.verify(SpecDecodeBatch(sequences,
+            [Proposal(seq.seq_id, draft) for seq, draft in zip(sequences, drafts)]))
+    assert calls == [16]
+    for rid in ids:
+        assert_cache_state_equal(cache.ensure_request(rid), before[rid])
+    assert cache.estimate_bytes()["active_transactions"] == 0
+    assert not runner._pending_verified_cache_transactions
+
+
+@pytest.mark.parametrize("reuse_single_block", [False, True])
+@torch.inference_mode()
+def test_verifier_single_block_result_shares_storage_after_rejection(reuse_single_block, monkeypatch):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=8))
+    init_small(model)
+    cache = HybridCacheManager(reuse_transaction_kv=True)
+    ids = ["a", "b"]
+    for rid in ids:
+        model.forward_with_cache(torch.tensor([1, 2, 3]), cache, rid)
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model, runner.hybrid_cache_manager = model, cache
+    runner.dflash2_draft_model = None
+    runner.dflash2_draft_cache = None
+    runner.is_qwen35_target, runner.rank = True, 0
+    runner.config = {"qwen35_parallel_verification": True,
+        "qwen35_parallel_verification_chunk_size": 8,
+        "qwen35_replay_state_updates": True, "qwen35_reuse_verification_samples": True,
+        "capture_verification_hidden_taps": True,
+        "qwen35_batch_verification_sampling": True,
+        "qwen35_reuse_single_block_outputs": reuse_single_block,
+        "qwen35_cached_batch_pad_to_size": 4, "qwen35_cached_attention_pad_to_length": 32}
+    runner._pending_verified_cache_transactions = {}
+    # Force first-position rejection to exercise the reported-prefix view.
+    runner._sample_qwen35_logits = lambda logits, temperatures, **kw: torch.zeros(
+        logits.shape[0], dtype=torch.long, device=logits.device)
+    native = model.forward_with_cache_parallel_batch
+    captured = []
+    def record(*args, **kwargs):
+        outputs = native(*args, **kwargs)
+        captured.extend(outputs)
+        return outputs
+    monkeypatch.setattr(model, "forward_with_cache_parallel_batch", record)
+    sequences = [Sequence([1, 2, 3, 4], 4, SamplingParams(temperature=0, max_tokens=16),
+                          request_id=rid) for rid in ids]
+    drafts = [(1,) * 7] * 2
+    for seq, draft in zip(sequences, drafts):
+        seq.mark_computed(3)
+        seq.begin_speculation(draft)
+    results = runner.verify(SpecDecodeBatch(sequences,
+        [Proposal(seq.seq_id, draft) for seq, draft in zip(sequences, drafts)]))
+    assert [r.metadata["verified_tokens"] for r in results] == [1, 1]
+    for seq, output in zip(sequences, captured):
+        plan = runner._pending_verified_cache_transactions[seq.seq_id]
+        assert plan.hidden_taps and output.hidden_taps
+        for layer, tap in plan.hidden_taps.items():
+            assert tap.shape[1] == 1
+            assert torch.equal(tap, output.hidden_taps[layer][:, :1])
+            shares = tap.untyped_storage().data_ptr() == output.hidden_taps[layer].untyped_storage().data_ptr()
+            assert shares == reuse_single_block
+    stats = runner.get_qwen35_verification_stats()
+    assert stats["postprocess_token_downloads"] == 1
+    assert stats["single_block_reused_requests"] == (2 if reuse_single_block else 0)
+    runner.rollback_verified_cache([seq.seq_id for seq in sequences])
+    assert cache.estimate_bytes()["active_transactions"] == 0

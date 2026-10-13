@@ -83,6 +83,8 @@ class Qwen35ForwardOutput:
     hidden_states: torch.Tensor
     hidden_taps: dict[int, torch.Tensor]
     cache_transaction_id: int | None = None
+    # Sampling can consume the original batched storage without gathering logits.
+    verification_batch: tuple[torch.Tensor, torch.Tensor, int] | None = None
 
 
 class Qwen35TokenwiseLinear(nn.Linear):
@@ -1434,6 +1436,7 @@ class Qwen35ForCausalLM(nn.Module):
                         cache_transaction_id=(
                             None if transaction is None else transaction.transaction_id
                         ),
+                        verification_batch=(logits, hidden, block_row),
                     )
         if any(output is None for output in outputs):
             raise RuntimeError("parallel cached target omitted a request")
