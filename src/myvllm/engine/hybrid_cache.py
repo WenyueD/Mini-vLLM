@@ -129,12 +129,12 @@ class HybridRequestState:
     )
     linear_layers: dict[int, LinearLayerState] = field(default_factory=dict)
 
-    def clone(self) -> "HybridRequestState":
+    def clone(self, *, reuse_full_attention: bool = False) -> "HybridRequestState":
         return HybridRequestState(
             request_id=self.request_id,
             logical_length=self.logical_length,
             full_attention_layers={
-                layer_id: _clone_full_attention_state(state)
+                layer_id: _clone_full_attention_state(state, reuse_storage=reuse_full_attention)
                 for layer_id, state in self.full_attention_layers.items()
             },
             linear_layers={
@@ -165,9 +165,17 @@ class HybridRequestState:
 
 def _clone_full_attention_state(
     state: FullAttentionLayerState | tuple[torch.Tensor, torch.Tensor],
+    *,
+    reuse_storage: bool = False,
 ) -> FullAttentionLayerState:
     if isinstance(state, FullAttentionLayerState):
+        if reuse_storage:
+            # Length metadata is private; committed prefix storage is append-only.
+            return FullAttentionLayerState(state.key, state.value, state.logical_length)
         return state.clone()
+    if reuse_storage:
+        key, value = state
+        return FullAttentionLayerState(key, value, int(key.shape[1]))
     key, value = state
     return FullAttentionLayerState.from_tensors(key, value)
 
@@ -207,6 +215,7 @@ class HybridCacheTransaction:
     )
     recorded_steps: dict[RequestId, set[int]] = field(default_factory=dict)
     state: HybridTransactionState = HybridTransactionState.ACTIVE
+    reuse_full_attention: bool = False
     linear_updates: dict[RequestId, dict[int, list[LinearStateUpdate]]] = field(
         default_factory=dict
     )
@@ -220,7 +229,9 @@ class HybridCacheManager:
     full-attention KV. Snapshot-based commit remains available to legacy callers.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, reuse_transaction_kv: bool = False) -> None:
+        # Metadata-only rollback requires append-only KV writers.
+        self.reuse_transaction_kv = reuse_transaction_kv
         self._states: dict[RequestId, HybridRequestState] = {}
         self._active: dict[int, HybridCacheTransaction] = {}
         self._next_transaction_id = 0
@@ -266,14 +277,31 @@ class HybridCacheManager:
             if any(value < 0 for value in reserve_map.values()):
                 raise ValueError("reserve_tokens must be non-negative")
 
+        if self.reuse_transaction_kv:
+            if any(rid in tx.request_ids for tx in self._active.values() for rid in request_ids):
+                raise RuntimeError("overlapping append-only KV transaction")
+            # Reserve once before sharing storage. Prefix copying only occurs
+            # when the request outgrows its current capacity.
+            for request_id in request_ids:
+                request = self.ensure_request(request_id)
+                for layer_id, kv in list(request.full_attention_layers.items()):
+                    if not isinstance(kv, FullAttentionLayerState):
+                        key, value = kv
+                        kv = FullAttentionLayerState(key, value, int(key.shape[1]))
+                        request.full_attention_layers[layer_id] = kv
+                    kv._ensure_capacity(kv.logical_length + reserve_map[request_id])
+
         transaction_id = self._next_transaction_id
         self._next_transaction_id += 1
         transaction = HybridCacheTransaction(
             transaction_id=transaction_id,
             request_ids=request_ids,
             reserve_tokens=reserve_map,
+            reuse_full_attention=self.reuse_transaction_kv,
             original_states={
-                request_id: self.ensure_request(request_id).clone()
+                request_id: self.ensure_request(request_id).clone(
+                    reuse_full_attention=self.reuse_transaction_kv
+                )
                 for request_id in request_ids
             },
             snapshots={request_id: {} for request_id in request_ids},
@@ -327,7 +355,9 @@ class HybridCacheManager:
         for request_id in selected:
             if request_id not in transaction.original_states:
                 raise ValueError("request does not belong to this transaction")
-            self._states[request_id] = transaction.original_states[request_id].clone()
+            self._states[request_id] = transaction.original_states[request_id].clone(
+                reuse_full_attention=transaction.reuse_full_attention
+            )
 
     def restore_verified_prefix(
         self,
@@ -423,7 +453,7 @@ class HybridCacheManager:
             if accepted == 0:
                 self._states[request_id] = transaction.original_states[
                     request_id
-                ].clone()
+                ].clone(reuse_full_attention=transaction.reuse_full_attention)
                 continue
             try:
                 snapshot = transaction.snapshots[request_id][accepted]
@@ -438,7 +468,9 @@ class HybridCacheManager:
     def rollback(self, transaction: HybridCacheTransaction) -> None:
         self._require_active(transaction)
         for request_id, state in transaction.original_states.items():
-            self._states[request_id] = state.clone()
+            self._states[request_id] = state.clone(
+                reuse_full_attention=transaction.reuse_full_attention
+            )
         transaction.state = HybridTransactionState.ROLLED_BACK
         del self._active[transaction.transaction_id]
 
@@ -457,6 +489,23 @@ class HybridCacheManager:
             for key, value in breakdown.items():
                 state_totals[key] += value
 
+        # Referenced KV storage is counted only once across active/rollback state.
+        seen_kv_storage = set()
+        def unique_kv_bytes(request):
+            total = 0
+            for kv in request.full_attention_layers.values():
+                tensors = (kv.key, kv.value) if isinstance(kv, FullAttentionLayerState) else kv
+                for tensor in tensors:
+                    storage = tensor.untyped_storage()
+                    identity = (str(tensor.device), storage.data_ptr())
+                    if identity not in seen_kv_storage:
+                        seen_kv_storage.add(identity)
+                        total += storage.nbytes()
+            return total
+        for request in self._states.values():
+            unique_kv_bytes(request)
+        original_kv_owned_bytes = 0
+        original_kv_reference_bytes = 0
         original_bytes = 0
         snapshot_bytes = 0
         update_bytes = 0
@@ -468,10 +517,14 @@ class HybridCacheManager:
                 for updates in layers.values()
                 for update in updates
             )
-            original_bytes += sum(
-                state.nbytes()["total_bytes"]
-                for state in transaction.original_states.values()
-            )
+            for original in transaction.original_states.values():
+                owned_kv = unique_kv_bytes(original)
+                original_kv_owned_bytes += owned_kv
+                if transaction.reuse_full_attention:
+                    original_kv_reference_bytes += original.nbytes()["full_attention_kv_bytes"]
+                original_bytes += owned_kv + sum(
+                    state.nbytes() for state in original.linear_layers.values()
+                )
             snapshot_bytes += sum(
                 snapshot.nbytes()["total_bytes"]
                 for snapshots in transaction.snapshots.values()
@@ -491,6 +544,8 @@ class HybridCacheManager:
             "state_total_bytes": state_totals["total_bytes"],
             "active_transactions": len(self._active),
             "transaction_original_state_bytes": original_bytes,
+            "transaction_original_kv_owned_bytes": original_kv_owned_bytes,
+            "transaction_original_kv_reference_bytes": original_kv_reference_bytes,
             "transaction_snapshot_state_bytes": snapshot_bytes,
             "transaction_linear_update_bytes": update_bytes,
             "transaction_recorded_steps": recorded_steps,

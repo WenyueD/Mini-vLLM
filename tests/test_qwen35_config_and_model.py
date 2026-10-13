@@ -1606,3 +1606,95 @@ def test_runner_dflash2_tensor_batches_unequal_contexts_and_independent_budgets(
     assert runner.get_dflash2_profile_stats()["proposal_requests"] == 2
     assert runner.get_dflash2_profile_stats()["max_proposal_batch_size"] == 2
     assert runner.get_dflash2_profile_stats()["tensor_batched_proposal_calls"] == 1
+
+
+@pytest.mark.parametrize("accepted", range(9))
+@pytest.mark.parametrize("device,dtype", [
+    ("cpu", torch.float32), ("cpu", torch.bfloat16),
+    pytest.param("cuda", torch.bfloat16, marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="requires CUDA")),
+])
+@torch.inference_mode()
+def test_reused_transaction_kv_matches_full_copy_parallel_prefix(accepted, device, dtype):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    model.to(device=device, dtype=dtype).eval()
+    if device == "cuda":
+        model.set_experimental_vectorized_target(
+            True, fused_gdn=True, compact_updates=True, short_prefill_attention=True)
+    caches = [HybridCacheManager(reuse_transaction_kv=flag) for flag in (False, True)]
+    ids, lengths = ["r0", "r1"], [8, 5]
+    prefixes = [torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3, 4, 5, 6, 7])]
+    prefixes = [prefix.to(device) for prefix in prefixes]
+    query = torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 0, 0, 0]], device=device)
+    results = []
+    for cache in caches:
+        for rid, prefix in zip(ids, prefixes):
+            model.forward_with_cache(prefix, cache, rid)
+        txs = {rid: cache.begin_transaction([rid], length)
+               for rid, length in zip(ids, lengths)}
+        if cache.reuse_transaction_kv:
+            for rid in ids:
+                original = txs[rid].original_states[rid].full_attention_layers[3]
+                current = cache.ensure_request(rid).full_attention_layers[3]
+                assert original is not current
+                assert original.key.data_ptr() == current.key.data_ptr()
+                assert original.value.data_ptr() == current.value.data_ptr()
+            assert cache.estimate_bytes()["transaction_original_kv_owned_bytes"] == 0
+        results.append(model.forward_with_cache_parallel_batch(
+            query, lengths, cache, ids, transactions=txs, record_linear_updates=True,
+            attention_pad_to_length=32, batch_pad_to_size=4,
+        ))
+        for rid, length in zip(ids, lengths):
+            count = min(accepted, length)
+            assert cache.restore_verified_prefix(txs[rid], rid, count, fused=device == "cuda")
+            cache.finalize_replayed_commit(txs[rid], {rid: count})
+        assert cache.estimate_bytes()["active_transactions"] == 0
+    for a, b in zip(*results):
+        assert torch.equal(a.logits, b.logits)
+        assert torch.equal(a.hidden_states, b.hidden_states)
+    for rid in ids:
+        assert_cache_state_equal(caches[0].ensure_request(rid), caches[1].ensure_request(rid))
+    # The next target step must overwrite rejected suffixes and read only the prefix.
+    outputs = [model.forward_with_cache_batch(
+        torch.tensor([[13], [14]], device=device), [1, 1], cache, ids,
+        attention_pad_to_length=32, batch_pad_to_size=4,
+    ) for cache in caches]
+    for a, b in zip(*outputs):
+        assert torch.equal(a.logits, b.logits)
+    for rid in ids:
+        assert_cache_state_equal(caches[0].ensure_request(rid), caches[1].ensure_request(rid))
+
+
+@torch.inference_mode()
+def test_reused_transaction_kv_exception_restores_grown_prefix(monkeypatch):
+    model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
+    init_small(model)
+    cache = HybridCacheManager(reuse_transaction_kv=True)
+    ids = ["r0", "r1"]
+    for rid in ids:
+        model.forward_with_cache(torch.tensor([1, 2, 3]), cache, rid)
+    before = {rid: cache.ensure_request(rid).clone() for rid in ids}
+    txs = {rid: cache.begin_transaction([rid], 8) for rid in ids}
+    pointers = {rid: cache.ensure_request(rid).full_attention_layers[3].key.data_ptr()
+                for rid in ids}
+    native = model.model.layers[3].self_attn.forward_with_cache_batch
+    def fail_after_kv(*args, **kwargs):
+        native(*args, **kwargs)
+        raise RuntimeError("injected failure after KV append")
+    monkeypatch.setattr(model.model.layers[3].self_attn, "forward_with_cache_batch", fail_after_kv)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        model.forward_with_cache_parallel_batch(
+            torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11]] * 2), [8, 8], cache, ids,
+            transactions=txs, record_linear_updates=True,
+            attention_pad_to_length=32, batch_pad_to_size=4,
+        )
+    for rid in ids:
+        cache.rollback(txs[rid])
+        assert_cache_state_equal(cache.ensure_request(rid), before[rid])
+        assert cache.ensure_request(rid).full_attention_layers[3].key.data_ptr() == pointers[rid]
+    assert cache.estimate_bytes()["active_transactions"] == 0
+    # A new transaction can reuse the already reserved suffix capacity.
+    tx = cache.begin_transaction(["r0"], 8)
+    assert cache.ensure_request("r0").full_attention_layers[3].key.data_ptr() == pointers["r0"]
+    cache.rollback(tx)

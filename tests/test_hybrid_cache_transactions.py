@@ -111,3 +111,34 @@ def test_hybrid_cache_replayed_commit_keeps_per_step_records_lightweight():
     assert tx.state is HybridTransactionState.COMMITTED
     assert after.logical_length == 7
     assert after.linear_layers[0].recurrent_state.unique().item() == 3
+
+
+def test_reused_kv_transaction_keeps_recurrent_backup_and_rejects_overlap():
+    from myvllm.engine.hybrid_cache import FullAttentionLayerState
+    manager = HybridCacheManager(reuse_transaction_kv=True)
+    state = manager.ensure_request("r")
+    state.logical_length = 3
+    state.full_attention_layers[1] = FullAttentionLayerState.from_tensors(
+        torch.arange(6.).reshape(1, 3, 1, 2),
+        torch.arange(6.).reshape(1, 3, 1, 2), capacity=16,
+    )
+    manager.set_linear_layer_state("r", 0, torch.ones(1, 2, 3, 4), torch.ones(1, 8, 3))
+    pointer = state.full_attention_layers[1].key.data_ptr()
+    tx = manager.begin_transaction(["r"], 8)
+    with pytest.raises(RuntimeError, match="overlapping"):
+        manager.begin_transaction(["r"], 8)
+    original = tx.original_states["r"]
+    state.full_attention_layers[1].append(torch.zeros(1, 8, 1, 2), torch.zeros(1, 8, 1, 2))
+    state.logical_length += 8
+    state.linear_layers[0].recurrent_state.zero_()
+    assert original.full_attention_layers[1].logical_length == 3
+    assert original.linear_layers[0].recurrent_state.sum() > 0
+    estimate = manager.estimate_bytes()
+    assert estimate["transaction_original_kv_owned_bytes"] == 0
+    assert estimate["transaction_original_kv_reference_bytes"] > 0
+    assert estimate["transaction_original_state_bytes"] == original.linear_layers[0].nbytes()
+    manager.rollback(tx)
+    restored = manager.ensure_request("r")
+    assert restored.full_attention_layers[1].key.data_ptr() == pointer
+    assert restored.logical_length == restored.full_attention_layers[1].logical_length == 3
+    assert restored.linear_layers[0].recurrent_state.sum() > 0

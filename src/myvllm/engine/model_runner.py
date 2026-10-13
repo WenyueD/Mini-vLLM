@@ -160,7 +160,9 @@ class ModelRunner:
                 qwen35_text_config.full_attention_layers
             )
             self.is_qwen35_target = True
-            self.hybrid_cache_manager = HybridCacheManager()
+            self.hybrid_cache_manager = HybridCacheManager(
+                reuse_transaction_kv=self.config.get("qwen35_reuse_transaction_kv", True)
+            )
             # Keep cached decode, verification, and replay on the same CUDA
             # kernel shapes. BF16 reductions can otherwise vary with the
             # active batch/context shape and change greedy decisions at ties.
