@@ -1,7 +1,7 @@
 [project]
 name = "myvllm"
 version = "0.1.0"
-description = "A custom vLLM project"
+description = "Qwen hybrid inference and DFlash2 speculative decoding research on Mini-vLLM"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -33,6 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = [".", "src", "tests"]
+testpaths = ["tests"]
 
 [dependency-groups]
 dev = [

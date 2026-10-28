@@ -55,6 +55,10 @@ cover/
 # Benchmark artifacts
 logs/
 results/
+reports/*.tar.gz
+.pytest-tmp*/
+.pytest-proposal-*/
+.codex-*.bundle
 
 # Translations
 *.mo

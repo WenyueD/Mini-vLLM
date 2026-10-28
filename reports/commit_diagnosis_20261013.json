@@ -1,0 +1,45 @@
+{
+  "sample_commit_calls": 64,
+  "stats": {
+    "_install_dflash2_projected_context": {
+      "calls": 1560,
+      "host_seconds": 4.992652975022793,
+      "false_returns": 0,
+      "nonempty_plans": 0,
+      "cuda_interval_ms": 5074.763900279999
+    },
+    "restore_verified_prefix": {
+      "calls": 1134,
+      "host_seconds": 5.337131340056658,
+      "false_returns": 0,
+      "nonempty_plans": 0,
+      "cuda_interval_ms": 5399.388061761856
+    },
+    "_replay_qwen35_accepted_prefixes": {
+      "calls": 64,
+      "host_seconds": 0.00020689517259597778,
+      "false_returns": 0,
+      "nonempty_plans": 0,
+      "cuda_interval_ms": 0.9813440088182688
+    },
+    "_append_dflash2_hidden_history": {
+      "calls": 1536,
+      "host_seconds": 0.22312238439917564,
+      "false_returns": 0,
+      "nonempty_plans": 0,
+      "cuda_interval_ms": 251.98985577374697
+    },
+    "finalize_replayed_commit": {
+      "calls": 1536,
+      "host_seconds": 0.005787555128335953,
+      "false_returns": 0,
+      "nonempty_plans": 0,
+      "cuda_interval_ms": 21.523456007242203
+    },
+    "commit_total": {
+      "calls": 64,
+      "wall_seconds": 15.79171908646822
+    }
+  },
+  "scope": "First 64 C24 commits; synchronization-instrumented diagnostic, not throughput benchmark"
+}

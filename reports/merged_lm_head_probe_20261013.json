@@ -1,0 +1,38 @@
+[
+  {
+    "batch": 24,
+    "query": 8,
+    "max_abs_diff": 0.0,
+    "different_logits": 0,
+    "argmax_mismatches": 0,
+    "serial_ms": 12.392243448893229,
+    "merged_ms": 2.4568832397460936
+  },
+  {
+    "batch": 24,
+    "query": 4,
+    "max_abs_diff": 0.0,
+    "different_logits": 0,
+    "argmax_mismatches": 0,
+    "serial_ms": 6.178986612955729,
+    "merged_ms": 1.6011946360270182
+  },
+  {
+    "batch": 24,
+    "query": 1,
+    "max_abs_diff": 0.0,
+    "different_logits": 0,
+    "argmax_mismatches": 0,
+    "serial_ms": 1.5502335866292318,
+    "merged_ms": 1.5269888559977214
+  },
+  {
+    "batch": 6,
+    "query": 8,
+    "max_abs_diff": 0.03125,
+    "different_logits": 3179974,
+    "argmax_mismatches": 0,
+    "serial_ms": 12.155392456054688,
+    "merged_ms": 1.5576746622721354
+  }
+]

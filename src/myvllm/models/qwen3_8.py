@@ -1009,9 +1009,10 @@ class Qwen35ForCausalLM(nn.Module):
 
     def set_experimental_vectorized_target(
         self, enabled: bool, *, fused_gdn: bool = False, compact_updates: bool = False,
-        short_prefill_attention: bool = False,
+        short_prefill_attention: bool = False, merged_lm_head: bool = False,
     ) -> None:
         self.experimental_fixed_lm_head_rows = bool(enabled)
+        self.experimental_merged_lm_head = bool(enabled and merged_lm_head)
         self.model.compact_verification_copies = bool(enabled and compact_updates)
         for module in self.model.modules():
             if isinstance(module, (
@@ -1410,13 +1411,21 @@ class Qwen35ForCausalLM(nn.Module):
                     head_rows = micro_batch_size
                 if head_rows < len(rows):
                     raise ValueError("LM head rows cannot omit active requests")
-                logits = torch.stack(
-                    [
-                        self.compute_logits(hidden[:head_rows, token_index])
-                        for token_index in range(query_length)
-                    ],
-                    dim=1,
-                )
+                if getattr(self, "experimental_merged_lm_head", False):
+                    # Flatten active and padded rows together; preserve [B, Q, V]
+                    # output layout. This changes GEMM shape and is opt-in.
+                    head_input = hidden[:head_rows].contiguous()
+                    logits = self.compute_logits(
+                        head_input.reshape(-1, head_input.shape[-1])
+                    ).reshape(head_rows, query_length, -1)
+                else:
+                    logits = torch.stack(
+                        [
+                            self.compute_logits(hidden[:head_rows, token_index])
+                            for token_index in range(query_length)
+                        ],
+                        dim=1,
+                    )
                 for block_row, row in enumerate(rows):
                     request_id = request_ids[row]
                     transaction = None if transactions is None else transactions[request_id]

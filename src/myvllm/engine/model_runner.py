@@ -953,6 +953,7 @@ class ModelRunner:
                 self.model.set_experimental_vectorized_target(
                     not is_prefill, fused_gdn=self.config.get("qwen35_fused_gdn", False),
                     short_prefill_attention=self.config.get("qwen35_short_prefill_attention", False),
+                    merged_lm_head=self.config.get("qwen35_merged_lm_head", False),
                 )
             stage_name = "prefill" if is_prefill else "target_decode"
             self._record_memory_stage(
@@ -1572,6 +1573,7 @@ class ModelRunner:
             self.model.set_experimental_vectorized_target(
                 True, fused_gdn=self.config.get("qwen35_fused_gdn", False),
                 short_prefill_attention=self.config.get("qwen35_short_prefill_attention", False),
+                merged_lm_head=self.config.get("qwen35_merged_lm_head", False),
                 compact_updates=self.config.get("qwen35_compact_verification_copies", False),
             )
         if self.hybrid_cache_manager is None:
@@ -2108,6 +2110,7 @@ class ModelRunner:
             self.model.set_experimental_vectorized_target(
                 True, fused_gdn=self.config.get("qwen35_fused_gdn", False),
                 short_prefill_attention=self.config.get("qwen35_short_prefill_attention", False),
+                merged_lm_head=self.config.get("qwen35_merged_lm_head", False),
             )
         self.model.forward_with_cache_batch(
             input_ids,

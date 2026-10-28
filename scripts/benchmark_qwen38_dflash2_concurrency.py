@@ -220,6 +220,8 @@ def parse_args() -> argparse.Namespace:
         "--vectorized-target-numerics", action="store_true",
         help="Experimentally share a vectorized BF16 target path across baseline and verifier.",
     )
+    parser.add_argument("--merged-lm-head", action="store_true",
+                        help="Experimentally merge verifier LM-head positions; changes BF16 GEMM shape.")
     parser.add_argument("--max-metrics-history", type=int, default=100000)
     parser.add_argument(
         "--lightweight-live-stats", action="store_true",
@@ -261,6 +263,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.warmup_output_tokens < 0:
         parser.error("--warmup-output-tokens must be nonnegative")
+    if args.merged_lm_head and not args.vectorized_target_numerics:
+        parser.error("--merged-lm-head requires --vectorized-target-numerics")
     if args.short_prefill_attention and not args.vectorized_target_numerics:
         parser.error("--short-prefill-attention requires --vectorized-target-numerics")
     if args.fused_gdn_target and not args.vectorized_target_numerics:
@@ -483,6 +487,7 @@ def build_config(
             "qwen35_reuse_verification_samples": getattr(args, "reuse_verification_samples", False),
             "qwen35_compact_verification_copies": getattr(args, "compact_verification_copies", False),
             "qwen35_short_prefill_attention": getattr(args, "short_prefill_attention", False),
+            "qwen35_merged_lm_head": getattr(args, "merged_lm_head", False),
             "max_metrics_history": args.max_metrics_history,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "target_cache_memory_fraction": args.target_cache_memory_fraction,
@@ -1427,6 +1432,7 @@ def run_variant(
                 "num_speculative_tokens": args.num_speculative_tokens,
                 "temperature": 0.0,
                 "ignore_eos": args.ignore_eos,
+                "merged_lm_head": config.get("qwen35_merged_lm_head", False),
                 "batch_verification_sampling": config.get("qwen35_batch_verification_sampling", True),
                 "reuse_single_block_outputs": config.get("qwen35_reuse_single_block_outputs", True),
                 "reuse_transaction_kv": config.get("qwen35_reuse_transaction_kv", True),

@@ -1247,7 +1247,8 @@ def test_qwen35_vectorized_rmsnorm_is_query_shape_invariant(width):
     assert torch.equal(block, individual)
 
 
-def test_qwen35_fixed_lm_head_rows_match_serial_and_parallel():
+@pytest.mark.parametrize("merged", [False, True])
+def test_qwen35_fixed_lm_head_rows_match_serial_and_parallel(merged):
     model = Qwen35ForCausalLM.from_config_dict(tiny_config(num_layers=4))
     init_small(model)
     serial_cache = HybridCacheManager()
@@ -1255,6 +1256,7 @@ def test_qwen35_fixed_lm_head_rows_match_serial_and_parallel():
     model.forward_with_cache(torch.tensor([1, 2, 3]), serial_cache, "serial")
     parallel_cache._states["parallel"] = serial_cache.get_request_state("serial").clone()
     model.experimental_fixed_lm_head_rows = True
+    model.experimental_merged_lm_head = merged
     row_counts = []
     original_compute_logits = model.compute_logits
 
@@ -1268,14 +1270,17 @@ def test_qwen35_fixed_lm_head_rows_match_serial_and_parallel():
             torch.tensor([[4]]), [1], serial_cache, ["serial"],
             attention_pad_to_length=32, batch_pad_to_size=4,
         )
-        model.forward_with_cache_parallel_batch(
+        outputs = model.forward_with_cache_parallel_batch(
             torch.tensor([[4, 5, 6]]), [3], parallel_cache, ["parallel"],
             attention_pad_to_length=32, batch_pad_to_size=4,
             logit_batch_size=1,
         )
     finally:
         model.compute_logits = original_compute_logits
-    assert row_counts == [4, 4, 4, 4]
+    assert row_counts == ([4, 12] if merged else [4, 4, 4, 4])
+    assert outputs[0].logits.shape == (1, 3, model.config.vocab_size)
+    expected = original_compute_logits(outputs[0].hidden_states)
+    torch.testing.assert_close(outputs[0].logits, expected)
 
 
 def test_qwen35_allocate_kv_cache_skips_unused_generic_pool(monkeypatch):

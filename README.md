@@ -1,264 +1,116 @@
-<p align="center">
-  <img src="./assets/minivllm.png" alt="MinivLLM" width="50%" height="50%">
-</p>
+# Mini-vLLM: Qwen Hybrid Inference & DFlash2
 
-<p align="center">
-| <a href="./README.md"><b>English</b></a> 
-| <a href="./README_zh.md"><b>简体中文</b></a> |
-</p>
+[English](README.md) | [简体中文](README_zh.md)
 
-# miniVLLM
+A research inference engine for **Qwen3.5/Qwen3.8 hybrid models and DFlash2 speculative decoding**, built on Mini-vLLM. The project focuses on real-model execution, greedy-output validation, hybrid cache transactions, and draft/verify/commit performance across concurrency levels.
 
-A custom implementation of vLLM inference engine with attention mechanism benchmarks, based on Nano-vLLM but with self-contained paged attention and flash attention implementation. 
+Current experiments use a Qwen3.8-27B target and a compatible DFlash2 draft on NVIDIA A800 80GB. This is an independent implementation; official vLLM is used as a separate comparison and diagnostic reference.
 
-Benchmarking on flash attention in prefilling time and paged attention in decoding time are provided.
+## Main features
 
-**New to vLLM?** Check out [HowToApproachvLLM.md](HowToApproachvLLM.md) for a step-by-step implementation guide covering layers, models, paged attention, CUDA graphs, and scheduling.
+- **Hybrid target:** Full Attention and Gated DeltaNet (GDN), checkpoint loading, RoPE, cached decoding, and target hidden-state taps.
+- **DFlash2 proposals:** up to seven speculative tokens, target-conditioned draft context, and batched proposals.
+- **Verification and commit:** greedy acceptance/correction, transactional KV and recurrent state, accepted-prefix restoration, and rollback.
+- **Optimizations:** parallel block verification, fused GDN recurrence/prefix restoration, append-only KV reuse, batched verification sampling, and reduced intermediate copies.
+- **Measurements:** paired target-only/DFlash2 runs, exact token comparison, acceptance, stage timing, memory tracking, and fixed-prefix official-vLLM diagnostics.
+- **Online runtime:** concurrent admission, cancellation, streaming infrastructure, and request metrics. See [online serving](docs/online_serving.md) for its separate entry points and scope.
 
-## Quickstart
+Original attention benchmarks and learning examples remain available but are no longer the main project entry point.
 
-```bash
-# Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
+## Results and boundaries
 
-# Sync dependencies
-uv sync
+Performance depends on workload, concurrency, numerical settings, and version. A faster LM head does not establish an equivalent end-to-end speedup.
 
-# Run the main inference engine
-uv run python main.py
+| Experiment | Observation | Scope |
+|---|---|---|
+| C1 real-model pair | Target-only 8.80 tok/s; DFlash2 18.80 tok/s; acceptance 29.57% | Four requests × 3,000 output tokens; unmerged head; all 12,000 tokens matched; single observation |
+| C24 LM-head A/B | Accumulated verify 651.38 → 634.48 s (−2.59%) | Both runs use DFlash2; 24 × 3,000 outputs matched; not a target-only comparison |
+| B4 matched-input profile | LM-head GPU activity 11.89 → 1.48 ms; official 1.48 ms | Same prompts/candidates, K=7; one warmed verification; profiler data, not throughput |
 
-# Run prefilling benchmark
-uv run python benchmark_prefilling.py
+Evidence: [C1 data](reports/batch1_default_comparison_20261013.json), [C24 data](reports/merged_lm_head_real_comparison_20261013.json), [matched-input report](reports/matched_profile_20261028/README.md). See the [report index](reports/README.md) for dated experiments; different versions and workloads must not be combined into one scaling curve.
 
-# Run decoding benchmark
-uv run python benchmark_decoding.py
-```
+**Numerical boundary:** BF16 kernel shape changes can change greedy decisions. `--merged-lm-head` remains experimental and off by default: a separate C1 long-output test found mismatches. The B4 diagnostic passing does not supersede that result. See [C1 merged-head evidence](reports/batch1_merged_comparison_20261013.json).
 
-To run multi-GPU setting, simply change world_size to n > 1 in config in main.py
+## Installation
 
-## What Each Script Does
+Real-model execution requires Linux, an NVIDIA GPU, compatible CUDA drivers, and local target/draft weights. The tested large-model setup uses A800 80GB; capacity at a requested concurrency must be measured.
 
 ```bash
-uv run python main.py
+git clone https://github.com/WenyueD/Mini-vLLM.git
+cd Mini-vLLM
+uv sync --python 3.11 --group dev
 ```
 
-This is the main inference engine demo
+Dependencies pin PyTorch 2.9.1, Transformers 4.57.3, and Linux x86-64 Triton 3.5.1. Official vLLM diagnostics use a **separate environment**, not a dependency of Mini-vLLM inference. The optional `oracle` dependency does not pin the historical reference build.
 
-Demonstrates the complete LLM inference pipeline using a custom engine implementation:
-- Create a small version of Qwen3 with random initialization
-- Creates 60 chat prompts (2 base prompts repeated 30 times each)
-- Processes them through the custom LLM engine with batch processing
-- Uses paged attention and KV cache management for efficient inference
-- Generates up to 256 tokens per prompt with temperature sampling
+## Paired real-model benchmark
 
-This showcases how the custom vLLM implementation handles batched text generation with memory-efficient attention.
+Weights are not included. Set checkpoint directories, then run a C1 smoke pair:
 
 ```bash
-uv run python benchmark_prefilling.py
+export MINIVLLM_QWEN38_PATH=/path/to/Qwen3.8-27B
+export MINIVLLM_DFLASH2_PATH=/path/to/Qwen3.8-27B-DFlash2
+
+uv run python scripts/benchmark_qwen38_dflash2_concurrency.py \
+  --target-model "$MINIVLLM_QWEN38_PATH" \
+  --draft-model "$MINIVLLM_DFLASH2_PATH" \
+  --variants target_only dflash2 \
+  --workload short --concurrency 1 \
+  --requests-per-run 4 --repeats 1 \
+  --warmup-requests 1 --warmup-output-tokens 16 \
+  --num-speculative-tokens 7 \
+  --parallel-target-verification --parallel-verification-chunk-size 8 \
+  --vectorized-target-numerics --fused-gdn-target \
+  --cached-target-micro-batch-size 1 \
+  --fused-prefix-commit --reuse-verification-samples \
+  --compact-verification-copies --short-prefill-attention \
+  --lightweight-live-stats --timeout 3600 \
+  --run-id qwen_dflash2_c1_smoke
 ```
 
-This is the prefilling phase comparison
+This short smoke run is **not** the 3,000-token experiment above. `--workload tasks4096` selects the four long-form tasks with a 4,096-token output budget. Start at C1 before raising concurrency, and set `--cached-target-micro-batch-size` deliberately: it changes execution shapes. Maximum admitted concurrency and actual verification batch size are different metrics.
 
-Compares three attention implementations during the **prefilling phase** (processing input prompts):
+Results: `results/qwen38_dflash2_perf/<run-id>/`; logs: `logs/qwen38_dflash2_perf/<run-id>/`. Check fairness/token matches, failures, actual batches, and warmup settings before interpreting throughput. Raw logs, traces, weights, and environments are not committed.
 
-1. **PyTorch Standard (O(N²) memory)**: Traditional attention that materializes full attention matrix
-2. **Naive Triton (O(N²) memory)**: GPU kernel that also uses O(N²) memory, limited by shared memory constraints (≤128 tokens)
-3. **Flash Attention (O(N) memory)**: Memory-efficient online softmax algorithm that processes attention in blocks
+## Key options
+
+| Option | Purpose / boundary |
+|---|---|
+| `--num-speculative-tokens 7` | Seven proposals; the complete verification query also contains an anchor |
+| `--parallel-target-verification` | Verify a causal block rather than a separate target forward per position |
+| `--vectorized-target-numerics` | Experimental shared BF16 vectorized target path |
+| `--fused-gdn-target`, `--fused-prefix-commit` | Fuse recurrence and accepted-prefix restoration respectively |
+| `--short-prefill-attention` | Direct-KV cached attention; requires vectorized target numerics |
+| `--merged-lm-head` | One GEMM across verification positions; opt-in, with known BF16 equality failures |
+| `--stop-verification-at-mismatch` | Optional early stopping, off by default; savings depend on mode/chunk size |
+
+Use `--help` for all switches. Numerical-path changes require exact greedy-output regression. This project does not claim general stochastic rejection sampling, universal equality to official vLLM, or a speedup at every concurrency.
+
+## Tests and diagnosis
 
 ```bash
-uv run python benchmark_decoding.py
-```
-
-This is the decoding phase comparison
-
-Compares three implementations during the **decoding phase** (generating output tokens one at a time):
-
-1. **Naive PyTorch**: Simple loop-based implementation using paged KV cache
-2. **Optimized PyTorch**: Vectorized implementation with batch gathering and masking
-3. **Triton Kernel**: Custom GPU kernel optimized for paged attention decode
-
-
-## Project Structure
-
-```
-myvllm/
-├── src/
-│   └── myvllm/           # Core vLLM implementation
-│       ├── models/       # Model implementations
-│       ├── engine/       # LLM engine logic, including sequence definition for input prompts, block management for KV cache management for GPU, scheduler for iteration-based scheduling of sequences, runner for actual implementation of running prefilling and decoding, and engine for generation API interface
-│       ├── layers/       # Model layer components (activation, attention, embeddings, etc.)
-│       ├── utils/        # Utility helpers and inference context management
-│       └── sampling_parameters.py
-├── main.py              # Full inference demo
-├── benchmark_prefilling.py   # Prefilling attention comparison
-└── benchmark_decoding.py     # Decoding attention comparison
-```
-
-## Requirements
-
-- Python ≥3.11, < 3.12
-- CUDA-capable GPU
-- Dependencies: `transformers`, `torch`, `xxhash` (managed by uv)
-
-## Speculative decoding MVP
-
-MiniVLLM now has an opt-in, proposer-independent speculative decode path:
-
-```python
-config["speculative_config"] = {
-    "enabled": True,
-    "proposer": "ngram",
-    "num_speculative_tokens": 4,
-    "ngram_min_size": 2,
-    "ngram_max_size": 4,
-}
-sampling_params = SamplingParams(temperature=0, max_tokens=128)
-```
-
-`temperature=0` is exact deterministic argmax. Target-only and speculative
-decoding use the same logits-to-token decision function. The MVP supports prompt
-n-gram lookup, a deterministic mock proposer, heterogeneous proposal/acceptance
-lengths, K+1 eager verification (including the bonus token), EOS/length limits,
-and transactional paged-KV reserve/commit/rollback. When prompt lookup finds no
-match or draft capacity is unavailable, that request performs ordinary one-token
-greedy decode.
-
-Runtime statistics are available through `engine.get_speculative_stats()`. They
-include proposed/accepted counts, acceptance lengths and per-position rates, plus
-proposal/verify/sample/commit wall times. A CPU-only correctness and overhead smoke
-benchmark is available without model weights:
-
-```bash
-uv run python benchmark_speculative.py
 uv run pytest -q
+python scripts/validate_matched_evidence.py reports/matched_profile_20261028
 ```
 
-`benchmark_speculative.py` uses a deterministic fake target/verifier whose output
-is the repeating cycle `0,1,2,3,4`, with a matching repeated prompt. Its K=4 / high
-acceptance result validates the lossless coordinator, transaction pipeline, and
-statistics plumbing only. It is **not** a real-model throughput measurement, an
-n-gram quality claim, or evidence of GPU speedup. Real performance and acceptance
-numbers must come from the Qwen3 GPU command below.
+Tests cover tiny models, cache/rollback, and CUDA paths when available. Real-checkpoint tests require additional opt-in settings; skipped tests are not real-model validation. Use [profile_qwen35_verifier.py](scripts/profile_qwen35_verifier.py) for operator attribution, separately from throughput runs. Matched-profile fixture layout is documented in the [reproduction guide](docs/matched_profile_reproduction.md).
 
-The implementation does **not** claim probability rejection sampling, non-greedy
-speculation, a neural draft model, EAGLE/DFlash2, verification CUDA graphs, or
-dynamic-K kernels. Positive-temperature requests continue through the unchanged
-ordinary sampler. Speculative verification is forced eager. Prefix-cache hash
-metadata is only published on transaction commit; speculative reservations never
-publish provisional prefixes.
+## Repository map
 
-The state/data-flow rationale and failure invariants are documented in
-[`docs/speculative_decoding_design.md`](docs/speculative_decoding_design.md).
+| Path | Contents |
+|---|---|
+| `src/myvllm/models/` | Qwen models, hybrid attention, GDN kernels |
+| `src/myvllm/spec_decode/` | DFlash2, proposal/verification coordination, greedy acceptance |
+| `src/myvllm/engine/` | Runner, sequences, scheduling, hybrid cache transactions |
+| `src/myvllm/online/` | Concurrent online runtime |
+| `scripts/` | Benchmarks, oracle fixtures, diagnostic tools |
+| `tests/` | Functional, numerical, rollback, and GPU tests |
+| `reports/` | Dated results, failure evidence, and conclusions |
 
-Qwen3.5/Qwen3.8 hybrid text target scaffolding is documented in
-[`docs/qwen35_target.md`](docs/qwen35_target.md). It covers nested `text_config`
-parsing, zero-based hidden taps `[5, 19, 33, 47, 61]`, request-isolated eager
-hybrid cache transactions, and the current text-only support boundary for the
-later DFlash2 proposer integration.
+Further reading: [target notes](docs/qwen35_target.md), [speculative design](docs/speculative_decoding_design.md), [server commands](docs/autodl_qwen38_validation.md), [version reconciliation](docs/version_reconciliation_20261028.md).
 
-### Real Qwen3-0.6B GPU validation
+## Origins and license
 
-The repository includes an opt-in target-only versus speculative greedy equality
-test. Its primary test replays target-only baseline tokens as proposals and asserts
-positive proposed/accepted counts plus an acceptance length greater than one. Thus
-it necessarily exercises real Qwen3 K+1 verification and cannot silently pass via
-K=0 fallback. A separate n-gram equality smoke test is also included. The test
-never downloads weights implicitly; point it at a local checkpoint:
+This work extends the original [MiniVLLM](https://github.com/Wenyueh/MinivLLM), based on Nano-vLLM with standalone attention benchmarks. Original learning material remains in [HowToApproachvLLM.md](HowToApproachvLLM.md); the previous overview is preserved as [historical documentation](docs/legacy_minivllm_readme.md). Historical capability statements are not current project status.
 
-```bash
-MINIVLLM_QWEN3_PATH=/absolute/path/to/Qwen3-0.6B \
-  uv run pytest -q -s tests/gpu/test_qwen3_speculative_equivalence.py
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:MINIVLLM_QWEN3_PATH = "D:\models\Qwen3-0.6B"
-uv run pytest -q -s tests/gpu/test_qwen3_speculative_equivalence.py
-```
-
-This environment had no CUDA device, so the real-model test is provided but was
-not reported as passed. CPU tests validate coordinator, scheduler, acceptance,
-verification metadata, and KV transaction behavior with deterministic targets.
-
-## Online request processing
-
-The online layer has three explicit boundaries:
-
-- `LLMEngine` owns request IDs, incremental committed-token events, cancellation,
-  scheduler state, and step-level metrics.
-- `OnlineEngine` is the single background writer to `LLMEngine` and GPU state.
-  HTTP threads only enqueue add/cancel commands and consume output queues. When no
-  requests exist, the loop blocks on the command queue and does not busy-spin.
-- The standard-library HTTP server handles JSON/SSE only. It does not call the
-  model runner or speculative coordinator directly, and adds no new dependency.
-
-Edit the model path in `examples/online_qwen3_config.json`, then start the server:
-
-```bash
-uv run python -m myvllm.online.server \
-  --config examples/online_qwen3_config.json --host 0.0.0.0 --port 8000
-```
-
-Non-streaming completion:
-
-```bash
-curl http://127.0.0.1:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"red blue red blue","temperature":0,"max_tokens":32}'
-```
-
-SSE streaming (`-N` disables curl buffering):
-
-```bash
-curl -N http://127.0.0.1:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"red blue red blue","temperature":0,"max_tokens":32,"stream":true,"request_id":"demo-stream"}'
-```
-
-Cancel explicitly with
-`POST /v1/requests/demo-stream/cancel`. A disconnected streaming client also
-causes the handler to enqueue cancellation. Health and step-level statistics are
-available at `/health` and `/stats`.
-
-This is a minimal OpenAI-style completions surface, not full OpenAI API
-compatibility. SSE detokenization retains an eight-token mutable suffix so common
-BPE boundary rewrites do not corrupt concatenated chunks; a rewrite extending
-beyond that window is reported as an explicit stream error. After a terminal event
-is consumed, request/channel state is released and `/stats` retains only a bounded
-terminal status history while keeping lifetime submitted/released counters.
-
-The speculative online endpoint rejects positive temperatures with HTTP 400 rather
-than silently changing sampling semantics. To serve positive-temperature requests,
-start a target-only configuration with `speculative_config.enabled=false`.
-
-Send concurrent requests from a shell:
-
-```bash
-seq 1 8 | xargs -P 8 -I{} curl -s http://127.0.0.1:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Explain paged KV cache","temperature":0,"max_tokens":64,"request_id":"curl-{}"}'
-curl -s http://127.0.0.1:8000/stats
-```
-
-Or run the repeatable HTTP benchmark:
-
-```bash
-uv run python benchmark_online.py --requests 32 --concurrency 8 --max-tokens 64
-```
-
-The benchmark reports `max_observed_decode_batch_size` and
-`observed_continuous_batching`. A single client issuing one request after another
-is only serial inference wrapped in HTTP. Dynamic continuous batching is actually
-demonstrated only when overlapping requests produce a recorded decode batch size
-greater than one.
-
-For a real Qwen3-0.6B server smoke test, run the server command on a CUDA host, then
-run both the concurrent benchmark and the `/stats` query above. This local
-environment has no CUDA and did not permit reading an SSH configuration, so no
-remote GPU/online result is claimed here.
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Wenyueh/MinivLLM&type=date&legend=top-left)](https://www.star-history.com/?utm_source=chatgpt.com#Wenyueh/MinivLLM&type=date&legend=top-left)
+The repository retains its [Apache-2.0 license](LICENSE). Model weights and external reference implementations have their own licenses.
