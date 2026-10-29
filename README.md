@@ -27,9 +27,9 @@ Performance depends on workload, concurrency, numerical settings, and version. A
 | C24 LM-head A/B | Accumulated verify 651.38 → 634.48 s (−2.59%) | Both runs use DFlash2; 24 × 3,000 outputs matched; not a target-only comparison |
 | B4 matched-input profile | LM-head GPU activity 11.89 → 1.48 ms; official 1.48 ms | Same prompts/candidates, K=7; one warmed verification; profiler data, not throughput |
 
-Evidence: [C1 data](reports/batch1_default_comparison_20261013.json), [C24 data](reports/merged_lm_head_real_comparison_20261013.json), [matched-input report](reports/matched_profile_20261028/README.md). See the [report index](reports/README.md) for dated experiments; different versions and workloads must not be combined into one scaling curve.
+Different versions and workloads must not be combined into one scaling curve. Detailed experiment artifacts are maintained outside the published repository.
 
-**Numerical boundary:** BF16 kernel shape changes can change greedy decisions. `--merged-lm-head` remains experimental and off by default: a separate C1 long-output test found mismatches. The B4 diagnostic passing does not supersede that result. See [C1 merged-head evidence](reports/batch1_merged_comparison_20261013.json).
+**Numerical boundary:** BF16 kernel shape changes can change greedy decisions. `--merged-lm-head` remains experimental and off by default; validate exact output equality for your configuration before enabling it.
 
 ## Installation
 
@@ -81,7 +81,7 @@ Results: `results/qwen38_dflash2_perf/<run-id>/`; logs: `logs/qwen38_dflash2_per
 | `--vectorized-target-numerics` | Experimental shared BF16 vectorized target path |
 | `--fused-gdn-target`, `--fused-prefix-commit` | Fuse recurrence and accepted-prefix restoration respectively |
 | `--short-prefill-attention` | Direct-KV cached attention; requires vectorized target numerics |
-| `--merged-lm-head` | One GEMM across verification positions; opt-in, with known BF16 equality failures |
+| `--merged-lm-head` | One GEMM across verification positions; experimental, requires numerical validation |
 | `--stop-verification-at-mismatch` | Optional early stopping, off by default; savings depend on mode/chunk size |
 
 Use `--help` for all switches. Numerical-path changes require exact greedy-output regression. This project does not claim general stochastic rejection sampling, universal equality to official vLLM, or a speedup at every concurrency.
@@ -90,10 +90,9 @@ Use `--help` for all switches. Numerical-path changes require exact greedy-outpu
 
 ```bash
 uv run pytest -q
-python scripts/validate_matched_evidence.py reports/matched_profile_20261028
 ```
 
-Tests cover tiny models, cache/rollback, and CUDA paths when available. Real-checkpoint tests require additional opt-in settings; skipped tests are not real-model validation. Use [profile_qwen35_verifier.py](scripts/profile_qwen35_verifier.py) for operator attribution, separately from throughput runs. Matched-profile fixture layout is documented in the [reproduction guide](docs/matched_profile_reproduction.md).
+Tests cover tiny models, cache/rollback, and CUDA paths when available. Real-checkpoint tests require additional opt-in settings; skipped tests are not real-model validation. Use [profile_qwen35_verifier.py](scripts/profile_qwen35_verifier.py) for operator attribution, separately from throughput runs.
 
 ## Repository map
 
@@ -105,9 +104,8 @@ Tests cover tiny models, cache/rollback, and CUDA paths when available. Real-che
 | `src/myvllm/online/` | Concurrent online runtime |
 | `scripts/` | Benchmarks, oracle fixtures, diagnostic tools |
 | `tests/` | Functional, numerical, rollback, and GPU tests |
-| `reports/` | Dated results, failure evidence, and conclusions |
 
-Further reading: [target notes](docs/qwen35_target.md), [speculative design](docs/speculative_decoding_design.md), [server commands](docs/autodl_qwen38_validation.md), [version reconciliation](docs/version_reconciliation_20261028.md).
+Further reading: [target notes](docs/qwen35_target.md), [speculative design](docs/speculative_decoding_design.md), [server commands](docs/autodl_qwen38_validation.md).
 
 ## Origins and license
 

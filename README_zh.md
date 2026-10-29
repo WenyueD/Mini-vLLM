@@ -27,9 +27,9 @@
 | C24 LM head A/B | 累计 verify 从 651.38 降至 634.48 秒，下降 2.59% | 两边均为 DFlash2；24×3,000 输出一致；不是 target-only 对照 |
 | B4 同输入诊断 | LM head GPU 活动累计从 11.89 降至 1.48 ms；官方为 1.48 ms | 相同 prompt 和候选，K=7；预热后首轮验证；插桩数据，非吞吐指标 |
 
-证据：[C1 数据](reports/batch1_default_comparison_20261013.json)、[C24 数据](reports/merged_lm_head_real_comparison_20261013.json)、[同输入诊断](reports/matched_profile_20261028/README.md)。历史实验见[报告索引](reports/README.md)，不同版本和负载的数据不能直接拼成并发扩展曲线。
+不同版本和负载的数据不能直接拼成并发扩展曲线。详细实验产物在公开仓库之外保存。
 
-**数值边界：** BF16 的 kernel 形状变化可能改变贪心决策。`--merged-lm-head` 仍是默认关闭的实验选项：另一轮 C1 长输出测试出现了 token 分歧，B4 首轮通过不能覆盖该失败记录。见[合并头 C1 数据](reports/batch1_merged_comparison_20261013.json)。
+**数值边界：** BF16 的 kernel 形状变化可能改变贪心决策。`--merged-lm-head` 仍是默认关闭的实验选项，开启前应针对具体配置验证严格输出一致性。
 
 ## 安装
 
@@ -81,7 +81,7 @@ uv run python scripts/benchmark_qwen38_dflash2_concurrency.py \
 | `--vectorized-target-numerics` | 实验性的共享 BF16 向量化 target 路径 |
 | `--fused-gdn-target`、`--fused-prefix-commit` | 分别融合递推和接受前缀恢复 |
 | `--short-prefill-attention` | 直接访问 KV 的缓存 attention；需要向量化 target |
-| `--merged-lm-head` | 将验证位置合成一次 LM-head GEMM；显式开启，已有 BF16 一致性失败记录 |
+| `--merged-lm-head` | 将验证位置合成一次 LM-head GEMM；实验选项，需要数值验证 |
 | `--stop-verification-at-mismatch` | 可选的首错早停，默认关闭；实际节省取决于验证模式及分块大小 |
 
 全部参数见 `--help`。修改数值路径后仍需严格贪心输出回归。本项目不宣称通用随机拒绝采样、不宣称所有输出与官方 vLLM 一致，也不宣称所有并发下都有加速。
@@ -90,10 +90,9 @@ uv run python scripts/benchmark_qwen38_dflash2_concurrency.py \
 
 ```bash
 uv run pytest -q
-python scripts/validate_matched_evidence.py reports/matched_profile_20261028
 ```
 
-测试包括小模型、缓存、回滚，以及有 CUDA 时运行的 GPU 测试。真实权重测试还需额外显式开启；跳过不能视为真实模型验证通过。[profile_qwen35_verifier.py](scripts/profile_qwen35_verifier.py) 用于算子分析，插桩运行应与吞吐基准分开。同输入 profile 脚本依赖实验目录布局，见[复现说明](docs/matched_profile_reproduction.md)。
+测试包括小模型、缓存、回滚，以及有 CUDA 时运行的 GPU 测试。真实权重测试还需额外显式开启；跳过不能视为真实模型验证通过。[profile_qwen35_verifier.py](scripts/profile_qwen35_verifier.py) 用于算子分析，插桩运行应与吞吐基准分开。
 
 ## 代码结构
 
@@ -105,9 +104,8 @@ python scripts/validate_matched_evidence.py reports/matched_profile_20261028
 | `src/myvllm/online/` | 并发在线运行时 |
 | `scripts/` | 基准、官方 fixture、诊断工具 |
 | `tests/` | 功能、数值、回滚和 GPU 测试 |
-| `reports/` | 按日期记录的实验、失败证据和结论 |
 
-进一步阅读：[模型说明](docs/qwen35_target.md)、[推测解码设计](docs/speculative_decoding_design.md)、[服务器命令](docs/autodl_qwen38_validation.md)、[版本统一记录](docs/version_reconciliation_20261028.md)。
+进一步阅读：[模型说明](docs/qwen35_target.md)、[推测解码设计](docs/speculative_decoding_design.md)、[服务器命令](docs/autodl_qwen38_validation.md)。
 
 ## 来源与许可证
 

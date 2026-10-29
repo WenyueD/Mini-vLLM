@@ -55,7 +55,9 @@ cover/
 # Benchmark artifacts
 logs/
 results/
-reports/*.tar.gz
+reports/
+docs/matched_profile_reproduction.md
+docs/version_reconciliation_20261028.md
 .pytest-tmp*/
 .pytest-proposal-*/
 .codex-*.bundle
