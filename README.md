@@ -23,8 +23,8 @@ Performance depends on workload, concurrency, numerical settings, and version. A
 
 | Experiment | Observation | Scope |
 |---|---|---|
-| C1 real-model pair | Target-only 8.80 tok/s; DFlash2 18.80 tok/s; acceptance 29.57% | Four requests × 4,096 output tokens; unmerged head; all 16384 tokens matched; single observation |
-| C24 LM-head A/B | Accumulated verify 651.38 → 584.8 s (−10.22%) | Both runs use DFlash2; 24 × 4,096 outputs matched; not a target-only comparison |
+| C1 real-model pair | Target-only 8.80 tok/s; DFlash2 24.80 tok/s; acceptance 29.57% | Four requests × 4,096 output tokens; unmerged head; all 16384 tokens matched; single observation |
+| C24 LM-head A/B | Accumulated verify 277.38 → 249.8 s (−10.22%) | Both runs use DFlash2; 24 × 4,096 outputs matched; not a target-only comparison |
 | B4 matched-input profile | LM-head GPU activity 11.89 → 1.48 ms; official 1.48 ms | Same prompts/candidates, K=7; one warmed verification; profiler data, not throughput |
 
 Different versions and workloads must not be combined into one scaling curve. Detailed experiment artifacts are maintained outside the published repository.
