@@ -19,7 +19,7 @@ Original attention benchmarks and learning examples remain available but are no 
 
 ## Results and boundaries
 
-Performance depends on workload, concurrency, numerical settings, and version. A faster LM head does not establish an equivalent end-to-end speedup.
+Performance depends on workload, concurrency, numerical settings, and version. 
 
 | Experiment | Observation | Scope |
 |---|---|---|
