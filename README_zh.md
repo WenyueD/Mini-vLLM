@@ -15,21 +15,53 @@
 - **实验工具**：target-only/DFlash2 配对基准、严格 token 比较、接受率、分阶段计时、显存跟踪，以及与官方 vLLM 的固定前缀对照。
 - **在线运行时**：并发请求准入、取消、流式基础设施与逐请求指标；具体入口和支持范围见[在线服务文档](docs/online_serving.md)。
 
-原始 attention benchmark 和教学示例仍保留，但不再作为项目的主要运行入口。
+# DFlash2 评测实验记录
+> 基础配置：Qwen3.8-27B target、配套 DFlash2 draft，NVIDIA A800 80GB
+> 说明：性能与接受率受任务、采样参数、并发、输出长度及执行配置影响。
 
-## 当前结果与适用范围
+## GSM8K 接受率评测
+测试条件：同一批 128 道 GSM8K 题目，并发为 8，最大输出长度为 4096 token，每轮最多提出 7 个 draft token。两套实现使用相同输入和模型权重，预热不计入结果。
 
-性能取决于任务、并发、数值配置和实现版本。
+| 实现 | 采样参数 | 总体 draft 接受率 | 逐请求平均接受长度 | 汇总输出 token / 验证轮数 |
+| ---- | -------- | ---------------- | ------------------ | ------------------------ |
+| Mini-vLLM + DFlash2 | greedy | 54.65% | 5.6117 | 4.8253 |
+| vLLM + DFlash2 | greedy | 55.19% | 5.6519 | 4.8637 |
+| vLLM + DFlash2 | temperature=1, top_p=0.95, top_k=20 | 41.47% | 4.8372 | 3.9037 |
+
+**指标定义**
+- 总体 draft 接受率：所有请求接受的 draft token 总数除以提出的 draft token 总数，不包含 target 补充的 token。
+- 逐请求平均接受长度：先计算每个请求的输出 token 数除以验证轮数，再对请求取算术平均。
+- 汇总推进长度：总输出 token 数除以总验证轮数。验证轮数更多的请求具有更大权重，因此一般不等于逐请求平均接受长度。
+
+**备注**
+Mini-vLLM 与 vLLM greedy 的总体接受率相差约 0.54 个百分点。
+
+官方模型卡在 GSM8K 上报告的逐请求平均接受长度为 5.46，使用 SGLang、H200、FlashAttention 3 和官方推荐的随机采样参数。本项目的 vLLM 随机采样结果 4.8372 与其采用相同的指标定义，但运行环境不同，不构成完整复现。
+参考：https://huggingface.co/incoai/Qwen3.8-27B-DFlash2#evaluation
+
+## GSM8K 运行吞吐记录
+计时范围：生成调用，排除模型加载、预热和计数器读取。vLLM 使用 eager 模式，关闭 CUDA Graph 和异步调度。这些结果是当前诊断配置下的运行记录，不代表各引擎最佳性能。
+
+| 实现 | 请求数 | 并发 | 采样 | 输出上限 | 输出吞吐 |
+| ---- | ------ | ---- | ---- | -------- | -------- |
+| Mini-vLLM + DFlash2 | 128 | 8 | greedy | 4096 token | 172.8 tok/s |
+| vLLM + DFlash2 | 128 | 8 | greedy | 4096 token | 226.7 tok/s |
+| vLLM + DFlash2 | 128 | 8 | 官方推荐随机采样参数 | 4096 token | 204.3 tok/s |
+| Mini-vLLM + DFlash2 | 32 | 8 | greedy | 未设置人为输出长度上限 | 165.8 tok/s |
+
+
+## 历史配对与算子优化实验
+> 以下结果来自不同负载或实现配置，保留用于记录已完成的验证。
 
 | 实验 | 观测结果 | 适用范围 |
-|---|---|---|
-| C1 真实模型配对 | Target-only 8.80 tok/s；DFlash2 24.80 tok/s；接受率 29.57% | 四请求各生成 4,096 token；默认未合并头；16384 个输出 token 完全一致；单次观测 |
-| C24 LM head A/B | 累计 verify 从 277.38 降至 249.8 秒，下降 10.22% | 两边均为 DFlash2；24×4,096 输出一致；不是 target-only 对照 |
-| B4 同输入诊断 | LM head GPU 活动累计从 11.89 降至 1.48 ms；官方为 1.48 ms | 相同 prompt 和候选，K=7；预热后首轮验证；插桩数据，非吞吐指标 |
+| ---- | -------- | -------- |
+| C1 真实模型配对 | Target-only 12.860 tok/s；DFlash2 39.86 tok/s；约 3.1 倍加速；接受率 54.9% | 四请求各生成 4096 token；默认未合并头；16384 个输出 token 完全一致；单次观测 |
+| C24 LM head A/B | 累计 verify 从 277.38 降至 249.8 秒，下降 10.22% | 两边均为 DFlash2；24 个请求各生成 4096 token，输出一致；不是 target-only 对照 |
+| B4 同输入诊断 | LM head GPU 活动累计从 11.89 降至 1.48 ms；官方 vLLM 对照为 1.48 ms | 相同 prompt 和候选，K=7；预热后首轮验证；插桩数据，非吞吐指标 |
 
+## 全局补充说明
+数值边界： BF16 的 kernel 形状变化可能改变贪心决策。`--merged-lm-head` 仍是默认关闭的实验选项，开启前应针对具体配置验证严格输出一致性。
 
-
-**数值边界：** BF16 的 kernel 形状变化可能改变贪心决策。`--merged-lm-head` 仍是默认关闭的实验选项，开启前应针对具体配置验证严格输出一致性。
 
 ## 安装
 
@@ -68,7 +100,7 @@ uv run python scripts/benchmark_qwen38_dflash2_concurrency.py \
   --run-id qwen_dflash2_c1_smoke
 ```
 
-该命令是短负载 smoke，**不是**表中的 C1 3,000-token 实验。`--workload tasks4096` 使用四个长文本任务，输出预算为 4,096 token。先完成 C1，再提升并发；`--cached-target-micro-batch-size` 会改变执行形状，需要明确设置。最大准入并发与实际验证 batch 是两个不同指标。
+该命令是短负载 smoke，**不是**表中的 C1 4096-token 实验。`--workload tasks4096` 使用四个长文本任务，输出预算为 4,096 token。先完成 C1，再提升并发；`--cached-target-micro-batch-size` 会改变执行形状，需要明确设置。最大准入并发与实际验证 batch 是两个不同指标。
 
 结果位于 `results/qwen38_dflash2_perf/<run-id>/`，日志位于 `logs/qwen38_dflash2_perf/<run-id>/`。解释吞吐前，应检查 fairness/token-match、失败数量、实际 batch 和预热配置。原始日志、trace、模型权重及环境目录不提交到 Git。
 
