@@ -15,21 +15,52 @@ Current experiments use a Qwen3.8-27B target and a compatible DFlash2 draft on N
 - **Measurements:** paired target-only/DFlash2 runs, exact token comparison, acceptance, stage timing, memory tracking, and fixed-prefix official-vLLM diagnostics.
 - **Online runtime:** concurrent admission, cancellation, streaming infrastructure, and request metrics. See [online serving](docs/online_serving.md) for its separate entry points and scope.
 
-Original attention benchmarks and learning examples remain available but are no longer the main project entry point.
+# DFlash2 Evaluation Record
+> Base Configuration: Qwen3.8-27B target, paired DFlash2 draft, NVIDIA A800 80GB
+> Note: Performance and acceptance rate are affected by task, sampling parameters, concurrency, output length and execution configuration.
 
-## Results and boundaries
+## GSM8K Acceptance Rate Evaluation
+Test Condition: Same set of 128 GSM8K problems, concurrency = 8, maximum output length = 4096 tokens, at most 7 draft tokens proposed per round. Both implementations share identical input and model weights; warmup results are excluded.
 
-Performance depends on workload, concurrency, numerical settings, and version. 
+| Implementation | Sampling Parameters | Overall Draft Acceptance Rate | Per-request Average Accepted Length | Total Output Tokens / Verification Rounds |
+| ---- | -------- | ---------------- | ------------------ | ------------------------ |
+| Mini-vLLM + DFlash2 | greedy | 54.65% | 5.6117 | 4.8253 |
+| vLLM + DFlash2 | greedy | 55.19% | 5.6519 | 4.8637 |
+| vLLM + DFlash2 | temperature=1, top_p=0.95, top_k=20 | 41.47% | 4.8372 | 3.9037 |
+
+**Metric Definition**
+- Overall draft acceptance rate: Total number of accepted draft tokens across all requests divided by total proposed draft tokens. Target-supplemented tokens are excluded.
+- Per-request average accepted length: For each request, divide output token count by verification rounds, then take the arithmetic mean over all requests.
+- Aggregate advancement length: Total output tokens divided by total verification rounds. Requests with more verification rounds carry higher weight, so this value generally differs from the per-request average accepted length.
+
+**Remarks**
+The overall draft acceptance rate of Mini-vLLM and vLLM under greedy mode differs by approximately 0.54 percentage points. A close acceptance rate does not guarantee identical token-wise outputs; this table does not serve as strict proof of output consistency.
+
+The official model card reports a per-request average accepted length of 5.46 on GSM8K, using SGLang, H200, FlashAttention 3 and official recommended stochastic sampling parameters. Our vLLM stochastic sampling result of 4.8372 uses the same metric definition, but runs on different hardware and environment, so it does not constitute a full reproduction.
+Reference: https://huggingface.co/incoai/Qwen3.8-27B-DFlash2#evaluation
+
+## GSM8K Throughput Benchmark
+Timing Scope: Generation calls only. Model loading, warmup and counter reading are excluded. vLLM runs in eager mode with CUDA Graph and asynchronous scheduling disabled. These are diagnostic measurements and do not represent the optimal performance of each engine.
+
+| Implementation | Request Count | Concurrency | Sampling | Output Limit | Output Throughput |
+| ---- | ------ | ---- | ---- | -------- | -------- |
+| Mini-vLLM + DFlash2 | 128 | 8 | greedy | 4096 token | 172.8 tok/s |
+| vLLM + DFlash2 | 128 | 8 | greedy | 4096 token | 226.7 tok/s |
+| vLLM + DFlash2 | 128 | 8 | Official recommended stochastic sampling | 4096 token | 204.3 tok/s |
+| Mini-vLLM + DFlash2 | 32 | 8 | greedy | No artificial output cap | 165.8 tok/s |
+
+## Historical Pairing & Operator Optimization Experiments
+> Results below come from different workloads and configurations, retained only for validation logging.
 
 | Experiment | Observation | Scope |
-|---|---|---|
-| C1 real-model pair | Target-only 8.80 tok/s; DFlash2 24.80 tok/s; acceptance 29.57% | Four requests × 4,096 output tokens; unmerged head; all 16384 tokens matched; single observation |
-| C24 LM-head A/B | Accumulated verify 277.38 → 249.8 s (−10.22%) | Both runs use DFlash2; 24 × 4,096 outputs matched; not a target-only comparison |
-| B4 matched-input profile | LM-head GPU activity 11.89 → 1.48 ms; official 1.48 ms | Same prompts/candidates, K=7; one warmed verification; profiler data, not throughput |
+| ---- | -------- | -------- |
+| C1 Real Model Pairing | Target-only: 12.860 tok/s; DFlash2: 39.86 tok/s; ~3.1× speedup; acceptance rate 54.9% | 4 requests, each generating 4096 tokens; head merging disabled by default; 16384 output tokens fully consistent; single observation |
+| C24 LM head A/B | Cumulative verify time reduced from 277.38 s to 249.8 s, a 10.22% drop | Both sides use DFlash2; 24 requests each generating 4096 tokens, consistent outputs; not a target-only baseline |
+| B4 Same Input Diagnostic | LM head GPU cumulative activity reduced from 11.89 ms to 1.48 ms; official vLLM baseline = 1.48 ms | Identical prompt and candidates, K=7; first round after warmup; instrumented profiling, not a throughput metric |
 
-Different versions and workloads must not be combined into one scaling curve. Detailed experiment artifacts are maintained outside the published repository.
+## Global Supplementary Notes
+Numerical boundary: Kernel shape changes under BF16 may alter greedy sampling decisions. `--merged-lm-head` remains an experimental option disabled by default. Strict output consistency should be validated for your specific setup before enabling it.
 
-**Numerical boundary:** BF16 kernel shape changes can change greedy decisions. `--merged-lm-head` remains experimental and off by default; validate exact output equality for your configuration before enabling it.
 
 ## Installation
 
